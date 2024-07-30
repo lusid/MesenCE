@@ -28,6 +28,7 @@ public class DwarfSymbolProvider
 
 					var symbolList = compilationUnits.SelectMany((cu) => cu.Symbols).ToList();
 					var filteredSymbols = symbolList.Where(s => s.Tag == DwarfTag.Member || s.Tag == DwarfTag.Variable).ToList();
+					var filtered2 = symbolList.Where(s => s.Attributes.Values.Any(v => v.Type == DwarfAttributeValueType.Address && v.Address != 0)).ToList();
 
 					/*if(compilationUnits.Length != 0 || lineNumberPrograms.Length != 0 || commonInformationEntries.Length != 0)
 						return new DwarfSymbolProviderModule(location, module, compilationUnits, lineNumberPrograms, commonInformationEntries, image.PublicSymbols, image.CodeSegmentOffset, image.Is64bit);*/
