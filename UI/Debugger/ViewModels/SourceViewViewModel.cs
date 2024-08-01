@@ -138,7 +138,7 @@ public class SourceViewViewModel : DisposableViewModel, ISelectableModel
 		}
 
 		if(endAddress?.Type == address?.Type && endAddress?.Address >= address?.Address) {
-			opSize = Math.Min(endAddress!.Value.Address - address!.Value.Address + 1, 16);
+			opSize = Math.Min(endAddress!.Value.Address - address!.Value.Address + 1, 5000);
 		}
 
 		byte[]? byteCode = null;

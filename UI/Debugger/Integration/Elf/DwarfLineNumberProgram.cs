@@ -155,6 +155,10 @@ internal class DwarfLineNumberProgram
 		/// </summary>
 		public void AddCurrentLineInfo()
 		{
+			if(Address == 0x80003e0) {
+
+			}
+
 			File.Lines.Add(new DwarfLineInformation() {
 				File = File,
 				Address = Address,
@@ -247,9 +251,11 @@ internal class DwarfLineNumberProgram
 								break;
 							case DwarfLineNumberExtendedOpcode.SetAddress: {
 								state.Address = debugLine.ReadUint();
-								if(state.Address == 0) {
+								
+								//Breaks stuff that isn't mapped at all (e.g unused code?)
+								/*if(state.Address == 0) {
 									state.Address = lastAddress;
-								}
+								}*/
 								state.OperationIndex = 0;
 							}
 							break;
@@ -267,7 +273,7 @@ internal class DwarfLineNumberProgram
 					}
 					break;
 					case DwarfLineNumberStandardOpcode.Copy:
-						state.AddCurrentLineInfo();
+						//state.AddCurrentLineInfo();
 						state.IsBasicBlock = false;
 						state.IsPrologueEnd = false;
 						state.IsEpilogueEnd = false;

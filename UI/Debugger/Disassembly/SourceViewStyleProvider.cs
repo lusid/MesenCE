@@ -19,7 +19,9 @@ namespace Mesen.Debugger.Disassembly
 
 		public override bool IsLineActive(CodeLineData line, int lineIndex)
 		{
-			return _model.ActiveAddress.HasValue && _model.ActiveAddress.Value == line.Address;
+			int start = line.Address;
+			int end = line.Address + line.OpSize - 1;
+			return _model.ActiveAddress.HasValue && _model.ActiveAddress >= start && _model.ActiveAddress <= end;
 		}
 
 		public override bool IsLineFocused(CodeLineData line, int lineIndex)

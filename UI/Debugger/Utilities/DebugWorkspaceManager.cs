@@ -128,7 +128,9 @@ namespace Mesen.Debugger.Utilities
 		{
 			if(File.Exists(path) && Path.GetExtension(path).ToLower() == "." + FileDialogHelper.ElfFileExt) {
 				ResetLabels();
-				ElfImporter.Import(path, showResult, _romInfo.ConsoleType.GetMainCpuType());
+				ElfImporter importer = new();
+				importer.Import(path, showResult, _romInfo.ConsoleType.GetMainCpuType());
+				SymbolProvider = importer;
 			}
 		}
 

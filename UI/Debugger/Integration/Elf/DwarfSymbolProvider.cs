@@ -11,15 +11,18 @@ public delegate ulong NormalizeAddressDelegate(ulong address);
 public class DwarfSymbolProvider
 {
 	private ElfImage _elf;
+	private DwarfLineNumberProgram[] _lineMappings;
 
 	public IEnumerable<SymbolEntry<uint>> Symbols => _elf.PublicSymbols;
+	internal DwarfLineNumberProgram[] LineMappings => _lineMappings;
 
 	private DwarfSymbolProvider(ElfImage elf)
 	{
 		_elf = elf;
+		_lineMappings = ParseLineNumberPrograms(_elf.DebugLine, _elf.NormalizeAddress);
+
 		try {
 			//var compilationUnits = ParseCompilationUnits(_elf.DebugData, _elf.DebugDataDescription, _elf.DebugDataStrings, _elf.NormalizeAddress);
-			var lineNumberPrograms = ParseLineNumberPrograms(_elf.DebugLine, _elf.NormalizeAddress);
 			//var commonInformationEntries = ParseCommonInformationEntries(_elf.DebugFrame, _elf.EhFrame, new DwarfExceptionHandlingFrameParsingInput(_elf));
 
 			//var symbolList = compilationUnits.SelectMany((cu) => cu.Symbols).ToList();
@@ -63,9 +66,12 @@ public class DwarfSymbolProvider
 			List<DwarfLineNumberProgram> programs = new List<DwarfLineNumberProgram>();
 
 			while(!debugLineReader.IsEnd) {
-				DwarfLineNumberProgram program = new DwarfLineNumberProgram(debugLineReader, addressNormalizer);
-
-				programs.Add(program);
+				try {
+					DwarfLineNumberProgram program = new DwarfLineNumberProgram(debugLineReader, addressNormalizer);
+					programs.Add(program);
+				} catch {
+					break;
+				}
 			}
 
 			return programs.ToArray();
