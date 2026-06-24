@@ -66,6 +66,8 @@ protected:
 	void TriggerNmi();
 
 	__forceinline void LoadTileInfo();
+	__forceinline void LoadTileInfoEven();
+	__forceinline void LoadTileInfoOdd();
 
 	void LoadSprite(uint8_t spriteY, uint8_t tileIndex, uint8_t attributes, uint8_t spriteX, bool extraSprite);
 	void LoadSpriteTileInfo();

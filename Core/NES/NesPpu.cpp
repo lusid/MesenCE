@@ -683,9 +683,22 @@ template<class T> void NesPpu<T>::WriteVram(uint16_t addr, uint8_t value)
 
 template<class T> void NesPpu<T>::LoadTileInfo()
 {
-	switch(_cycle & 0x07) {
+	//Performance is somehow better (in MSVC) if the switch is split into 2 smaller switches
+	//Performance drops by around 20% if merged into a single switch
+	if(_cycle & 0x01) {
+		LoadTileInfoOdd();
+	} else {
+		LoadTileInfoEven();
+	}
+}
+
+template<class T> void NesPpu<T>::LoadTileInfoEven()
+{
+	switch((_cycle >> 1) & 0x03) {
 		case 0:
 			//This is the last dot of the 8-dot sequence (e.g dot 8, 16, etc.)
+			_tile.HighByte = _mapper->ReadVram(_ppuBusAddress, MemoryOperationType::PpuRenderingRead);
+
 			//Replace bottom 8 bits of the BG shifters
 			_highBitShift &= 0xFF00;
 			_highBitShift |= _tile.HighByte;
@@ -698,25 +711,29 @@ template<class T> void NesPpu<T>::LoadTileInfo()
 			break;
 
 		case 1: {
-			uint8_t tileIndex = ReadVram(GetNameTableAddr());
+			uint8_t tileIndex = _mapper->ReadVram(_ppuBusAddress, MemoryOperationType::PpuRenderingRead);
 			_tile.TileAddr = (tileIndex << 4) | (_videoRamAddr >> 12) | _control.BackgroundPatternAddr;
 			((T*)this)->StoreTileInformation(); //Used by HD packs
 			break;
 		}
 
-		case 3: {
+		case 2: {
 			uint8_t shift = ((_videoRamAddr >> 4) & 0x04) | (_videoRamAddr & 0x02);
-			_tile.PaletteOffset = ((ReadVram(GetAttributeAddr()) >> shift) & 0x03) << 2;
+			_tile.PaletteOffset = ((_mapper->ReadVram(_ppuBusAddress, MemoryOperationType::PpuRenderingRead) >> shift) & 0x03) << 2;
 			break;
 		}
 
-		case 5:
-			_tile.LowByte = ReadVram(_tile.TileAddr);
-			break;
+		case 3: _tile.LowByte = _mapper->ReadVram(_ppuBusAddress, MemoryOperationType::PpuRenderingRead); break;
+	}
+}
 
-		case 7:
-			_tile.HighByte = ReadVram(_tile.TileAddr + 8);
-			break;
+template<class T> void NesPpu<T>::LoadTileInfoOdd()
+{
+	switch((_cycle >> 1) & 0x03) {
+		case 0: SetBusAddress(GetNameTableAddr()); break;
+		case 1: SetBusAddress(GetAttributeAddr()); break;
+		case 2: SetBusAddress(_tile.TileAddr); break;
+		case 3: SetBusAddress(_tile.TileAddr + 8); break;
 	}
 }
 
