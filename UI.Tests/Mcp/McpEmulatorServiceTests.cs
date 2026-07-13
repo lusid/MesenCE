@@ -23,6 +23,18 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
+	public void DebuggerApiContract_ExposesStoppedMappingStackAndTraceOperations()
+	{
+		IMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+
+		Assert.True(api.IsExecutionStopped());
+		Assert.Equal(0x8000U, api.GetProgramCounter(CpuType.Nes, true));
+		Assert.Single(api.GetDisassemblyOutput(CpuType.Nes, 0x8000, 1));
+		Assert.Single(api.GetCallstack(CpuType.Nes));
+		Assert.Empty(api.GetExecutionTrace(0, 1));
+	}
+
+	[Fact]
 	public void GetStatus_WhenGameIsLoaded_ReturnsDisplayMetadataWithoutPaths()
 	{
 		FakeMcpEmulatorApi api = new() {
@@ -364,67 +376,4 @@ public sealed class McpEmulatorServiceTests
 		Assert.Equal(hex, register.Hex);
 	}
 
-	private sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
-	{
-		public bool Running { get; init; }
-		public bool Paused { get; init; }
-		public RomInfo RomInfo { get; init; } = new() { ConsoleType = ConsoleType.Nes, RomPath = "game.nes" };
-		public Dictionary<MemoryType, int> MemorySizes { get; } = [];
-		public int DefaultMemorySize { get; init; }
-		public byte[] ReadData { get; set; } = [0];
-		public NesCpuState NesCpuState { get; init; }
-		public int DebuggerRequestBlockStateCalls { get; private set; }
-		public int IsRunningCalls { get; private set; }
-		public int GetRomInfoCalls { get; private set; }
-		public int GetMemoryValuesCalls { get; private set; }
-		public int SetMemoryValuesCalls { get; private set; }
-		public int GetNesCpuStateCalls { get; private set; }
-		public uint LastReadStart { get; private set; }
-		public uint LastReadEndInclusive { get; private set; }
-		public uint LastWriteStart { get; private set; }
-		public byte[]? LastWriteData { get; private set; }
-
-		public bool IsRunning()
-		{
-			IsRunningCalls++;
-			return Running;
-		}
-
-		public ulong GetDebuggerRequestBlockState()
-		{
-			DebuggerRequestBlockStateCalls++;
-			return 0;
-		}
-
-		public bool IsPaused() => Paused;
-
-		public RomInfo GetRomInfo()
-		{
-			GetRomInfoCalls++;
-			return RomInfo;
-		}
-
-		public int GetMemorySize(MemoryType type) => MemorySizes.GetValueOrDefault(type, DefaultMemorySize);
-
-		public byte[] GetMemoryValues(MemoryType type, uint start, uint endInclusive)
-		{
-			GetMemoryValuesCalls++;
-			LastReadStart = start;
-			LastReadEndInclusive = endInclusive;
-			return ReadData;
-		}
-
-		public void SetMemoryValues(MemoryType type, uint start, byte[] data)
-		{
-			SetMemoryValuesCalls++;
-			LastWriteStart = start;
-			LastWriteData = data;
-		}
-
-		public NesCpuState GetNesCpuState()
-		{
-			GetNesCpuStateCalls++;
-			return NesCpuState;
-		}
-	}
 }

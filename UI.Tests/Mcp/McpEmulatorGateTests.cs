@@ -235,49 +235,4 @@ public sealed class McpEmulatorGateTests
 		Assert.Equal("server_stopping", (await queued).Error!.Code);
 	}
 
-	private sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
-	{
-		private readonly object _debuggerRequestBlockStateLock = new();
-		private ulong _debuggerRequestBlockState;
-		private int _debuggerRequestBlockCount;
-		private int _debuggerRequestBlockStateCalls;
-
-		public int ThrowOnDebuggerRequestBlockStateCall { get; set; }
-
-		public static FakeMcpEmulatorApi RunningNes() => new();
-
-		public ulong GetDebuggerRequestBlockState()
-		{
-			int call = Interlocked.Increment(ref _debuggerRequestBlockStateCalls);
-			if(call == ThrowOnDebuggerRequestBlockStateCall) {
-				throw new InvalidOperationException("native snapshot details");
-			}
-			lock(_debuggerRequestBlockStateLock) {
-				return _debuggerRequestBlockState;
-			}
-		}
-
-		public void SetDebuggerRequestBlocked(bool blocked)
-		{
-			lock(_debuggerRequestBlockStateLock) {
-				if(blocked) {
-					_debuggerRequestBlockCount++;
-				} else {
-					Assert.True(_debuggerRequestBlockCount > 0);
-					_debuggerRequestBlockCount--;
-				}
-				_debuggerRequestBlockState = (((_debuggerRequestBlockState >> 33) + 1) << 33)
-					| ((ulong)_debuggerRequestBlockCount << 1)
-					| (_debuggerRequestBlockCount > 0 ? 1UL : 0);
-			}
-		}
-
-		public bool IsRunning() => true;
-		public bool IsPaused() => false;
-		public RomInfo GetRomInfo() => new() { ConsoleType = ConsoleType.Nes, RomPath = "game.nes" };
-		public int GetMemorySize(MemoryType type) => 0;
-		public byte[] GetMemoryValues(MemoryType type, uint start, uint endInclusive) => [];
-		public void SetMemoryValues(MemoryType type, uint start, byte[] data) { }
-		public NesCpuState GetNesCpuState() => default;
-	}
 }

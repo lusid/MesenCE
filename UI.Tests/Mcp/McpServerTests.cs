@@ -470,47 +470,4 @@ public sealed class McpServerTests
 		return api;
 	}
 
-	private sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
-	{
-		public bool Running { get; init; }
-		public RomInfo RomInfo { get; init; } = new();
-		public Dictionary<MemoryType, int> MemorySizes { get; } = [];
-		public byte[] ReadData { get; init; } = [];
-		public NesCpuState NesCpuState { get; init; }
-		public Action? OnRead { get; set; }
-		public int IsRunningCalls { get; private set; }
-		public int GetMemoryValuesCalls { get; private set; }
-		public int SetMemoryValuesCalls { get; private set; }
-		public int DebuggerRequestBlockStateCalls { get; private set; }
-
-		public ulong GetDebuggerRequestBlockState()
-		{
-			DebuggerRequestBlockStateCalls++;
-			return 0;
-		}
-
-		public bool IsRunning()
-		{
-			IsRunningCalls++;
-			return Running;
-		}
-
-		public bool IsPaused() => false;
-		public RomInfo GetRomInfo() => RomInfo;
-		public int GetMemorySize(MemoryType type) => MemorySizes.GetValueOrDefault(type);
-
-		public byte[] GetMemoryValues(MemoryType type, uint start, uint endInclusive)
-		{
-			GetMemoryValuesCalls++;
-			OnRead?.Invoke();
-			return ReadData;
-		}
-
-		public void SetMemoryValues(MemoryType type, uint start, byte[] data)
-		{
-			SetMemoryValuesCalls++;
-		}
-
-		public NesCpuState GetNesCpuState() => NesCpuState;
-	}
 }
