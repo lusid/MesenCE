@@ -31,24 +31,28 @@ See [COMPILING.md](COMPILING.md)
 
 ## MCP Server
 
-This fork includes a local Model Context Protocol server for live emulator inspection and memory access.
+This fork includes a local Model Context Protocol server for live emulator inspection, memory access, and debugger control.
 
 1. Open **Options > Preferences > Advanced**.
 2. Enable **MCP Server** and leave the port at `7342` unless the client requires another port.
 3. Select **OK**, close Mesen, and restart it. Enabling, disabling, or changing the port takes effect after restart.
 4. Configure the MCP client to use the Streamable HTTP endpoint `http://127.0.0.1:7342/mcp`.
 
-The endpoint exposes exactly five tools:
+The endpoint exposes 19 tools:
 
-- `get_emulator_status`: returns whether a game is loaded, the system, ROM filename without its path, run state, and Mesen/MCP versions.
-- `list_memory_spaces`: returns the memory-space IDs, sizes, and read/write capabilities available for the loaded system.
-- `read_memory`: reads up to 65,536 bytes from a memory space and returns `data` as a numeric byte array plus `hex` for display.
-- `write_memory`: writes up to 65,536 bytes to a writable memory space; its `data` input is a numeric byte array.
-- `get_cpu_registers`: returns the live CPU register set supported for the loaded system.
+- Status and memory: `get_emulator_status`, `list_memory_spaces`, `read_memory`, `write_memory`, and `get_cpu_registers`.
+- MCP-owned breakpoints: `set_breakpoint`, `list_breakpoints`, `remove_breakpoint`, and `remove_all_breakpoints`.
+- Execution control: `pause`, `resume`, `step`, and `continue_until_break`.
+- Debugger inspection: `get_break_context`, `disassemble`, `map_address`, and `get_call_stack`.
+- Bounded tracing: `configure_execution_trace` and `get_execution_trace`.
+
+Breakpoint access is `execute`, `read`, or `write`. Step types are `instruction`, `over`, `out`, `cpu_cycle`, `ppu_scanline`, `ppu_frame`, and `back`, subject to active-system support. Trace actions are `enable`, `configure`, `clear`, and `disable`.
 
 Pass numeric inputs such as `address`, `count`, and every `data` byte as decimal JSON numbers, not `$`-prefixed or `0x`-prefixed strings. Each write byte must be an integer from `0` through `255`; for example, two bytes are `"data": [0, 255]`. Pass the case-sensitive enum-name `id` returned by `list_memory_spaces` as `space`; for example, use `NesInternalRam` only when discovery returns that ID.
 
-All tool calls inspect the live emulator without pausing it. A multi-byte read or write is not an atomic snapshot relative to emulation, concurrent protocol calls are serialized, and writes modify emulator state immediately. Record the original value before a diagnostic write and restore that same value when finished. Valid writes use Mesen's synchronous bulk setter only for spaces with a complete native write path; it has no partial-failure result, so MCP reports a count only after that call returns and never fabricates `bytesWritten` on failure.
+Memory and inspection calls do not pause automatically. `pause`, `resume`, `step`, and `continue_until_break` intentionally change execution state. Break context is valid only while stopped at the same emulator generation; resume, reset, ROM transitions, and state loads invalidate it. A multi-byte read or write is not an atomic snapshot relative to emulation, concurrent protocol calls are serialized, and writes modify emulator state immediately. Record the original value before a diagnostic write and restore that same value when finished.
+
+MCP breakpoints use stable IDs and coexist with debugger UI breakpoints. The in-memory execution trace has one owner at a time, so MCP returns `operation_in_progress` rather than overwriting an active UI trace. Limits include 128 MCP breakpoints, 256 disassembly rows, 128 call-stack frames, 1,000 returned trace rows, 999 UTF-8 bytes per condition or trace format, and a 30-second maximum `continue_until_break` timeout.
 
 The server binds only to `127.0.0.1`, but every local process and every MCP client granted access to it is inside the trust boundary and may invoke destructive writes. Server lifecycle and tool outcomes are written to Mesen's log with an `[MCP]` prefix, request type, result, and duration; arguments and memory payloads are never logged.
 
