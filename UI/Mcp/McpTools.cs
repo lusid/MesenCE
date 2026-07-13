@@ -11,7 +11,7 @@ using ModelContextProtocol.Server;
 namespace Mesen.Mcp;
 
 public sealed record ReadMemoryRequest(string Space, uint Address, int Count);
-public sealed record WriteMemoryRequest(string Space, uint Address, JsonElement[] Data);
+public sealed record WriteMemoryRequest(string Space, uint Address, int[] Data);
 public sealed record McpMemoryRead(string Space, uint Address, int Count, int[] Data, string Hex);
 
 internal sealed class McpTools
@@ -99,14 +99,13 @@ internal sealed class McpTools
 			return InvalidByteValue();
 		}
 
-		byte[] data = new byte[request.Data.Length];
-		for(int i = 0; i < request.Data.Length; i++) {
-			if(request.Data[i].ValueKind != JsonValueKind.Number || !request.Data[i].TryGetInt32(out int value) || value is < 0 or > byte.MaxValue) {
+		foreach(int value in request.Data) {
+			if(value is < 0 or > byte.MaxValue) {
 				return InvalidByteValue();
 			}
-			data[i] = (byte)value;
 		}
 
+		byte[] data = Array.ConvertAll(request.Data, value => (byte)value);
 		return ToResult("write_memory", _service.WriteMemory(request.Space, request.Address, data), McpToolJsonContext.Default.MemoryWrite);
 	}
 
