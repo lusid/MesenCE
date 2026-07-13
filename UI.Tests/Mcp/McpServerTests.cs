@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using Mesen.Interop;
 using Mesen.Mcp;
+using Mesen.Windows;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
@@ -9,6 +10,84 @@ namespace UI.Tests.Mcp;
 
 public sealed class McpServerTests
 {
+	[Fact]
+	public async Task MainWindowLifecycle_OnlyHostsAfterInitializationAndStopsBeforeCoreRelease()
+	{
+		List<string> events = [];
+		int createCalls = 0;
+		using McpServer server = new(new McpEmulatorService(new FakeMcpEmulatorApi()));
+		MainWindowMcpLifecycle lifecycle = new(
+			() => {
+				createCalls++;
+				return server;
+			},
+			(_, _) => {
+				events.Add("start");
+				return Task.CompletedTask;
+			},
+			(_, timeout) => events.Add($"stop:{timeout.TotalSeconds}"),
+			_ => events.Add("dispose"),
+			events.Add
+		);
+
+		await lifecycle.StartAsync(false, 7342);
+		Assert.Equal(0, createCalls);
+		events.Add("initialized");
+		await lifecycle.StartAsync(true, 7342);
+		await lifecycle.StartAsync(true, 7342);
+		Assert.Equal(1, createCalls);
+
+		lifecycle.Stop();
+		lifecycle.Stop();
+		events.Add("core-release");
+
+		Assert.Equal(["initialized", "start", "stop:2", "dispose", "core-release"], events);
+	}
+
+	[Fact]
+	public async Task MainWindowLifecycle_LogsAndSwallowsBindFailure()
+	{
+		List<string> logs = [];
+		int disposeCalls = 0;
+		using McpServer server = new(new McpEmulatorService(new FakeMcpEmulatorApi()));
+		MainWindowMcpLifecycle lifecycle = new(
+			() => server,
+			(_, _) => Task.FromException(new IOException("Address already in use")),
+			(_, _) => throw new InvalidOperationException("Failed hosts must not be stopped."),
+			_ => disposeCalls++,
+			logs.Add
+		);
+
+		await lifecycle.StartAsync(true, 7342);
+		lifecycle.Stop();
+
+		Assert.Equal(1, disposeCalls);
+		Assert.Equal(["[MCP] Unable to start server on 127.0.0.1:7342: Address already in use"], logs);
+	}
+
+	[Fact]
+	public async Task MainWindowLifecycle_CloseDuringStartupOwnsDisposalAndSuppressesFailureLog()
+	{
+		TaskCompletionSource startup = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		List<string> events = [];
+		using McpServer server = new(new McpEmulatorService(new FakeMcpEmulatorApi()));
+		MainWindowMcpLifecycle lifecycle = new(
+			() => server,
+			(_, _) => startup.Task,
+			(_, _) => events.Add("stop"),
+			_ => events.Add("dispose"),
+			message => events.Add($"log:{message}")
+		);
+
+		Task start = lifecycle.StartAsync(true, 7342);
+		lifecycle.Stop();
+		startup.SetException(new OperationCanceledException("closing"));
+		await start;
+		lifecycle.Stop();
+
+		Assert.Equal(["stop", "dispose"], events);
+	}
+
 	[Fact]
 	public async Task Discovery_ExposesExactlyFiveToolsOnLoopbackMcpRoute()
 	{
