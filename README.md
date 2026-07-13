@@ -42,11 +42,11 @@ The endpoint exposes exactly five tools:
 
 - `get_emulator_status`: returns whether a game is loaded, the system, ROM filename without its path, run state, and Mesen/MCP versions.
 - `list_memory_spaces`: returns the memory-space IDs, sizes, and read/write capabilities available for the loaded system.
-- `read_memory`: reads up to 65,536 bytes from a memory space and returns `data` as base64 plus `hex` for display.
-- `write_memory`: writes up to 65,536 bytes to a writable memory space; its `data` input is a base64 string.
+- `read_memory`: reads up to 65,536 bytes from a memory space and returns `data` as a numeric byte array plus `hex` for display.
+- `write_memory`: writes up to 65,536 bytes to a writable memory space; its `data` input is a numeric byte array.
 - `get_cpu_registers`: returns the live CPU register set supported for the loaded system.
 
-Pass numeric inputs such as `address` and `count` as decimal JSON numbers, not `$`-prefixed or `0x`-prefixed strings. Pass the case-sensitive enum-name `id` returned by `list_memory_spaces` as `space`; for example, use `NesInternalRam` only when discovery returns that ID. The `read_memory` and `write_memory` `data` field is base64 because the protocol model uses a JSON `byte[]`; it is not a numeric field.
+Pass numeric inputs such as `address`, `count`, and every `data` byte as decimal JSON numbers, not `$`-prefixed or `0x`-prefixed strings. Each write byte must be an integer from `0` through `255`; for example, two bytes are `"data": [0, 255]`. Pass the case-sensitive enum-name `id` returned by `list_memory_spaces` as `space`; for example, use `NesInternalRam` only when discovery returns that ID.
 
 All tool calls inspect the live emulator without pausing it. A multi-byte read or write is not an atomic snapshot relative to emulation, concurrent protocol calls are serialized, and writes modify emulator state immediately. Record the original value before a diagnostic write and restore that same value when finished.
 

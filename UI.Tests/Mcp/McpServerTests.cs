@@ -110,6 +110,8 @@ public sealed class McpServerTests
 			Assert.Contains("without pausing", tool.Description);
 		});
 		Assert.Contains("modifies emulator state immediately", tools.Single(tool => tool.Name == "write_memory").Description);
+		JsonElement writeSchema = tools.Single(tool => tool.Name == "write_memory").JsonSchema;
+		Assert.Equal("array", writeSchema.GetProperty("properties").GetProperty("request").GetProperty("properties").GetProperty("data").GetProperty("type").GetString());
 	}
 
 	[Fact]
@@ -130,7 +132,7 @@ public sealed class McpServerTests
 		CallToolResult write = await client.CallToolAsync("write_memory", Request(new {
 			space = nameof(MemoryType.NesWorkRam),
 			address = 2U,
-			data = new byte[] { 0x44, 0x55 }
+			data = new[] { 0x44, 0x55 }
 		}));
 		CallToolResult registers = await client.CallToolAsync("get_cpu_registers");
 		CallToolResult invalid = await client.CallToolAsync("read_memory", Request(new {
@@ -145,6 +147,7 @@ public sealed class McpServerTests
 		Assert.Equal(nameof(MemoryType.NesWorkRam), spaces.StructuredContent!.Value[0].GetProperty("id").GetString());
 		Assert.False(read.IsError);
 		Assert.Equal("A1B2", read.StructuredContent!.Value.GetProperty("hex").GetString());
+		Assert.Equal([0xA1, 0xB2], read.StructuredContent.Value.GetProperty("data").EnumerateArray().Select(value => value.GetInt32()));
 		Assert.False(write.IsError);
 		Assert.Equal(2, write.StructuredContent!.Value.GetProperty("count").GetInt32());
 		Assert.False(registers.IsError);
@@ -156,6 +159,43 @@ public sealed class McpServerTests
 		Assert.False(error.TryGetProperty("bytesWritten", out _));
 		Assert.Equal(1, api.GetMemoryValuesCalls);
 		Assert.Equal(1, api.SetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public async Task WriteMemory_RejectsInvalidNumericArrayElementsBeforeCallingService()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		using McpServer server = new(new McpEmulatorService(api));
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult negative = await client.CallToolAsync("write_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			data = new[] { -1 }
+		}));
+		CallToolResult tooLarge = await client.CallToolAsync("write_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			data = new[] { 256 }
+		}));
+		CallToolResult fractional = await client.CallToolAsync("write_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			data = new[] { 1.5 }
+		}));
+		CallToolResult text = await client.CallToolAsync("write_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			data = new[] { "1" }
+		}));
+
+		AssertInvalidByteValue(negative);
+		AssertInvalidByteValue(tooLarge);
+		AssertInvalidByteValue(fractional);
+		AssertInvalidByteValue(text);
+		Assert.Equal(0, api.IsRunningCalls);
+		Assert.Equal(0, api.SetMemoryValuesCalls);
 	}
 
 	[Fact]
@@ -268,6 +308,15 @@ public sealed class McpServerTests
 	}
 
 	private static Dictionary<string, object?> Request(object request) => new() { ["request"] = request };
+
+	private static void AssertInvalidByteValue(CallToolResult result)
+	{
+		Assert.True(result.IsError);
+		JsonElement error = result.StructuredContent!.Value;
+		Assert.Equal("invalid_byte_value", error.GetProperty("code").GetString());
+		Assert.Equal("Write data must contain only integer values from 0 through 255.", error.GetProperty("message").GetString());
+		Assert.False(error.TryGetProperty("bytesWritten", out _));
+	}
 
 	private static FakeMcpEmulatorApi CreateRunningApi()
 	{

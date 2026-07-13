@@ -11,7 +11,8 @@ using ModelContextProtocol.Server;
 namespace Mesen.Mcp;
 
 public sealed record ReadMemoryRequest(string Space, uint Address, int Count);
-public sealed record WriteMemoryRequest(string Space, uint Address, byte[] Data);
+public sealed record WriteMemoryRequest(string Space, uint Address, JsonElement[] Data);
+public sealed record McpMemoryRead(string Space, uint Address, int Count, int[] Data, string Hex);
 
 internal sealed class McpTools
 {
@@ -79,12 +80,43 @@ internal sealed class McpTools
 
 	private CallToolResult ReadMemory(ReadMemoryRequest request)
 	{
-		return ToResult("read_memory", _service.ReadMemory(request.Space, request.Address, request.Count), McpToolJsonContext.Default.MemoryRead);
+		McpServiceResult<MemoryRead> result = _service.ReadMemory(request.Space, request.Address, request.Count);
+		McpServiceResult<McpMemoryRead> protocolResult = result.Error is not null
+			? new(null, result.Error)
+			: McpServiceResult<McpMemoryRead>.Success(new(
+				result.Value!.Space,
+				result.Value.Address,
+				result.Value.Count,
+				Array.ConvertAll(result.Value.Data, value => (int)value),
+				result.Value.Hex
+			));
+		return ToResult("read_memory", protocolResult, McpToolJsonContext.Default.McpMemoryRead);
 	}
 
 	private CallToolResult WriteMemory(WriteMemoryRequest request)
 	{
-		return ToResult("write_memory", _service.WriteMemory(request.Space, request.Address, request.Data), McpToolJsonContext.Default.MemoryWrite);
+		if(request.Data is null) {
+			return InvalidByteValue();
+		}
+
+		byte[] data = new byte[request.Data.Length];
+		for(int i = 0; i < request.Data.Length; i++) {
+			if(request.Data[i].ValueKind != JsonValueKind.Number || !request.Data[i].TryGetInt32(out int value) || value is < 0 or > byte.MaxValue) {
+				return InvalidByteValue();
+			}
+			data[i] = (byte)value;
+		}
+
+		return ToResult("write_memory", _service.WriteMemory(request.Space, request.Address, data), McpToolJsonContext.Default.MemoryWrite);
+	}
+
+	private static CallToolResult InvalidByteValue()
+	{
+		return ToResult(
+			"write_memory",
+			McpServiceResult<MemoryWrite>.Failure("invalid_byte_value", "Write data must contain only integer values from 0 through 255."),
+			McpToolJsonContext.Default.MemoryWrite
+		);
 	}
 
 	private CallToolResult GetCpuRegisters()
@@ -139,7 +171,7 @@ internal sealed class McpTools
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(EmulatorStatus))]
 [JsonSerializable(typeof(IReadOnlyList<MemorySpace>))]
-[JsonSerializable(typeof(MemoryRead))]
+[JsonSerializable(typeof(McpMemoryRead))]
 [JsonSerializable(typeof(MemoryWrite))]
 [JsonSerializable(typeof(CpuRegisters))]
 [JsonSerializable(typeof(ReadMemoryRequest))]
