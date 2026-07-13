@@ -3,7 +3,6 @@ using Avalonia.Threading;
 using Mesen.Config;
 using Mesen.Debugger.Labels;
 using Mesen.Debugger.Windows;
-using Mesen.Interop;
 using Mesen.Utilities;
 using System;
 using System.Collections.Concurrent;
@@ -78,7 +77,7 @@ namespace Mesen.Debugger.Utilities
 			_openedWindows.TryRemove(wnd, out _);
 
 			if(Interlocked.Decrement(ref _debugWindowCounter) == 0) {
-				//Closed the last debug window, save the workspace and turn off the debugger
+				//Closed the last debug window, save the workspace
 				//Run any jobs pending on the UI thread, to ensure the debugger
 				//doesn't get restarted by a pending job from the window that was closed
 				//Lock to prevent this from running while ProcessNotification is sending
@@ -90,7 +89,6 @@ namespace Mesen.Debugger.Utilities
 					_windowNotifLock.ExitWriteLock();
 				}
 				DebugWorkspaceManager.Save(true);
-				DebugApi.ReleaseDebugger();
 			}
 		}
 

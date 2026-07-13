@@ -35,16 +35,23 @@ namespace Mesen.ViewModels
 
 		public void SaveSpcFile(string filename)
 		{
-			bool releaseDebugger = !DebugWindowManager.HasOpenedDebugWindows();
 			bool paused = EmuApi.IsPaused();
+			SpcState cpu;
+			byte[] spcRam;
+			byte[] spcMemory;
+			byte[] dspRegisters;
+			using(DebuggerLifetimeCoordinator.Shared.Acquire()) {
+				cpu = DebugApi.GetCpuState<SpcState>(CpuType.Spc);
+				spcRam = DebugApi.GetMemoryState(MemoryType.SpcRam);
+				spcMemory = DebugApi.GetMemoryState(MemoryType.SpcMemory);
+				dspRegisters = DebugApi.GetMemoryState(MemoryType.SpcDspRegisters);
+			}
+			if(paused) {
+				EmuApi.Pause();
+			}
 
 			using(FileStream stream = File.Open(filename, FileMode.Create)) {
 				using(BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8, false)) {
-					SpcState cpu = DebugApi.GetCpuState<SpcState>(CpuType.Spc);
-					byte[] spcRam = DebugApi.GetMemoryState(MemoryType.SpcRam);
-					byte[] spcMemory = DebugApi.GetMemoryState(MemoryType.SpcMemory);
-					byte[] dspRegisters = DebugApi.GetMemoryState(MemoryType.SpcDspRegisters);
-
 					WriteFixedLengthString(writer, "SNES-SPC700 Sound File Data v0.30", 33);
 					writer.Write((short)0x1a1a);
 					writer.Write((byte)26); // Has ID666 tags
@@ -78,14 +85,6 @@ namespace Mesen.ViewModels
 					writer.Write(dspRegisters, 0, 128);
 					WriteFixedLengthString(writer, "", 64); // Unused
 					writer.Write(spcRam, 0x10000 - 64, 64); // Last 64 bytes of RAM, in case IPL was enabled
-				}
-			}
-
-			if(releaseDebugger) {
-				//The debug calls to get SPC state will initialize the debugger - stop the debugger if no other debug window is opened
-				DebugApi.ReleaseDebugger();
-				if(paused) {
-					EmuApi.Pause();
 				}
 			}
 		}

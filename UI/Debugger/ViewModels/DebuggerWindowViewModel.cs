@@ -64,6 +64,7 @@ namespace Mesen.Debugger.ViewModels
 
 		public CpuType CpuType { get; private set; }
 		private UInt64 _masterClock = 0;
+		private readonly IDisposable? _debuggerLease;
 
 		private bool _autoSwitchToSourceView = false;
 
@@ -75,7 +76,7 @@ namespace Mesen.Debugger.ViewModels
 		public DebuggerWindowViewModel(CpuType? cpuType)
 		{
 			if(!Design.IsDesignMode) {
-				DebugApi.InitializeDebugger();
+				_debuggerLease = DebuggerLifetimeCoordinator.Shared.Acquire();
 			}
 
 			ConsoleType consoleType;
@@ -210,6 +211,7 @@ namespace Mesen.Debugger.ViewModels
 			BreakpointManager.BreakpointsChanged -= BreakpointManager_BreakpointsChanged;
 			BreakpointManager.RemoveCpuType(CpuType);
 			ConfigApi.SetDebuggerFlag(CpuType.GetDebuggerFlag(), false);
+			_debuggerLease?.Dispose();
 		}
 
 		private void Config_PropertyChanged(object? sender, PropertyChangedEventArgs e)

@@ -23,6 +23,7 @@ namespace Mesen.Interop
 		[DllImport(DllPath)] public static extern UInt64 GetDebuggerRequestBlockState();
 
 		[DllImport(DllPath)] public static extern void ResumeExecution();
+		[DllImport(DllPath)][return: MarshalAs(UnmanagedType.I1)] public static extern bool IsExecutionStopped();
 		[DllImport(DllPath)] public static extern void Step(CpuType cpuType, Int32 instructionCount, StepType type = StepType.Step);
 
 		[DllImport(DllPath)] public static extern void StartLogTraceToFile([MarshalAs(UnmanagedType.LPUTF8Str)] string filename);
