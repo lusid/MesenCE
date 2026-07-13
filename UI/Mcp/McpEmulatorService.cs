@@ -191,7 +191,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<McpBreakpoint>.Failure("invalid_access", "Breakpoint access must be execute, read, or write.");
 		}
 
-		return Execute(() => {
+		return ExecuteWithDebuggerLease((_, prepareDebuggerLease) => {
 			if(_mcpBreakpoints.Count >= McpDebuggerLimits.MaxMcpBreakpoints) {
 				return McpServiceResult<McpBreakpoint>.Failure(
 					"payload_too_large",
@@ -221,7 +221,10 @@ internal sealed class McpEmulatorService : IDisposable
 				return McpServiceResult<McpBreakpoint>.Failure("invalid_range", "The breakpoint range is outside the selected memory space.");
 			}
 
-			EnsureDebuggerLease();
+			McpServiceResult<bool> lease = prepareDebuggerLease();
+			if(!lease.IsSuccess) {
+				return FailureFrom<McpBreakpoint>(lease);
+			}
 			if(!string.IsNullOrEmpty(condition)) {
 				_api.EvaluateExpression(condition, cpuType, out EvalResultType resultType, useCache: false);
 				if(resultType is not (EvalResultType.Numeric or EvalResultType.Boolean)) {
@@ -285,12 +288,15 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal McpServiceResult<BreakpointRemovalSummary> RemoveAllBreakpoints()
 	{
-		return Execute(() => {
+		return ExecuteWithDebuggerLease((_, prepareDebuggerLease) => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<BreakpointRemovalSummary>.Failure("no_game", "No game is currently loaded.");
 			}
 
-			EnsureDebuggerLease();
+			McpServiceResult<bool> lease = prepareDebuggerLease();
+			if(!lease.IsSuccess) {
+				return FailureFrom<BreakpointRemovalSummary>(lease);
+			}
 			int removedCount = _mcpBreakpoints.Count;
 			if(removedCount > 0) {
 				_breakpointCollection.Replace([]);
@@ -500,7 +506,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<TraceConfiguration>.Failure("unknown_cpu", "The selected CPU is not available.");
 		}
 
-		return ExecuteWithTicket(ticket => {
+		return ExecuteWithDebuggerLease((ticket, prepareDebuggerLease) => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<TraceConfiguration>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -546,8 +552,11 @@ internal sealed class McpEmulatorService : IDisposable
 				Condition = EncodeTraceText(condition),
 				Format = EncodeTraceText(format)
 			};
+			McpServiceResult<bool> lease = prepareDebuggerLease();
+			if(!lease.IsSuccess) {
+				return FailureFrom<TraceConfiguration>(lease);
+			}
 			if(!_traceCoordinator.TryAcquireAndExecute(_traceOwner, () => {
-				EnsureDebuggerLease();
 				_api.SetTraceOptions(cpuType, options);
 			})) {
 				return TraceOwnershipConflict<TraceConfiguration>();
@@ -650,7 +659,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<ExecutionState>.Failure("invalid_step_type", "The selected step type is not supported.");
 		}
 
-		return ExecuteWithTicket(ticket => {
+		return ExecuteWithDebuggerLease((ticket, prepareDebuggerLease) => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -668,7 +677,10 @@ internal sealed class McpEmulatorService : IDisposable
 				return McpServiceResult<ExecutionState>.Failure("operation_in_progress", "A continue operation is still in progress.");
 			}
 
-			EnsureDebuggerLease();
+			McpServiceResult<bool> lease = prepareDebuggerLease();
+			if(!lease.IsSuccess) {
+				return FailureFrom<ExecutionState>(lease);
+			}
 			InvalidateLatestBreak();
 			_api.Step(cpuType, 1, nativeStepType);
 			return McpServiceResult<ExecutionState>.Success(new("running", ticket.Generation));
@@ -683,7 +695,7 @@ internal sealed class McpEmulatorService : IDisposable
 		McpOperationTicket ticket = default;
 		CpuType cpuType = default;
 		TaskCompletionSource<CapturedBreakEvent>? waiter = null;
-		McpServiceResult<ExecutionState> setup = ExecuteWithTicket(currentTicket => {
+		McpServiceResult<ExecutionState> setup = ExecuteWithDebuggerLease((currentTicket, prepareDebuggerLease) => {
 			if(timeoutMs is < McpDebuggerLimits.MinContinueTimeoutMs or > McpDebuggerLimits.MaxContinueTimeoutMs) {
 				return McpServiceResult<ExecutionState>.Failure("invalid_timeout", "Continue timeout is outside the supported range.");
 			}
@@ -717,8 +729,11 @@ internal sealed class McpEmulatorService : IDisposable
 				_latestBreakGeneration = -1;
 			}
 
+			McpServiceResult<bool> lease = prepareDebuggerLease();
+			if(!lease.IsSuccess) {
+				return FailureFrom<ExecutionState>(lease);
+			}
 			ticket = currentTicket;
-			EnsureDebuggerLease();
 			if(_api.IsExecutionStopped()) {
 				_api.ResumeDebugger();
 			} else {
@@ -1053,6 +1068,11 @@ internal sealed class McpEmulatorService : IDisposable
 		_debuggerLease ??= _debuggerLifetime.Acquire();
 	}
 
+	private static McpServiceResult<T> FailureFrom<T>(McpServiceResult<bool> result)
+	{
+		return McpServiceResult<T>.Failure(result.Error!.Code, result.Error.Message);
+	}
+
 	private static byte[] EncodeTraceText(string? value)
 	{
 		byte[] buffer = new byte[1000];
@@ -1252,6 +1272,21 @@ internal sealed class McpEmulatorService : IDisposable
 			}
 			ReconcilePendingResources();
 			return operation(ticket);
+		});
+	}
+
+	private McpServiceResult<T> ExecuteWithDebuggerLease<T>(
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteWithDebuggerLease(EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(ticket, prepareDebuggerLease);
 		});
 	}
 

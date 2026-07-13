@@ -37,6 +37,13 @@ internal sealed class McpEmulatorGate
 		return ExecuteLocked(operation);
 	}
 
+	internal McpServiceResult<T> ExecuteWithDebuggerLease<T>(
+		Action acquireDebuggerLease,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(operation, acquireDebuggerLease);
+	}
+
 	internal McpServiceResult<T> ExecuteForTicket<T>(McpOperationTicket ticket, Func<McpServiceResult<T>> operation)
 	{
 		return ExecuteLocked(currentTicket => currentTicket != ticket
@@ -90,6 +97,13 @@ internal sealed class McpEmulatorGate
 
 	private McpServiceResult<T> ExecuteLocked<T>(Func<McpOperationTicket, McpServiceResult<T>> operation)
 	{
+		return ExecuteLocked((ticket, _) => operation(ticket), null);
+	}
+
+	private McpServiceResult<T> ExecuteLocked<T>(
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation,
+		Action? acquireDebuggerLease)
+	{
 		_emulatorSemaphore.Wait();
 		try {
 			if(Volatile.Read(ref _shutdownStarted) != 0) {
@@ -109,7 +123,7 @@ internal sealed class McpEmulatorGate
 
 			McpServiceResult<T> result;
 			try {
-				result = operation(new(generation, debuggerBlockState));
+				result = operation(new(generation, debuggerBlockState), PrepareDebuggerLease);
 			} catch(Exception) {
 				result = InteropFailure<T>();
 			}
@@ -124,6 +138,26 @@ internal sealed class McpEmulatorGate
 				return StateChanged<T>();
 			}
 			return result;
+
+			McpServiceResult<bool> PrepareDebuggerLease()
+			{
+				if(acquireDebuggerLease is null) {
+					return InteropFailure<bool>();
+				}
+
+				acquireDebuggerLease();
+				if(!TryGetDebuggerRequestBlockState(out ulong refreshedDebuggerBlockState)) {
+					return InteropFailure<bool>();
+				}
+				if(generation != Volatile.Read(ref _emulatorGeneration)
+					|| Volatile.Read(ref _transitionActive) != 0
+					|| IsDebuggerRequestBlocked(refreshedDebuggerBlockState)) {
+					return StateChanged<bool>();
+				}
+
+				debuggerBlockState = refreshedDebuggerBlockState;
+				return McpServiceResult<bool>.Success(true);
+			}
 		} finally {
 			_emulatorSemaphore.Release();
 		}

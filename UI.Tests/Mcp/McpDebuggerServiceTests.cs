@@ -416,6 +416,65 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
+	public void SetBreakpoint_FirstLeaseBlockStateChangeSucceedsAndInstallsExactlyOnce()
+	{
+		int initializes = 0;
+		FakeMcpEmulatorApi api = CreateApi();
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(
+				() => {
+					initializes++;
+					api.SetDebuggerRequestBlocked(true);
+					api.SetDebuggerRequestBlocked(false);
+				},
+				() => { }
+			),
+			breakpointCollection: collection
+		);
+
+		McpServiceResult<McpBreakpoint> result = SetBreakpoint(service, 0x8000);
+
+		Assert.True(result.IsSuccess);
+		Assert.Equal(1, result.Value!.Id);
+		Assert.Equal(1, initializes);
+		Assert.Single(collection.Snapshots);
+		AssertBreakpoint(Assert.Single(collection.Snapshots[0]), 1, 0x8000, "");
+		Assert.Equal(result.Value, Assert.Single(service.ListBreakpoints().Value!));
+	}
+
+	[Theory]
+	[InlineData(true)]
+	[InlineData(false)]
+	public void SetBreakpoint_WhenLeaseAcquireStartsTransitionOrBlock_RejectsBeforeMutation(bool transition)
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		McpEmulatorGate gate = new(api);
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = new(
+			api,
+			gate,
+			new DebuggerLifetimeCoordinator(
+				() => {
+					if(transition) {
+						gate.BeginEmulatorTransition();
+					} else {
+						api.SetDebuggerRequestBlocked(true);
+					}
+				},
+				() => { }
+			),
+			collection
+		);
+
+		McpServiceResult<McpBreakpoint> result = SetBreakpoint(service, 0x8000);
+
+		Assert.Equal("state_changed", result.Error!.Code);
+		Assert.Empty(collection.Snapshots);
+	}
+
+	[Fact]
 	public void SetBreakpoint_WhenAtLimit_ReturnsPayloadTooLargeWithoutMutation()
 	{
 		FakeBreakpointCollection collection = new();

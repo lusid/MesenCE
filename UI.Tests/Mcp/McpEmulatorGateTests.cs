@@ -111,6 +111,63 @@ public sealed class McpEmulatorGateTests
 	}
 
 	[Fact]
+	public void ExecuteWithDebuggerLease_WhenAcquireChangesBlockState_RefreshesSnapshotBeforeMutation()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api);
+		int mutations = 0;
+
+		McpServiceResult<int> result = gate.ExecuteWithDebuggerLease(
+			() => {
+				api.SetDebuggerRequestBlocked(true);
+				api.SetDebuggerRequestBlocked(false);
+			},
+			(_, prepareDebuggerLease) => {
+				McpServiceResult<bool> lease = prepareDebuggerLease();
+				if(!lease.IsSuccess) {
+					return McpServiceResult<int>.Failure(lease.Error!.Code, lease.Error.Message);
+				}
+				mutations++;
+				return McpServiceResult<int>.Success(1);
+			}
+		);
+
+		Assert.True(result.IsSuccess);
+		Assert.Equal(1, mutations);
+	}
+
+	[Theory]
+	[InlineData(true)]
+	[InlineData(false)]
+	public void ExecuteWithDebuggerLease_WhenAcquireStartsTransitionOrBlock_RejectsBeforeMutation(bool transition)
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api);
+		bool mutated = false;
+
+		McpServiceResult<int> result = gate.ExecuteWithDebuggerLease(
+			() => {
+				if(transition) {
+					gate.BeginEmulatorTransition();
+				} else {
+					api.SetDebuggerRequestBlocked(true);
+				}
+			},
+			(_, prepareDebuggerLease) => {
+				McpServiceResult<bool> lease = prepareDebuggerLease();
+				if(!lease.IsSuccess) {
+					return McpServiceResult<int>.Failure(lease.Error!.Code, lease.Error.Message);
+				}
+				mutated = true;
+				return McpServiceResult<int>.Success(1);
+			}
+		);
+
+		Assert.Equal("state_changed", result.Error!.Code);
+		Assert.False(mutated);
+	}
+
+	[Fact]
 	public void Execute_WhenOperationThrows_ReturnsSanitizedInteropFailure()
 	{
 		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
