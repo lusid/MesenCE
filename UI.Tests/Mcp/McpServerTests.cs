@@ -582,6 +582,69 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
+	public async Task Stop_WhenHostCleanupExceedsTimeout_DetachesHostAndCleansServiceExactlyOnce()
+	{
+		TaskCompletionSource releaseHostCleanup = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		TaskCompletionSource hostCleanupCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		using ManualResetEventSlim hostCleanupEntered = new();
+		int hostCleanupCalls = 0;
+		int debuggerReleaseCalls = 0;
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => debuggerReleaseCalls++),
+			breakpointCollection: breakpoints
+		);
+		using McpServer server = new(
+			service,
+			applicationCleanup: async (application, _) => {
+				Interlocked.Increment(ref hostCleanupCalls);
+				hostCleanupEntered.Set();
+				await releaseHostCleanup.Task;
+				await application.DisposeAsync();
+				hostCleanupCompleted.SetResult();
+			}
+		);
+		await server.StartAsync(0);
+		Assert.True(service.SetBreakpoint(
+			nameof(CpuType.Nes),
+			nameof(MemoryType.NesWorkRam),
+			"write",
+			0,
+			null,
+			null
+		).IsSuccess);
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+		long elapsed = Environment.TickCount64 - started;
+
+		Assert.True(hostCleanupEntered.IsSet);
+		Assert.InRange(elapsed, 0, 1000);
+		Assert.Equal(1, hostCleanupCalls);
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(1, debuggerReleaseCalls);
+		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
+		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
+		Action restart = () => { _ = server.StartAsync(0); };
+		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
+		int nativeCallsAfterStop = NativeCallCount(api);
+
+		releaseHostCleanup.SetResult();
+		await hostCleanupCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+		Assert.Equal(nativeCallsAfterStop, NativeCallCount(api));
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+		Assert.Equal(1, hostCleanupCalls);
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(1, debuggerReleaseCalls);
+	}
+
+	[Fact]
 	public async Task Stop_WithBlockedToolCall_WaitsForNativeDrainAndDoesNotResurrectHost()
 	{
 		using ManualResetEventSlim readEntered = new();
@@ -629,6 +692,33 @@ public sealed class McpServerTests
 	}
 
 	private static Dictionary<string, object?> Request(object request) => new() { ["request"] = request };
+
+	private static int NativeCallCount(FakeMcpEmulatorApi api) =>
+		api.DebuggerRequestBlockStateCalls
+		+ api.IsRunningCalls
+		+ api.IsPausedCalls
+		+ api.GetRomInfoCalls
+		+ api.GetMemorySizeCalls
+		+ api.GetMemoryValuesCalls
+		+ api.SetMemoryValuesCalls
+		+ api.GetNesCpuStateCalls
+		+ api.PauseCalls
+		+ api.ResumeCalls
+		+ api.ResumeDebuggerCalls
+		+ api.IsExecutionStoppedCalls
+		+ api.StepCalls
+		+ api.GetDebuggerFeaturesCalls
+		+ api.EvaluateExpressionCalls
+		+ api.GetProgramCounterCalls
+		+ api.GetDisassemblyOutputCalls
+		+ api.GetDisassemblyRowAddressCalls
+		+ api.GetAbsoluteAddressCalls
+		+ api.GetRelativeAddressCalls
+		+ api.GetCallstackCalls
+		+ api.SetTraceOptionsCalls
+		+ api.ClearExecutionTraceCalls
+		+ api.GetExecutionTraceSizeCalls
+		+ api.GetExecutionTraceCalls;
 
 	private static JsonElement RequestProperties(IEnumerable<McpClientTool> tools, string toolName)
 	{
@@ -685,6 +775,30 @@ public sealed class McpServerTests
 			_stableIdsByNativeId.TryGetValue(nativeBreakpointId, out stableId);
 
 		public void Dispose() { }
+	}
+
+	private sealed class TrackingBreakpointCollection : IMcpBreakpointCollection
+	{
+		public int EmptyReplaceCalls { get; private set; }
+		public int DisposeCalls { get; private set; }
+
+		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints)
+		{
+			if(breakpoints.Count == 0) {
+				EmptyReplaceCalls++;
+			}
+		}
+
+		public bool TryGetStableId(int nativeBreakpointId, out long stableId)
+		{
+			stableId = 0;
+			return false;
+		}
+
+		public void Dispose()
+		{
+			DisposeCalls++;
+		}
 	}
 
 }
