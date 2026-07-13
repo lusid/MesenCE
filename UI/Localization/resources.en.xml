@@ -778,6 +778,10 @@
 			<Control ID="lblSaveStateMinutes">minutes (game clock)</Control>
 			<Control ID="lblRewind">Allow rewind to use up to </Control>
 			<Control ID="lblRewindMinutes">MB of memory (Memory Usage ≈5MB/min)</Control>
+			<Control ID="McpServer">MCP server</Control>
+			<Control ID="EnableMcpServer">Enable MCP server</Control>
+			<Control ID="McpServerPort">MCP server port</Control>
+			<Control ID="McpServerWarning">Local applications can read and modify emulator memory while this server is enabled. The server listens only on 127.0.0.1.</Control>
 
 			<Control ID="tpgShortcuts">Shortcut Keys</Control>
 
