@@ -183,10 +183,11 @@ namespace Mesen.Windows
 			}
 
 			_timerBackgroundFlag.Stop();
-			_mcpLifecycle.Stop();
-			EmuApi.Stop();
-			_listener?.Dispose();
-			EmuApi.Release();
+			_mcpLifecycle.StopBeforeCoreRelease(
+				EmuApi.Stop,
+				() => _listener?.Dispose(),
+				EmuApi.Release
+			);
 			ConfigManager.Config.MainWindow.SaveWindowSettings(this);
 			ConfigManager.Config.Save();
 			_isClosing = true;
@@ -279,9 +280,11 @@ namespace Mesen.Windows
 
 				_model.Init(this);
 
-				ConfigManager.Config.ApplyConfig();
-
-				await _mcpLifecycle.StartAsync(ConfigManager.Config.Mcp.Enabled, ConfigManager.Config.Mcp.Port);
+				await _mcpLifecycle.ApplyConfigAndStartAsync(
+					ConfigManager.Config.ApplyConfig,
+					ConfigManager.Config.Mcp.Enabled,
+					ConfigManager.Config.Mcp.Port
+				);
 
 				if(ConfigManager.Config.Preferences.OverrideGameFolder && Directory.Exists(ConfigManager.Config.Preferences.GameFolder)) {
 					EmuApi.AddKnownGameFolder(ConfigManager.Config.Preferences.GameFolder);
@@ -828,11 +831,9 @@ namespace Mesen.Windows
 
 	internal sealed class MainWindowMcpLifecycle
 	{
-		private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(2);
 		private readonly object _lock = new();
 		private readonly Func<McpServer> _createServer;
 		private readonly Func<McpServer, ushort, Task> _startServer;
-		private readonly Action<McpServer, TimeSpan> _stopServer;
 		private readonly Action<McpServer> _disposeServer;
 		private readonly Action<string> _log;
 		private McpServer? _server;
@@ -842,7 +843,6 @@ namespace Mesen.Windows
 			: this(
 				() => new McpServer(new McpEmulatorService(new MesenMcpEmulatorApi())),
 				(server, port) => server.StartAsync(port),
-				(server, timeout) => server.Stop(timeout),
 				server => server.Dispose(),
 				McpServer.Log
 			)
@@ -851,15 +851,19 @@ namespace Mesen.Windows
 		internal MainWindowMcpLifecycle(
 			Func<McpServer> createServer,
 			Func<McpServer, ushort, Task> startServer,
-			Action<McpServer, TimeSpan> stopServer,
 			Action<McpServer> disposeServer,
 			Action<string> log)
 		{
 			_createServer = createServer;
 			_startServer = startServer;
-			_stopServer = stopServer;
 			_disposeServer = disposeServer;
 			_log = log;
+		}
+
+		internal async Task ApplyConfigAndStartAsync(Action applyConfig, bool enabled, ushort port)
+		{
+			applyConfig();
+			await StartAsync(enabled, port).ConfigureAwait(false);
 		}
 
 		internal async Task StartAsync(bool enabled, ushort port)
@@ -898,7 +902,7 @@ namespace Mesen.Windows
 			}
 		}
 
-		internal void Stop()
+		internal void StopBeforeCoreRelease(Action stopCore, Action disposeListener, Action releaseCore)
 		{
 			McpServer? server;
 			lock(_lock) {
@@ -908,9 +912,11 @@ namespace Mesen.Windows
 			}
 
 			if(server != null) {
-				_stopServer(server, StopTimeout);
 				_disposeServer(server);
 			}
+			stopCore();
+			disposeListener();
+			releaseCore();
 		}
 	}
 }

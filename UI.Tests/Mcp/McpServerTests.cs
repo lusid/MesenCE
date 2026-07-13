@@ -11,7 +11,7 @@ namespace UI.Tests.Mcp;
 public sealed class McpServerTests
 {
 	[Fact]
-	public async Task MainWindowLifecycle_OnlyHostsAfterInitializationAndStopsBeforeCoreRelease()
+	public async Task MainWindowLifecycle_AppliesConfigBeforeStartingAndStopsBeforeCoreRelease()
 	{
 		List<string> events = [];
 		int createCalls = 0;
@@ -25,23 +25,25 @@ public sealed class McpServerTests
 				events.Add("start");
 				return Task.CompletedTask;
 			},
-			(_, timeout) => events.Add($"stop:{timeout.TotalSeconds}"),
 			_ => events.Add("dispose"),
 			events.Add
 		);
 
-		await lifecycle.StartAsync(false, 7342);
+		await lifecycle.ApplyConfigAndStartAsync(() => events.Add("disabled-config"), false, 7342);
 		Assert.Equal(0, createCalls);
-		events.Add("initialized");
-		await lifecycle.StartAsync(true, 7342);
+		await lifecycle.ApplyConfigAndStartAsync(() => events.Add("config"), true, 7342);
 		await lifecycle.StartAsync(true, 7342);
 		Assert.Equal(1, createCalls);
 
-		lifecycle.Stop();
-		lifecycle.Stop();
-		events.Add("core-release");
+		lifecycle.StopBeforeCoreRelease(
+			() => events.Add("core-stop"),
+			() => events.Add("listener-dispose"),
+			() => events.Add("core-release")
+		);
 
-		Assert.Equal(["initialized", "start", "stop:2", "dispose", "core-release"], events);
+		Assert.Equal([
+			"disabled-config", "config", "start", "dispose", "core-stop", "listener-dispose", "core-release"
+		], events);
 	}
 
 	[Fact]
@@ -53,13 +55,12 @@ public sealed class McpServerTests
 		MainWindowMcpLifecycle lifecycle = new(
 			() => server,
 			(_, _) => Task.FromException(new IOException("Address already in use")),
-			(_, _) => throw new InvalidOperationException("Failed hosts must not be stopped."),
 			_ => disposeCalls++,
 			logs.Add
 		);
 
 		await lifecycle.StartAsync(true, 7342);
-		lifecycle.Stop();
+		lifecycle.StopBeforeCoreRelease(() => { }, () => { }, () => { });
 
 		Assert.Equal(1, disposeCalls);
 		Assert.Equal(["[MCP] Unable to start server on 127.0.0.1:7342: Address already in use"], logs);
@@ -74,18 +75,17 @@ public sealed class McpServerTests
 		MainWindowMcpLifecycle lifecycle = new(
 			() => server,
 			(_, _) => startup.Task,
-			(_, _) => events.Add("stop"),
 			_ => events.Add("dispose"),
 			message => events.Add($"log:{message}")
 		);
 
 		Task start = lifecycle.StartAsync(true, 7342);
-		lifecycle.Stop();
+		lifecycle.StopBeforeCoreRelease(() => events.Add("core-stop"), () => { }, () => events.Add("core-release"));
 		startup.SetException(new OperationCanceledException("closing"));
 		await start;
-		lifecycle.Stop();
+		lifecycle.StopBeforeCoreRelease(() => { }, () => { }, () => { });
 
-		Assert.Equal(["stop", "dispose"], events);
+		Assert.Equal(["dispose", "core-stop", "core-release"], events);
 	}
 
 	[Fact]
