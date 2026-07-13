@@ -148,6 +148,10 @@ public sealed class McpServerTests
 		});
 		Assert.Contains("modifies emulator state immediately", tools.Single(tool => tool.Name == "write_memory").Description);
 		JsonElement writeSchema = tools.Single(tool => tool.Name == "write_memory").JsonSchema;
+		JsonElement readSchema = tools.Single(tool => tool.Name == "read_memory").JsonSchema;
+		JsonElement countSchema = readSchema.GetProperty("properties").GetProperty("request").GetProperty("properties").GetProperty("count");
+		Assert.Equal(1, countSchema.GetProperty("minimum").GetInt32());
+		Assert.Equal(McpEmulatorService.MaxTransferSize, countSchema.GetProperty("maximum").GetInt32());
 		JsonElement dataSchema = writeSchema.GetProperty("properties").GetProperty("request").GetProperty("properties").GetProperty("data");
 		Assert.Equal("array", dataSchema.GetProperty("type").GetString());
 		Assert.Equal(McpEmulatorService.MaxTransferSize, dataSchema.GetProperty("maxItems").GetInt32());
@@ -156,6 +160,27 @@ public sealed class McpServerTests
 		Assert.Equal(byte.MaxValue, dataSchema.GetProperty("items").GetProperty("maximum").GetInt32());
 		Assert.False(tools.Single(tool => tool.Name == "write_memory").ProtocolTool.Annotations!.IdempotentHint);
 		Assert.All(tools.Where(tool => tool.Name != "write_memory"), tool => Assert.True(tool.ProtocolTool.Annotations!.IdempotentHint));
+	}
+
+	[Fact]
+	public async Task ReadMemory_RejectsOversizeCountBeforeRangeValidationOrNativeAccess()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		using McpServer server = new(new McpEmulatorService(api));
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult result = await client.CallToolAsync("read_memory", Request(new {
+			space = "invalid",
+			address = uint.MaxValue,
+			count = McpEmulatorService.MaxTransferSize + 1
+		}));
+
+		Assert.True(result.IsError);
+		Assert.Equal("payload_too_large", result.StructuredContent!.Value.GetProperty("code").GetString());
+		Assert.Equal(0, api.DebuggerRequestBlockStateCalls);
+		Assert.Equal(0, api.IsRunningCalls);
+		Assert.Equal(0, api.GetMemoryValuesCalls);
 	}
 
 	[Fact]
@@ -456,6 +481,13 @@ public sealed class McpServerTests
 		public int IsRunningCalls { get; private set; }
 		public int GetMemoryValuesCalls { get; private set; }
 		public int SetMemoryValuesCalls { get; private set; }
+		public int DebuggerRequestBlockStateCalls { get; private set; }
+
+		public ulong GetDebuggerRequestBlockState()
+		{
+			DebuggerRequestBlockStateCalls++;
+			return 0;
+		}
 
 		public bool IsRunning()
 		{

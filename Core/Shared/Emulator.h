@@ -106,6 +106,8 @@ private:
 
 	atomic<int> _debugRequestCount;
 	atomic<int> _blockDebuggerRequestCount;
+	// Low bit is the current blocked state; upper bits are an epoch updated at every block boundary.
+	atomic<uint64_t> _debuggerRequestBlockState;
 
 	atomic<bool> _isRunAheadFrame;
 	bool _frameRunning = false;
@@ -139,6 +141,8 @@ private:
 	void RunFrameWithRunAhead();
 
 	void BlockDebuggerRequests();
+	void UnblockDebuggerRequests();
+	void UpdateDebuggerRequestBlockState(bool blocked);
 	void ResetDebugger(bool startDebugger = false);
 
 	double GetFrameDelay();
@@ -196,6 +200,7 @@ public:
 	bool IsThreadPaused();
 
 	bool IsDebuggerBlocked() { return _blockDebuggerRequestCount > 0; }
+	uint64_t GetDebuggerRequestBlockState() { return _debuggerRequestBlockState.load(); }
 	void SuspendDebugger(bool release);
 
 	void Serialize(ostream& out, bool includeSettings, int compressionLevel = 1);

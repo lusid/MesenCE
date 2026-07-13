@@ -225,7 +225,6 @@ public sealed class McpEmulatorServiceTests
 	[Theory]
 	[InlineData(0U, -1)]
 	[InlineData(0U, 0)]
-	[InlineData(0U, McpEmulatorService.MaxTransferSize + 1)]
 	[InlineData(16U, 1)]
 	[InlineData(uint.MaxValue, 2)]
 	[InlineData(15U, 2)]
@@ -237,6 +236,20 @@ public sealed class McpEmulatorServiceTests
 		McpServiceResult<MemoryRead> result = service.ReadMemory(nameof(MemoryType.NesWorkRam), address, count);
 
 		Assert.Equal("invalid_range", result.Error!.Code);
+		Assert.Equal(0, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public void ReadMemory_WhenCountExceedsLimit_ReturnsPayloadTooLargeBeforeRangeValidation()
+	{
+		FakeMcpEmulatorApi api = new() { Running = true };
+		McpEmulatorService service = new(api);
+
+		McpServiceResult<MemoryRead> result = service.ReadMemory("invalid", uint.MaxValue, McpEmulatorService.MaxTransferSize + 1);
+
+		Assert.Equal("payload_too_large", result.Error!.Code);
+		Assert.Equal(0, api.DebuggerRequestBlockStateCalls);
+		Assert.Equal(0, api.IsRunningCalls);
 		Assert.Equal(0, api.GetMemoryValuesCalls);
 	}
 
@@ -366,11 +379,74 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
-	public void EmulatorOperation_WhenGenerationChangesDuringInterop_ReturnsStateChanged()
+	public void EmulatorOperation_WhenTransitionBeginsDuringInterop_ReturnsStateChanged()
 	{
 		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
 		McpEmulatorService service = new(api);
-		api.OnRead = service.NotifyEmulatorStateChanged;
+		api.OnRead = service.BeginEmulatorTransition;
+
+		McpServiceResult<MemoryRead> result = service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenTransitionBeginsAndEndsDuringInterop_ReturnsStateChanged()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		McpEmulatorService service = new(api);
+		api.OnRead = () => {
+			service.BeginEmulatorTransition();
+			service.EndEmulatorTransition();
+		};
+
+		McpServiceResult<MemoryRead> result = service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenTransitionIsActive_RejectsBeforeNativeDataAccessAndRecoversAfterEnd()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		McpEmulatorService service = new(api);
+		service.BeginEmulatorTransition();
+
+		McpServiceResult<MemoryRead> blocked = service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("state_changed", blocked.Error!.Code);
+		Assert.Equal(0, api.IsRunningCalls);
+		Assert.Equal(0, api.GetMemoryValuesCalls);
+
+		service.EndEmulatorTransition();
+		Assert.True(service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).IsSuccess);
+		Assert.Equal(1, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenDebuggerRequestsAreBlocked_RejectsBeforeNativeDataAccess()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.SetDebuggerRequestBlocked(true);
+		McpEmulatorService service = new(api);
+
+		McpServiceResult<MemoryRead> result = service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("state_changed", result.Error!.Code);
+		Assert.Equal(0, api.IsRunningCalls);
+		Assert.Equal(0, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenDebuggerBlockStartsAndEndsAroundDefaultInteropResult_ReturnsStateChanged()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.OnRead = () => {
+			api.SetDebuggerRequestBlocked(true);
+			api.ReadData = [];
+			api.SetDebuggerRequestBlocked(false);
+		};
+		McpEmulatorService service = new(api);
 
 		McpServiceResult<MemoryRead> result = service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
 
@@ -444,6 +520,8 @@ public sealed class McpEmulatorServiceTests
 		public byte[] ReadData { get; set; } = [0];
 		public NesCpuState NesCpuState { get; init; }
 		public Action? OnRead { get; set; }
+		public ulong DebuggerRequestBlockState { get; private set; }
+		public int DebuggerRequestBlockStateCalls { get; private set; }
 		public int IsRunningCalls { get; private set; }
 		public int GetRomInfoCalls { get; private set; }
 		public int GetMemoryValuesCalls { get; private set; }
@@ -458,6 +536,17 @@ public sealed class McpEmulatorServiceTests
 		{
 			IsRunningCalls++;
 			return Running;
+		}
+
+		public ulong GetDebuggerRequestBlockState()
+		{
+			DebuggerRequestBlockStateCalls++;
+			return DebuggerRequestBlockState;
+		}
+
+		public void SetDebuggerRequestBlocked(bool blocked)
+		{
+			DebuggerRequestBlockState = (((DebuggerRequestBlockState >> 1) + 1) << 1) | (blocked ? 1UL : 0);
 		}
 
 		public bool IsPaused() => Paused;

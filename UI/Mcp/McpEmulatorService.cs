@@ -17,6 +17,7 @@ internal sealed class McpEmulatorService
 	private readonly IMcpEmulatorApi _api;
 	private readonly SemaphoreSlim _emulatorSemaphore = new(1, 1);
 	private long _emulatorGeneration;
+	private int _transitionActive;
 	private int _shutdownStarted;
 
 	public McpEmulatorService(IMcpEmulatorApi api)
@@ -101,6 +102,10 @@ internal sealed class McpEmulatorService
 
 	public McpServiceResult<MemoryRead> ReadMemory(string space, uint address, int count)
 	{
+		if(count > MaxTransferSize) {
+			return McpServiceResult<MemoryRead>.Failure("payload_too_large", $"Read count cannot exceed {MaxTransferSize} bytes.");
+		}
+
 		return Execute(() => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<MemoryRead>.Failure("no_game", "No game is currently loaded.");
@@ -110,7 +115,7 @@ internal sealed class McpEmulatorService
 				return McpServiceResult<MemoryRead>.Failure("unknown_memory_space", "The selected memory space is not available.");
 			}
 
-			if(count <= 0 || count > MaxTransferSize || address >= size || (uint)count > (uint)size - address) {
+			if(count <= 0 || address >= size || (uint)count > (uint)size - address) {
 				return McpServiceResult<MemoryRead>.Failure("invalid_range", "The requested range is outside the selected memory space.");
 			}
 
@@ -167,6 +172,18 @@ internal sealed class McpEmulatorService
 		Interlocked.Increment(ref _emulatorGeneration);
 	}
 
+	internal void BeginEmulatorTransition()
+	{
+		Interlocked.Exchange(ref _transitionActive, 1);
+		Interlocked.Increment(ref _emulatorGeneration);
+	}
+
+	internal void EndEmulatorTransition()
+	{
+		Interlocked.Increment(ref _emulatorGeneration);
+		Interlocked.Exchange(ref _transitionActive, 0);
+	}
+
 	internal void BeginShutdown()
 	{
 		Interlocked.Exchange(ref _shutdownStarted, 1);
@@ -187,6 +204,14 @@ internal sealed class McpEmulatorService
 			}
 
 			long generation = Volatile.Read(ref _emulatorGeneration);
+			ulong debuggerBlockState = _api.GetDebuggerRequestBlockState();
+			if(Volatile.Read(ref _transitionActive) != 0 || IsDebuggerRequestBlocked(debuggerBlockState)) {
+				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
+			if(generation != Volatile.Read(ref _emulatorGeneration)) {
+				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
+
 			McpServiceResult<T> result;
 			try {
 				result = operation();
@@ -194,7 +219,11 @@ internal sealed class McpEmulatorService
 				result = McpServiceResult<T>.Failure("interop_failure", "Native emulator interop failed.");
 			}
 
-			if(generation != Volatile.Read(ref _emulatorGeneration)) {
+			ulong endingDebuggerBlockState = _api.GetDebuggerRequestBlockState();
+			if(generation != Volatile.Read(ref _emulatorGeneration)
+				|| Volatile.Read(ref _transitionActive) != 0
+				|| debuggerBlockState != endingDebuggerBlockState
+				|| IsDebuggerRequestBlocked(endingDebuggerBlockState)) {
 				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
 			}
 			return result;
@@ -202,4 +231,6 @@ internal sealed class McpEmulatorService
 			_emulatorSemaphore.Release();
 		}
 	}
+
+	private static bool IsDebuggerRequestBlocked(ulong state) => (state & 1) != 0;
 }

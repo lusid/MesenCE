@@ -31,6 +31,14 @@ internal sealed class McpTools
 		McpTools tools = new(service, log ?? McpServer.Log);
 		JsonSerializerOptions serializerOptions = new(McpJsonUtilities.DefaultOptions);
 		serializerOptions.TypeInfoResolverChain.Insert(0, McpToolJsonContext.Default);
+		McpServerTool readTool = CreateTool(
+			new Func<ReadMemoryRequest, CallToolResult>(tools.ReadMemory),
+			"read_memory",
+			"Reads live emulator memory without pausing emulation.",
+			serializerOptions,
+			readOnly: true
+		);
+		AddReadSchemaLimits(readTool);
 		McpServerTool writeTool = CreateTool(
 			new Func<WriteMemoryRequest, CallToolResult>(tools.WriteMemory),
 			"write_memory",
@@ -55,13 +63,7 @@ internal sealed class McpTools
 				serializerOptions,
 				readOnly: true
 			),
-			CreateTool(
-				new Func<ReadMemoryRequest, CallToolResult>(tools.ReadMemory),
-				"read_memory",
-				"Reads live emulator memory without pausing emulation.",
-				serializerOptions,
-				readOnly: true
-			),
+			readTool,
 			writeTool,
 			CreateTool(
 				new Func<CallToolResult>(tools.GetCpuRegisters),
@@ -159,6 +161,16 @@ internal sealed class McpTools
 		JsonObject itemSchema = dataSchema["items"]!.AsObject();
 		itemSchema["minimum"] = 0;
 		itemSchema["maximum"] = byte.MaxValue;
+		using JsonDocument document = JsonDocument.Parse(schema.ToJsonString());
+		tool.ProtocolTool.InputSchema = document.RootElement.Clone();
+	}
+
+	private static void AddReadSchemaLimits(McpServerTool tool)
+	{
+		JsonObject schema = JsonNode.Parse(tool.ProtocolTool.InputSchema.GetRawText())!.AsObject();
+		JsonObject countSchema = schema["properties"]!["request"]!["properties"]!["count"]!.AsObject();
+		countSchema["minimum"] = 1;
+		countSchema["maximum"] = McpEmulatorService.MaxTransferSize;
 		using JsonDocument document = JsonDocument.Parse(schema.ToJsonString());
 		tool.ProtocolTool.InputSchema = document.RootElement.Clone();
 	}

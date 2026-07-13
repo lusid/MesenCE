@@ -5,6 +5,7 @@ namespace Mesen.Mcp;
 internal interface IMcpEmulatorApi
 {
 	bool IsRunning();
+	ulong GetDebuggerRequestBlockState();
 	bool IsPaused();
 	RomInfo GetRomInfo();
 	int GetMemorySize(MemoryType type);

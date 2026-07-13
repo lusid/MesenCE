@@ -94,6 +94,16 @@ internal sealed class McpServer : IDisposable
 		_service.NotifyEmulatorStateChanged();
 	}
 
+	internal void BeginEmulatorTransition()
+	{
+		_service.BeginEmulatorTransition();
+	}
+
+	internal void EndEmulatorTransition()
+	{
+		_service.EndEmulatorTransition();
+	}
+
 	internal void DrainEmulatorOperations()
 	{
 		_service.DrainOperations();

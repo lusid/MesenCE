@@ -76,6 +76,7 @@ Emulator::Emulator()
 
 	_debugRequestCount = 0;
 	_blockDebuggerRequestCount = 0;
+	_debuggerRequestBlockState = 0;
 
 	_videoDecoder->Init();
 }
@@ -315,7 +316,7 @@ void Emulator::Stop(bool sendNotification, bool preventRecentGameSave, bool save
 		_notificationManager->SendNotification(ConsoleNotificationType::EmulationStopped);
 	}
 
-	_blockDebuggerRequestCount--;
+	UnblockDebuggerRequests();
 }
 
 void Emulator::Reset()
@@ -449,7 +450,7 @@ bool Emulator::InternalLoadRom(VirtualFile romFile, VirtualFile patchFile, bool 
 			_internalDebugger = _debugger.get();
 			debugger->ResetSuspendCounter();
 		}
-		_blockDebuggerRequestCount--;
+		UnblockDebuggerRequests();
 		return false;
 	}
 
@@ -514,7 +515,7 @@ bool Emulator::InternalLoadRom(VirtualFile romFile, VirtualFile patchFile, bool 
 
 	//Mark the thread as paused, and release the debugger lock to avoid
 	//deadlocks with DebugBreakHelper if GameLoaded event starts the debugger
-	_blockDebuggerRequestCount--;
+	UnblockDebuggerRequests();
 	dbgLock.Release();
 
 	_threadPaused = true;
@@ -1052,6 +1053,7 @@ void Emulator::BlockDebuggerRequests()
 	//Block all new debugger calls
 	auto lock = _debuggerLock.AcquireSafe();
 	_blockDebuggerRequestCount++;
+	UpdateDebuggerRequestBlockState(true);
 	if(_debugger) {
 		//Ensure any thread waiting on DebugBreakHelper is allowed to resume/finish (prevent deadlock)
 		_debugger->ResetSuspendCounter();
@@ -1061,6 +1063,21 @@ void Emulator::BlockDebuggerRequests()
 		//Wait until debugger calls are all done
 		std::this_thread::sleep_for(std::chrono::duration<int, std::milli>(10));
 	}
+}
+
+void Emulator::UnblockDebuggerRequests()
+{
+	int blockCount = --_blockDebuggerRequestCount;
+	UpdateDebuggerRequestBlockState(blockCount > 0);
+}
+
+void Emulator::UpdateDebuggerRequestBlockState(bool blocked)
+{
+	uint64_t state = _debuggerRequestBlockState.load();
+	uint64_t updatedState;
+	do {
+		updatedState = (((state >> 1) + 1) << 1) | (blocked ? 1 : 0);
+	} while(!_debuggerRequestBlockState.compare_exchange_weak(state, updatedState));
 }
 
 DebuggerRequest Emulator::GetDebugger(bool autoInit)
@@ -1103,7 +1120,7 @@ void Emulator::InitDebugger()
 		if(!_debugger) {
 			BlockDebuggerRequests();
 			ResetDebugger(true);
-			_blockDebuggerRequestCount--;
+			UnblockDebuggerRequests();
 
 			//_paused should be false while debugger is enabled
 			_paused = false;
@@ -1121,7 +1138,7 @@ void Emulator::StopDebugger()
 		if(_debugger) {
 			BlockDebuggerRequests();
 			ResetDebugger();
-			_blockDebuggerRequestCount--;
+			UnblockDebuggerRequests();
 		}
 	}
 }

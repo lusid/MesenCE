@@ -5,6 +5,7 @@ namespace Mesen.Mcp;
 internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 {
 	public bool IsRunning() => EmuApi.IsRunning();
+	public ulong GetDebuggerRequestBlockState() => DebugApi.GetDebuggerRequestBlockState();
 	public bool IsPaused() => EmuApi.IsPaused();
 	public RomInfo GetRomInfo() => EmuApi.GetRomInfo();
 	public int GetMemorySize(MemoryType type) => DebugApi.GetMemorySize(type);
