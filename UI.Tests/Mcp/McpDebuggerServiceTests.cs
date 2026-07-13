@@ -4,6 +4,7 @@ using Mesen.Interop;
 using Mesen.Mcp;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using static Mesen.Debugger.BreakpointManager;
 
 namespace UI.Tests.Mcp;
@@ -501,6 +502,172 @@ public sealed class McpDebuggerServiceTests
 		Assert.Single(result.Frames);
 	}
 
+	[Fact]
+	public void ConfigureExecutionTrace_EnableValidatesUtf8BeforeNativeMutation()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		InteropTraceLoggerOptions captured = default;
+		api.SetTraceOptionsHandler = (_, options) => captured = options;
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+		string tooLarge = new('\u00E9', 500);
+		string maximum = new('x', McpDebuggerLimits.MaxConditionUtf8Bytes);
+
+		McpServiceResult<TraceConfiguration> invalidCondition = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "enable", true, true, tooLarge, "format"
+		);
+		McpServiceResult<TraceConfiguration> invalidFormat = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "enable", true, true, "condition", tooLarge
+		);
+
+		Assert.Equal("payload_too_large", invalidCondition.Error!.Code);
+		Assert.Equal("payload_too_large", invalidFormat.Error!.Code);
+		Assert.Equal(0, api.SetTraceOptionsCalls);
+
+		TraceConfiguration result = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "enable", true, false, maximum, maximum
+		).Value!;
+
+		Assert.True(result.Enabled);
+		Assert.True(result.IndentCode);
+		Assert.False(result.UseLabels);
+		Assert.Equal(maximum, result.Condition);
+		Assert.Equal(maximum, result.Format);
+		byte[] conditionBuffer = Assert.IsType<byte[]>(captured.Condition);
+		byte[] formatBuffer = Assert.IsType<byte[]>(captured.Format);
+		Assert.Equal(1000, conditionBuffer.Length);
+		Assert.Equal(1000, formatBuffer.Length);
+		Assert.Equal(Encoding.UTF8.GetBytes(maximum), conditionBuffer[..^1]);
+		Assert.Equal(Encoding.UTF8.GetBytes(maximum), formatBuffer[..^1]);
+		Assert.Equal(0, conditionBuffer[^1]);
+		Assert.Equal(0, formatBuffer[^1]);
+	}
+
+	[Fact]
+	public void ConfigureExecutionTrace_ClearClearsRowsWithoutDisabling()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+		TraceConfiguration configured = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "enable", true, false, "pc >= $8000", "{Address}"
+		).Value!;
+
+		McpServiceResult<TraceConfiguration> result = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "clear", false, false, null, null
+		);
+
+		Assert.Equal(configured, result.Value);
+		Assert.Equal(1, api.SetTraceOptionsCalls);
+		Assert.Equal(1, api.ClearExecutionTraceCalls);
+	}
+
+	[Fact]
+	public void ConfigureExecutionTrace_DisableSendsDisabledOptionsAndClearsOwnership()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		List<InteropTraceLoggerOptions> options = [];
+		api.SetTraceOptionsHandler = (_, value) => options.Add(value);
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", true, true, "condition", "format");
+
+		TraceConfiguration disabled = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "disable", false, false, null, null
+		).Value!;
+		McpServiceResult<TraceConfiguration> secondDisable = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "disable", false, false, null, null
+		);
+
+		Assert.False(disabled.Enabled);
+		Assert.False(options[^1].Enabled);
+		Assert.Equal(new byte[1000], options[^1].Condition);
+		Assert.Equal(new byte[1000], options[^1].Format);
+		Assert.Equal(1, api.ClearExecutionTraceCalls);
+		Assert.Equal("trace_not_owned", secondDisable.Error!.Code);
+	}
+
+	[Fact]
+	public void GetExecutionTrace_ReturnsBoundedTailInChronologicalOrder()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		TraceRow[] nativeRows = [
+			CreateTraceRow(CpuType.Nes, 0x8002, [0xA9, 0x02], "second"),
+			CreateTraceRow(CpuType.Nes, 0x8003, [0x60], "third")
+		];
+		api.GetExecutionTraceSizeHandler = () => 3;
+		api.GetExecutionTraceHandler = (start, count) => {
+			Assert.Equal(1U, start);
+			Assert.Equal(2U, count);
+			return nativeRows;
+		};
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
+
+		ExecutionTraceResult result = service.GetExecutionTrace(2).Value!;
+
+		Assert.Equal(3, result.AvailableRows);
+		Assert.True(result.Truncated);
+		Assert.Collection(
+			result.Rows,
+			row => Assert.Equal(new ExecutionTraceRow(nameof(CpuType.Nes), 0x8002, "A902", "second"), row),
+			row => Assert.Equal(new ExecutionTraceRow(nameof(CpuType.Nes), 0x8003, "60", "third"), row)
+		);
+	}
+
+	[Fact]
+	public void GetExecutionTrace_AboveLimitReturnsPayloadTooLargeWithoutNativeRead()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		McpServiceResult<ExecutionTraceResult> result = service.GetExecutionTrace(McpDebuggerLimits.MaxTraceRows + 1);
+
+		Assert.Equal("payload_too_large", result.Error!.Code);
+		Assert.Equal(0, api.GetExecutionTraceSizeCalls);
+		Assert.Equal(0, api.GetExecutionTraceCalls);
+	}
+
+	[Fact]
+	public void TraceConfiguration_GenerationChangeInvalidatesCursorAndClearsOwnedTrace()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		List<InteropTraceLoggerOptions> options = [];
+		api.SetTraceOptionsHandler = (_, value) => options.Add(value);
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
+
+		service.NotifyEmulatorStateChanged();
+
+		Assert.Single(options);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Null(GetPrivateField(service, "_traceConfiguration"));
+
+		Assert.True(service.GetStatus().IsSuccess);
+		Assert.Equal(2, options.Count);
+		Assert.False(options[^1].Enabled);
+		Assert.Equal(1, api.ClearExecutionTraceCalls);
+	}
+
+	[Fact]
+	public void Shutdown_DisablesAndClearsOwnedTrace()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		List<InteropTraceLoggerOptions> options = [];
+		api.SetTraceOptionsHandler = (_, value) => options.Add(value);
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection, api);
+		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
+		SetBreakpoint(service, 0x8000);
+
+		service.BeginShutdown();
+		service.BeginShutdown();
+
+		Assert.Equal(2, options.Count);
+		Assert.False(options[^1].Enabled);
+		Assert.Equal(1, api.ClearExecutionTraceCalls);
+		Assert.Empty(collection.Snapshots[^1]);
+		Assert.Equal(1, collection.DisposeCalls);
+		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
+	}
+
 	private static McpEmulatorService CreateService(FakeBreakpointCollection collection, FakeMcpEmulatorApi? api = null)
 	{
 		return new McpEmulatorService(
@@ -578,6 +745,25 @@ public sealed class McpDebuggerServiceTests
 		}).ToArray();
 	}
 
+	private static TraceRow CreateTraceRow(CpuType cpu, uint programCounter, byte[] byteCode, string output)
+	{
+		byte[] encodedOutput = Encoding.UTF8.GetBytes(output);
+		byte[] native = new byte[Marshal.SizeOf<TraceRow>()];
+		BitConverter.GetBytes(programCounter).CopyTo(native, Marshal.OffsetOf<TraceRow>(nameof(TraceRow.ProgramCounter)).ToInt32());
+		BitConverter.GetBytes((int)cpu).CopyTo(native, Marshal.OffsetOf<TraceRow>(nameof(TraceRow.Type)).ToInt32());
+		byteCode.CopyTo(native, Marshal.OffsetOf<TraceRow>(nameof(TraceRow.ByteCode)).ToInt32());
+		native[Marshal.OffsetOf<TraceRow>(nameof(TraceRow.ByteCodeSize)).ToInt32()] = (byte)byteCode.Length;
+		BitConverter.GetBytes((uint)encodedOutput.Length).CopyTo(native, Marshal.OffsetOf<TraceRow>(nameof(TraceRow.LogSize)).ToInt32());
+		encodedOutput.CopyTo(native, Marshal.OffsetOf<TraceRow>(nameof(TraceRow.LogOutput)).ToInt32());
+		IntPtr pointer = Marshal.AllocHGlobal(native.Length);
+		try {
+			Marshal.Copy(native, 0, pointer, native.Length);
+			return Marshal.PtrToStructure<TraceRow>(pointer);
+		} finally {
+			Marshal.FreeHGlobal(pointer);
+		}
+	}
+
 	private static NotificationEventArgs Notification(IntPtr pointer) => new() {
 		NotificationType = ConsoleNotificationType.CodeBreak,
 		Parameter = pointer
@@ -604,6 +790,7 @@ public sealed class McpDebuggerServiceTests
 
 		internal List<IReadOnlyList<ExternalBreakpoint>> Snapshots { get; } = [];
 		internal int UnownedEntryCount { get; init; }
+		internal int DisposeCalls { get; private set; }
 
 		public void Replace(IReadOnlyList<ExternalBreakpoint> breakpoints)
 		{
@@ -620,6 +807,6 @@ public sealed class McpDebuggerServiceTests
 		internal int GetNativeId(long stableId) =>
 			_stableIdsByNativeId.Single(entry => entry.Value == stableId).Key;
 
-		public void Dispose() { }
+		public void Dispose() => DisposeCalls++;
 	}
 }

@@ -28,8 +28,14 @@ internal sealed class McpEmulatorService : IDisposable
 	private readonly Dictionary<CpuType, TaskCompletionSource<BreakEvent>> _breakWaiters = [];
 	private BreakEvent? _latestBreakEvent;
 	private long _latestBreakGeneration = -1;
+	private TraceConfiguration? _traceConfiguration;
+	private CpuType? _traceCpu;
+	private CpuType? _traceReconciliationCpu;
+	private int _traceReconciliationVersion;
+	private bool _traceReconciliationPending;
 	private long _nextBreakpointId;
 	private IDisposable? _debuggerLease;
+	private bool _shutdownStarted;
 	private bool _disposed;
 
 	internal McpEmulatorService(
@@ -340,7 +346,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<AddressMapping>.Failure("unknown_cpu", "The selected CPU is not available.");
 		}
 
-		return _gate.ExecuteWithTicket(ticket => {
+		return ExecuteWithTicket(ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<AddressMapping>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -382,7 +388,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<CallStackResult>.Failure("unknown_cpu", "The selected CPU is not available.");
 		}
 
-		return _gate.ExecuteWithTicket(ticket => {
+		return ExecuteWithTicket(ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<CallStackResult>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -438,9 +444,135 @@ internal sealed class McpEmulatorService : IDisposable
 		waiter?.TrySetResult(copied);
 	}
 
+	internal McpServiceResult<TraceConfiguration> ConfigureExecutionTrace(
+		string cpu,
+		string action,
+		bool indentCode,
+		bool useLabels,
+		string? condition,
+		string? format)
+	{
+		if(action is not ("enable" or "configure" or "clear" or "disable")) {
+			return McpServiceResult<TraceConfiguration>.Failure(
+				"invalid_action",
+				"Trace action must be enable, configure, clear, or disable."
+			);
+		}
+		if(action is "enable" or "configure") {
+			if(Encoding.UTF8.GetByteCount(condition ?? "") > McpDebuggerLimits.MaxConditionUtf8Bytes) {
+				return McpServiceResult<TraceConfiguration>.Failure(
+					"payload_too_large",
+					$"Trace conditions cannot exceed {McpDebuggerLimits.MaxConditionUtf8Bytes} UTF-8 bytes."
+				);
+			}
+			if(Encoding.UTF8.GetByteCount(format ?? "") > McpDebuggerLimits.MaxTraceFormatUtf8Bytes) {
+				return McpServiceResult<TraceConfiguration>.Failure(
+					"payload_too_large",
+					$"Trace formats cannot exceed {McpDebuggerLimits.MaxTraceFormatUtf8Bytes} UTF-8 bytes."
+				);
+			}
+		}
+		if(!TryParseExactEnum(cpu, out CpuType cpuType)) {
+			return McpServiceResult<TraceConfiguration>.Failure("unknown_cpu", "The selected CPU is not available.");
+		}
+
+		return ExecuteWithTicket(ticket => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<TraceConfiguration>.Failure("no_game", "No game is currently loaded.");
+			}
+			if(!_api.GetRomInfo().CpuTypes.Contains(cpuType)) {
+				return McpServiceResult<TraceConfiguration>.Failure("unknown_cpu", "The selected CPU is not available.");
+			}
+
+			TraceConfiguration? owned;
+			CpuType? ownedCpu;
+			lock(_executionLock) {
+				owned = _traceConfiguration;
+				ownedCpu = _traceCpu;
+			}
+			if(action is "clear" or "disable") {
+				if(owned is null || ownedCpu != cpuType) {
+					return McpServiceResult<TraceConfiguration>.Failure("trace_not_owned", "The execution trace is not owned by MCP for this CPU.");
+				}
+				if(action == "clear") {
+					_api.ClearExecutionTrace();
+					return McpServiceResult<TraceConfiguration>.Success(owned);
+				}
+
+				_api.SetTraceOptions(cpuType, DisabledTraceOptions());
+				_api.ClearExecutionTrace();
+				TraceConfiguration disabled = owned with { Enabled = false, Generation = ticket.Generation };
+				lock(_executionLock) {
+					_traceConfiguration = null;
+					_traceCpu = null;
+				}
+				return McpServiceResult<TraceConfiguration>.Success(disabled);
+			}
+
+			EnsureDebuggerLease();
+			InteropTraceLoggerOptions options = new() {
+				Enabled = true,
+				IndentCode = indentCode,
+				UseLabels = useLabels,
+				Condition = EncodeTraceText(condition),
+				Format = EncodeTraceText(format)
+			};
+			_api.SetTraceOptions(cpuType, options);
+			TraceConfiguration configured = new(cpu, true, indentCode, useLabels, condition, format, ticket.Generation);
+			lock(_executionLock) {
+				_traceConfiguration = configured;
+				_traceCpu = cpuType;
+			}
+			return McpServiceResult<TraceConfiguration>.Success(configured);
+		});
+	}
+
+	internal McpServiceResult<ExecutionTraceResult> GetExecutionTrace(int maxRows)
+	{
+		if(maxRows > McpDebuggerLimits.MaxTraceRows) {
+			return McpServiceResult<ExecutionTraceResult>.Failure(
+				"payload_too_large",
+				$"Trace row count cannot exceed {McpDebuggerLimits.MaxTraceRows}."
+			);
+		}
+		if(maxRows < 1) {
+			return McpServiceResult<ExecutionTraceResult>.Failure("invalid_range", "Trace row count must be at least one.");
+		}
+
+		return ExecuteWithTicket(ticket => {
+			lock(_executionLock) {
+				if(_traceConfiguration is null) {
+					return McpServiceResult<ExecutionTraceResult>.Failure("trace_not_owned", "The execution trace is not owned by MCP.");
+				}
+			}
+
+			uint available = _api.GetExecutionTraceSize();
+			uint count = Math.Min(available, (uint)maxRows);
+			uint startOffset = available - count;
+			TraceRow[] nativeRows = count == 0 ? [] : _api.GetExecutionTrace(startOffset, count);
+			int returnedCount = Math.Min(nativeRows.Length, (int)count);
+			List<ExecutionTraceRow> rows = new(returnedCount);
+			for(int i = 0; i < returnedCount; i++) {
+				TraceRow row = nativeRows[i];
+				rows.Add(new(
+					row.Type.ToString(),
+					row.ProgramCounter,
+					row.GetByteCodeStr().Replace(" ", "", StringComparison.Ordinal),
+					row.GetOutput()
+				));
+			}
+			return McpServiceResult<ExecutionTraceResult>.Success(new(
+				ticket.Generation,
+				checked((int)available),
+				rows,
+				available > count
+			));
+		});
+	}
+
 	internal McpServiceResult<ExecutionState> Pause()
 	{
-		return _gate.ExecuteWithTicket(ticket => {
+		return ExecuteWithTicket(ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -451,7 +583,7 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal McpServiceResult<ExecutionState> Resume()
 	{
-		return _gate.ExecuteWithTicket(ticket => {
+		return ExecuteWithTicket(ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -475,7 +607,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<ExecutionState>.Failure("invalid_step_type", "The selected step type is not supported.");
 		}
 
-		return _gate.ExecuteWithTicket(ticket => {
+		return ExecuteWithTicket(ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -505,7 +637,7 @@ internal sealed class McpEmulatorService : IDisposable
 		McpOperationTicket ticket = default;
 		CpuType cpuType = default;
 		TaskCompletionSource<BreakEvent>? waiter = null;
-		McpServiceResult<ExecutionState> setup = _gate.ExecuteWithTicket(currentTicket => {
+		McpServiceResult<ExecutionState> setup = ExecuteWithTicket(currentTicket => {
 			if(timeoutMs is < McpDebuggerLimits.MinContinueTimeoutMs or > McpDebuggerLimits.MaxContinueTimeoutMs) {
 				return McpServiceResult<ExecutionState>.Failure("invalid_timeout", "Continue timeout is outside the supported range.");
 			}
@@ -561,7 +693,7 @@ internal sealed class McpEmulatorService : IDisposable
 		);
 		try {
 			BreakEvent breakEvent = await waiter!.Task.WaitAsync(linkedCancellation.Token).ConfigureAwait(false);
-			return _gate.ExecuteForTicket(ticket, () => CreateContinueResult(breakEvent, ticket.Generation));
+			return ExecuteForTicket(ticket, () => CreateContinueResult(breakEvent, ticket.Generation));
 		} catch(OperationCanceledException) {
 			if(_gate.ShutdownToken.IsCancellationRequested) {
 				return McpServiceResult<ContinueResult>.Failure("server_stopping", "The MCP server is shutting down.");
@@ -798,6 +930,13 @@ internal sealed class McpEmulatorService : IDisposable
 		TaskCompletionSource<BreakEvent>[] waiters;
 		lock(_executionLock) {
 			changeState();
+			if(_traceCpu.HasValue) {
+				_traceReconciliationCpu = _traceCpu;
+				_traceReconciliationVersion++;
+				_traceReconciliationPending = true;
+				_traceConfiguration = null;
+				_traceCpu = null;
+			}
 			waiters = [.. _breakWaiters.Values];
 			_breakWaiters.Clear();
 			_latestBreakEvent = null;
@@ -839,6 +978,41 @@ internal sealed class McpEmulatorService : IDisposable
 		_debuggerLease ??= _debuggerLifetime.Acquire();
 	}
 
+	private static byte[] EncodeTraceText(string? value)
+	{
+		byte[] buffer = new byte[1000];
+		Encoding.UTF8.GetBytes(value ?? "", buffer);
+		return buffer;
+	}
+
+	private static InteropTraceLoggerOptions DisabledTraceOptions() => new() {
+		Enabled = false,
+		Condition = new byte[1000],
+		Format = new byte[1000]
+	};
+
+	private void ReconcilePendingTrace()
+	{
+		CpuType cpuType;
+		int version;
+		lock(_executionLock) {
+			if(!_traceReconciliationPending || !_traceReconciliationCpu.HasValue) {
+				return;
+			}
+			cpuType = _traceReconciliationCpu.Value;
+			version = _traceReconciliationVersion;
+		}
+
+		_api.SetTraceOptions(cpuType, DisabledTraceOptions());
+		_api.ClearExecutionTrace();
+		lock(_executionLock) {
+			if(_traceReconciliationVersion == version) {
+				_traceReconciliationPending = false;
+				_traceReconciliationCpu = null;
+			}
+		}
+	}
+
 	private static CpuRegister Register(string name, ulong value, int bits)
 	{
 		int digits = (bits + 3) / 4;
@@ -862,7 +1036,58 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal void BeginShutdown()
 	{
-		InvalidateExecutionState(_gate.BeginShutdown);
+		bool requiresNativeCleanup;
+		lock(_executionLock) {
+			if(_shutdownStarted) {
+				return;
+			}
+			_shutdownStarted = true;
+			requiresNativeCleanup = _traceConfiguration is not null || _traceReconciliationPending || _mcpBreakpoints.Count > 0;
+		}
+
+		if(requiresNativeCleanup) {
+			_gate.Execute(() => {
+				ReconcilePendingTrace();
+				CpuType? traceCpu;
+				lock(_executionLock) {
+					traceCpu = _traceCpu;
+				}
+				if(traceCpu.HasValue) {
+					_api.SetTraceOptions(traceCpu.Value, DisabledTraceOptions());
+					_api.ClearExecutionTrace();
+					lock(_executionLock) {
+						_traceConfiguration = null;
+						_traceCpu = null;
+					}
+				}
+				if(_mcpBreakpoints.Count > 0) {
+					_breakpointCollection.Replace([]);
+					_mcpBreakpoints.Clear();
+				}
+				return McpServiceResult<bool>.Success(true);
+			});
+		}
+
+		TaskCompletionSource<BreakEvent>[] waiters;
+		lock(_executionLock) {
+			_gate.BeginShutdown();
+			waiters = [.. _breakWaiters.Values];
+			_breakWaiters.Clear();
+			_latestBreakEvent = null;
+			_latestBreakGeneration = -1;
+		}
+		foreach(TaskCompletionSource<BreakEvent> waiter in waiters) {
+			waiter.TrySetCanceled();
+		}
+
+		try {
+			_breakpointCollection.Dispose();
+		} catch(Exception) {
+			// Shutdown must continue through lease release even if native breakpoint cleanup is unavailable.
+		} finally {
+			_debuggerLease?.Dispose();
+			_debuggerLease = null;
+		}
 	}
 
 	internal void DrainOperations()
@@ -872,7 +1097,26 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
 	{
-		return _gate.Execute(operation);
+		return _gate.Execute(() => {
+			ReconcilePendingTrace();
+			return operation();
+		});
+	}
+
+	private McpServiceResult<T> ExecuteWithTicket<T>(Func<McpOperationTicket, McpServiceResult<T>> operation)
+	{
+		return _gate.ExecuteWithTicket(ticket => {
+			ReconcilePendingTrace();
+			return operation(ticket);
+		});
+	}
+
+	private McpServiceResult<T> ExecuteForTicket<T>(McpOperationTicket ticket, Func<McpServiceResult<T>> operation)
+	{
+		return _gate.ExecuteForTicket(ticket, () => {
+			ReconcilePendingTrace();
+			return operation();
+		});
 	}
 
 	public void Dispose()
@@ -881,10 +1125,6 @@ internal sealed class McpEmulatorService : IDisposable
 			return;
 		}
 		_disposed = true;
-		try {
-			_breakpointCollection.Dispose();
-		} finally {
-			_debuggerLease?.Dispose();
-		}
+		BeginShutdown();
 	}
 }
