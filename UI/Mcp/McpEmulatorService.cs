@@ -99,23 +99,7 @@ internal sealed class McpEmulatorService : IDisposable
 				return McpServiceResult<CpuRegisters>.Failure("registers_not_supported", "CPU registers are not supported for the current system.");
 			}
 
-			NesCpuState state = _api.GetNesCpuState();
-			return McpServiceResult<CpuRegisters>.Success(new(
-				romInfo.ConsoleType.ToString(),
-				CpuType.Nes.ToString(),
-				"6502",
-				[
-					Register("A", state.A, 8),
-					Register("X", state.X, 8),
-					Register("Y", state.Y, 8),
-					Register("SP", state.SP, 8),
-					Register("PC", state.PC, 16),
-					Register("PS", state.PS, 8),
-					Register("IRQFlag", state.IRQFlag, 8),
-					Register("NMIFlag", state.NMIFlag ? 1UL : 0UL, 1),
-					Register("CycleCount", state.CycleCount, 64)
-				]
-			));
+			return McpServiceResult<CpuRegisters>.Success(BuildNesRegisters(romInfo));
 		});
 	}
 
@@ -300,6 +284,138 @@ internal sealed class McpEmulatorService : IDisposable
 				_mcpBreakpoints.Clear();
 			}
 			return McpServiceResult<BreakpointRemovalSummary>.Success(new(removedCount));
+		});
+	}
+
+	internal McpServiceResult<IReadOnlyList<DisassemblyRow>> Disassemble(
+		string cpu,
+		string? space,
+		uint? address,
+		int before,
+		int after)
+	{
+		if(before < 0 || after < 0 || before > McpDebuggerLimits.MaxDisassemblyRows - after - 1) {
+			return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("invalid_range", "The disassembly window is outside the supported range.");
+		}
+		if(!TryParseExactEnum(cpu, out CpuType cpuType)) {
+			return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("unknown_cpu", "The selected CPU is not available.");
+		}
+
+		return Execute(() => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("no_game", "No game is currently loaded.");
+			}
+			if(!_api.GetRomInfo().CpuTypes.Contains(cpuType)) {
+				return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("unknown_cpu", "The selected CPU is not available.");
+			}
+
+			uint centerAddress;
+			if(space is null) {
+				centerAddress = address ?? _api.GetProgramCounter(cpuType, true);
+			} else {
+				if(!address.HasValue || !TryResolveMemorySpace(space, out MemoryType memoryType, out int memorySize)) {
+					return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("invalid_address", "The disassembly address is not available.");
+				}
+				if(address.Value >= (uint)memorySize) {
+					return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("invalid_address", "The disassembly address is not available.");
+				}
+				if(memoryType == cpuType.ToMemoryType()) {
+					centerAddress = address.Value;
+				} else {
+					AddressInfo relative = _api.GetRelativeAddress(new AddressInfo { Address = (int)address.Value, Type = memoryType }, cpuType);
+					if(relative.Address < 0) {
+						return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Failure("invalid_address", "The disassembly address is not mapped to the selected CPU.");
+					}
+					centerAddress = (uint)relative.Address;
+				}
+			}
+
+			return McpServiceResult<IReadOnlyList<DisassemblyRow>>.Success(BuildDisassembly(cpuType, centerAddress, before, after));
+		});
+	}
+
+	internal McpServiceResult<AddressMapping> MapAddress(string cpu, string space, uint address)
+	{
+		if(!TryParseExactEnum(cpu, out CpuType cpuType)) {
+			return McpServiceResult<AddressMapping>.Failure("unknown_cpu", "The selected CPU is not available.");
+		}
+
+		return _gate.ExecuteWithTicket(ticket => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<AddressMapping>.Failure("no_game", "No game is currently loaded.");
+			}
+			if(!_api.GetRomInfo().CpuTypes.Contains(cpuType)) {
+				return McpServiceResult<AddressMapping>.Failure("unknown_cpu", "The selected CPU is not available.");
+			}
+			if(!TryResolveMemorySpace(space, out MemoryType memoryType, out int memorySize) || address >= (uint)memorySize) {
+				return McpServiceResult<AddressMapping>.Failure("invalid_address", "The selected address is not available.");
+			}
+
+			AddressInfo relative;
+			AddressInfo physical;
+			if(memoryType == cpuType.ToMemoryType()) {
+				relative = new AddressInfo { Address = (int)address, Type = memoryType };
+				physical = _api.GetAbsoluteAddress(relative);
+			} else {
+				physical = new AddressInfo { Address = (int)address, Type = memoryType };
+				relative = _api.GetRelativeAddress(physical, cpuType);
+			}
+			if(relative.Address < 0 || physical.Address < 0) {
+				return McpServiceResult<AddressMapping>.Failure("invalid_address", "The selected address is not mapped.");
+			}
+
+			return McpServiceResult<AddressMapping>.Success(new(
+				cpu,
+				ToMcpAddress(relative),
+				ToMcpAddress(physical),
+				ticket.Generation
+			));
+		});
+	}
+
+	internal McpServiceResult<CallStackResult> GetCallStack(string cpu, int maxDepth)
+	{
+		if(maxDepth is < 1 or > McpDebuggerLimits.MaxCallStackDepth) {
+			return McpServiceResult<CallStackResult>.Failure("invalid_range", "The call stack depth is outside the supported range.");
+		}
+		if(!TryParseExactEnum(cpu, out CpuType cpuType)) {
+			return McpServiceResult<CallStackResult>.Failure("unknown_cpu", "The selected CPU is not available.");
+		}
+
+		return _gate.ExecuteWithTicket(ticket => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<CallStackResult>.Failure("no_game", "No game is currently loaded.");
+			}
+			if(!_api.GetRomInfo().CpuTypes.Contains(cpuType)) {
+				return McpServiceResult<CallStackResult>.Failure("unknown_cpu", "The selected CPU is not available.");
+			}
+
+			return McpServiceResult<CallStackResult>.Success(BuildCallStack(cpuType, maxDepth, ticket.Generation));
+		});
+	}
+
+	internal McpServiceResult<BreakContext> GetBreakContext(int before, int after, int maxStackDepth)
+	{
+		if(before < 0 || after < 0 || before > McpDebuggerLimits.MaxDisassemblyRows - after - 1) {
+			return McpServiceResult<BreakContext>.Failure("invalid_range", "The disassembly window is outside the supported range.");
+		}
+		if(maxStackDepth is < 1 or > McpDebuggerLimits.MaxCallStackDepth) {
+			return McpServiceResult<BreakContext>.Failure("invalid_range", "The call stack depth is outside the supported range.");
+		}
+
+		return Execute(() => {
+			BreakEvent breakEvent;
+			long generation;
+			lock(_executionLock) {
+				if(!_api.IsExecutionStopped()
+					|| !_latestBreakEvent.HasValue
+					|| _latestBreakGeneration != _gate.Generation) {
+					return McpServiceResult<BreakContext>.Failure("stale_context", "No current stopped break context is available.");
+				}
+				breakEvent = _latestBreakEvent.Value;
+				generation = _latestBreakGeneration;
+			}
+			return BuildBreakContext(breakEvent, generation, before, after, maxStackDepth);
 		});
 	}
 
@@ -509,6 +625,26 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private McpServiceResult<ContinueResult> CreateContinueResult(BreakEvent breakEvent, long generation)
 	{
+		McpServiceResult<BreakContext> context = BuildBreakContext(
+			breakEvent,
+			generation,
+			8,
+			8,
+			McpDebuggerLimits.MaxCallStackDepth
+		);
+		if(!context.IsSuccess) {
+			return McpServiceResult<ContinueResult>.Failure(context.Error!.Code, context.Error.Message);
+		}
+		return McpServiceResult<ContinueResult>.Success(new(context.Value!.Reason, context.Value, generation));
+	}
+
+	private McpServiceResult<BreakContext> BuildBreakContext(
+		BreakEvent breakEvent,
+		long generation,
+		int before,
+		int after,
+		int maxStackDepth)
+	{
 		string reason = breakEvent.Source switch {
 			BreakSource.Breakpoint => "breakpoint",
 			BreakSource.Pause => "pause",
@@ -526,22 +662,115 @@ internal sealed class McpEmulatorService : IDisposable
 			1,
 			breakEvent.Operation.Value
 		);
+		if(breakEvent.SourceCpu != CpuType.Nes) {
+			return McpServiceResult<BreakContext>.Failure("unsupported_cpu", "Register context is not supported for the selected CPU.");
+		}
+
+		RomInfo romInfo = _api.GetRomInfo();
+		uint programCounter = _api.GetProgramCounter(breakEvent.SourceCpu, true);
+		AddressInfo physicalProgramCounter = _api.GetAbsoluteAddress(new AddressInfo {
+			Address = (int)programCounter,
+			Type = breakEvent.SourceCpu.ToMemoryType()
+		});
+		IReadOnlyList<DisassemblyRow> disassembly = BuildDisassembly(breakEvent.SourceCpu, programCounter, before, after);
+		DisassemblyRow? currentRow = null;
+		foreach(DisassemblyRow row in disassembly) {
+			if(row.CpuAddress == programCounter) {
+				currentRow = row;
+				break;
+			}
+		}
+		CallStackResult callStack = BuildCallStack(breakEvent.SourceCpu, maxStackDepth, generation);
 		BreakContext context = new(
 			reason,
 			breakpointId,
 			breakEvent.SourceCpu.ToString(),
 			operation,
-			new("", breakEvent.SourceCpu.ToString(), "", []),
-			0,
-			null,
-			[],
-			null,
-			null,
-			[],
+			BuildNesRegisters(romInfo),
+			programCounter,
+			physicalProgramCounter.Address >= 0 ? ToMcpAddress(physicalProgramCounter) : null,
+			disassembly,
+			currentRow?.EffectiveAddress,
+			currentRow?.EffectiveValue,
+			callStack.Frames,
 			generation
 		);
-		return McpServiceResult<ContinueResult>.Success(new(reason, context, generation));
+		return McpServiceResult<BreakContext>.Success(context);
 	}
+
+	private IReadOnlyList<DisassemblyRow> BuildDisassembly(CpuType cpuType, uint centerAddress, int before, int after)
+	{
+		int start = _api.GetDisassemblyRowAddress(cpuType, centerAddress, -before);
+		if(start < 0) {
+			start = (int)centerAddress;
+		}
+		int requestedCount = before + after + 1;
+		CodeLineData[] nativeRows = _api.GetDisassemblyOutput(cpuType, (uint)start, (uint)requestedCount);
+		int count = Math.Min(nativeRows.Length, requestedCount);
+		List<DisassemblyRow> rows = new(count);
+		for(int i = 0; i < count; i++) {
+			CodeLineData row = nativeRows[i];
+			int byteCount = Math.Min(row.OpSize, row.ByteCode.Length);
+			McpAddress? effectiveAddress = row.ShowEffectiveAddress && row.EffectiveAddress >= 0
+				? new McpAddress(row.EffectiveAddressType.ToString(), (int)row.EffectiveAddress)
+				: null;
+			rows.Add(new(
+				(uint)row.Address,
+				row.AbsoluteAddress.Address >= 0 ? ToMcpAddress(row.AbsoluteAddress) : null,
+				Convert.ToHexString(row.ByteCode.AsSpan(0, byteCount)),
+				row.Text,
+				row.Comment,
+				effectiveAddress,
+				effectiveAddress is null ? null : row.Value,
+				effectiveAddress is null ? null : row.ValueSize
+			));
+		}
+		return rows;
+	}
+
+	private CallStackResult BuildCallStack(CpuType cpuType, int maxDepth, long generation)
+	{
+		bool live = !_api.IsExecutionStopped();
+		StackFrameInfo[] nativeFrames = _api.GetCallstack(cpuType);
+		int count = Math.Min(nativeFrames.Length, maxDepth);
+		List<CallStackFrame> frames = new(count);
+		for(int i = 0; i < count; i++) {
+			StackFrameInfo frame = nativeFrames[i];
+			frames.Add(new(
+				frame.Source,
+				ToMcpAddress(frame.AbsSource),
+				frame.Target,
+				ToMcpAddress(frame.AbsTarget),
+				frame.Return,
+				ToMcpAddress(frame.AbsReturn),
+				frame.Flags.ToString()
+			));
+		}
+		return new(cpuType.ToString(), live, generation, frames, nativeFrames.Length > maxDepth);
+	}
+
+	private CpuRegisters BuildNesRegisters(RomInfo romInfo)
+	{
+		NesCpuState state = _api.GetNesCpuState();
+		return new(
+			romInfo.ConsoleType.ToString(),
+			CpuType.Nes.ToString(),
+			"6502",
+			[
+				Register("A", state.A, 8),
+				Register("X", state.X, 8),
+				Register("Y", state.Y, 8),
+				Register("SP", state.SP, 8),
+				Register("PC", state.PC, 16),
+				Register("PS", state.PS, 8),
+				Register("IRQFlag", state.IRQFlag, 8),
+				Register("NMIFlag", state.NMIFlag ? 1UL : 0UL, 1),
+				Register("CycleCount", state.CycleCount, 64)
+			]
+		);
+	}
+
+	private static McpAddress ToMcpAddress(AddressInfo address) => new(address.Type.ToString(), address.Address);
 
 	private void RemoveWaiter(CpuType cpuType, TaskCompletionSource<BreakEvent>? waiter)
 	{

@@ -66,6 +66,11 @@ public sealed class McpDebuggerServiceTests
 		McpServiceResult<ContinueResult> result = await wait.WaitAsync(TimeSpan.FromSeconds(5));
 		Assert.Equal("breakpoint", result.Value!.Reason);
 		Assert.Equal(stableId, result.Value.Context!.BreakpointId);
+		Assert.NotEmpty(result.Value.Context.Registers.Registers);
+		Assert.Equal(0x8000U, result.Value.Context.ProgramCounter);
+		Assert.NotNull(result.Value.Context.PhysicalProgramCounter);
+		Assert.NotEmpty(result.Value.Context.Disassembly);
+		Assert.NotEmpty(result.Value.Context.CallStack);
 	}
 
 	[Fact]
@@ -319,6 +324,183 @@ public sealed class McpDebuggerServiceTests
 		Assert.Equal(thirdId, mappedThirdId);
 	}
 
+	[Fact]
+	public void GetBreakContext_WhenNoCurrentStopReturnsStaleContext()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+
+		McpServiceResult<BreakContext> result = service.GetBreakContext(0, 0, 1);
+
+		Assert.Equal("stale_context", result.Error!.Code);
+	}
+
+	[Fact]
+	public void GetBreakContext_AfterResumeOrGenerationChangeReturnsStaleContext()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		BreakEvent breakEvent = new() { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 };
+		SendBreak(service, breakEvent);
+
+		Assert.True(service.Resume().IsSuccess);
+		Assert.Equal("stale_context", service.GetBreakContext(0, 0, 1).Error!.Code);
+
+		SendBreak(service, breakEvent);
+		service.NotifyEmulatorStateChanged();
+		Assert.Equal("stale_context", service.GetBreakContext(0, 0, 1).Error!.Code);
+	}
+
+	[Fact]
+	public void GetBreakContext_ReturnsStableBreakpointOperationRegistersPhysicalPcAndBounds()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		api.GetNesCpuStateHandler = () => new NesCpuState { A = 0x42, PC = 0x8123 };
+		api.GetProgramCounterHandler = (_, _) => 0x8123;
+		api.GetAbsoluteAddressHandler = address => new AddressInfo {
+			Address = address.Address == 0x8123 ? 0x4010 : address.Address,
+			Type = MemoryType.NesPrgRom
+		};
+		api.GetDisassemblyOutputHandler = (_, _, _) => CreateDisassemblyRows(300, 0x8123);
+		api.GetCallstackHandler = _ => CreateStackFrames(129);
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection, api);
+		long stableId = SetBreakpoint(service, 0x8123).Value!.Id;
+		SendBreak(service, CreateBreakEvent(collection.GetNativeId(stableId)));
+
+		McpServiceResult<BreakContext> result = service.GetBreakContext(127, 128, 128);
+
+		BreakContext context = Assert.IsType<BreakContext>(result.Value);
+		Assert.Equal("breakpoint", context.Reason);
+		Assert.Equal(stableId, context.BreakpointId);
+		Assert.Equal(nameof(CpuType.Nes), context.Cpu);
+		Assert.Equal(new McpMemoryOperation(nameof(MemoryType.NesMemory), 0x8123, "execopcode", 1, 0x42), context.Operation);
+		Assert.Contains(context.Registers.Registers, register => register.Name == "A" && register.Value == 0x42);
+		Assert.Equal(0x8123U, context.ProgramCounter);
+		Assert.Equal(new McpAddress(nameof(MemoryType.NesPrgRom), 0x4010), context.PhysicalProgramCounter);
+		Assert.Equal(McpDebuggerLimits.MaxDisassemblyRows, context.Disassembly.Count);
+		Assert.Equal(McpDebuggerLimits.MaxCallStackDepth, context.CallStack.Count);
+		Assert.Equal(0, context.Generation);
+	}
+
+	[Fact]
+	public void Disassemble_UsesRowAddressForBeforeWindowAndCapsTotalRows()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		uint requestedStart = 0;
+		uint requestedCount = 0;
+		api.GetDisassemblyRowAddressHandler = (_, address, offset) => {
+			Assert.Equal(0x8000U, address);
+			Assert.Equal(-127, offset);
+			return 0x7000;
+		};
+		api.GetDisassemblyOutputHandler = (_, start, count) => {
+			requestedStart = start;
+			requestedCount = count;
+			return CreateDisassemblyRows(300, start);
+		};
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		McpServiceResult<IReadOnlyList<DisassemblyRow>> result = service.Disassemble(nameof(CpuType.Nes), null, 0x8000, 127, 128);
+
+		Assert.Equal(0x7000U, requestedStart);
+		Assert.Equal(256U, requestedCount);
+		Assert.Equal(McpDebuggerLimits.MaxDisassemblyRows, result.Value!.Count);
+		Assert.Equal("invalid_range", service.Disassemble(nameof(CpuType.Nes), null, 0x8000, -1, 0).Error!.Code);
+		Assert.Equal("invalid_range", service.Disassemble(nameof(CpuType.Nes), null, 0x8000, 128, 128).Error!.Code);
+	}
+
+	[Fact]
+	public void Disassemble_ReturnsStructuredEffectiveAddressAndValue()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		api.GetDisassemblyOutputHandler = (_, _, _) => [new(CpuType.Nes) {
+			Address = 0x8000,
+			AbsoluteAddress = new AddressInfo { Address = 0x10, Type = MemoryType.NesPrgRom },
+			OpSize = 2,
+			ByteCode = [0xA9, 0x0F, 0xFF],
+			Text = "LDA #$0F",
+			Comment = "load accumulator",
+			ShowEffectiveAddress = true,
+			EffectiveAddress = 0x20,
+			EffectiveAddressType = MemoryType.NesWorkRam,
+			Value = 0x0F,
+			ValueSize = 1
+		}];
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		DisassemblyRow row = Assert.Single(service.Disassemble(nameof(CpuType.Nes), null, 0x8000, 0, 0).Value!);
+
+		Assert.Equal(0x8000U, row.CpuAddress);
+		Assert.Equal(new McpAddress(nameof(MemoryType.NesPrgRom), 0x10), row.PhysicalAddress);
+		Assert.Equal("A90F", row.Bytes);
+		Assert.Equal("LDA #$0F", row.Text);
+		Assert.Equal("load accumulator", row.Comment);
+		Assert.Equal(new McpAddress(nameof(MemoryType.NesWorkRam), 0x20), row.EffectiveAddress);
+		Assert.Equal(0x0FU, row.EffectiveValue);
+		Assert.Equal(1, row.EffectiveValueWidth);
+	}
+
+	[Fact]
+	public void MapAddress_RequeriesNativeMapperEveryCallAndIncludesGeneration()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		int mappingCall = 0;
+		api.GetAbsoluteAddressHandler = _ => new AddressInfo {
+			Address = mappingCall++ == 0 ? 0x10 : 0x4010,
+			Type = MemoryType.NesPrgRom
+		};
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		AddressMapping first = service.MapAddress(nameof(CpuType.Nes), nameof(MemoryType.NesMemory), 0x8000).Value!;
+		AddressMapping second = service.MapAddress(nameof(CpuType.Nes), nameof(MemoryType.NesMemory), 0x8000).Value!;
+
+		Assert.Equal(0x10, first.Physical.Address);
+		Assert.Equal(0x4010, second.Physical.Address);
+		Assert.Equal(first.Generation, second.Generation);
+		Assert.Equal(0, first.Generation);
+		Assert.Equal(2, api.GetAbsoluteAddressCalls);
+	}
+
+	[Fact]
+	public void MapAddress_UnmappedResultReturnsInvalidAddress()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		api.GetAbsoluteAddressHandler = _ => new AddressInfo { Address = -1, Type = MemoryType.None };
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		McpServiceResult<AddressMapping> result = service.MapAddress(nameof(CpuType.Nes), nameof(MemoryType.NesMemory), 0x8000);
+
+		Assert.Equal("invalid_address", result.Error!.Code);
+	}
+
+	[Fact]
+	public void GetCallStack_RunningResultIsLiveAndTruncatesAtLimit()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		api.IsExecutionStoppedHandler = () => false;
+		api.GetCallstackHandler = _ => CreateStackFrames(129);
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		CallStackResult result = service.GetCallStack(nameof(CpuType.Nes), 128).Value!;
+
+		Assert.True(result.Live);
+		Assert.True(result.Truncated);
+		Assert.Equal(McpDebuggerLimits.MaxCallStackDepth, result.Frames.Count);
+		Assert.Equal(0, result.Generation);
+		Assert.Equal("invalid_range", service.GetCallStack(nameof(CpuType.Nes), 0).Error!.Code);
+		Assert.Equal("invalid_range", service.GetCallStack(nameof(CpuType.Nes), 129).Error!.Code);
+	}
+
+	[Fact]
+	public void GetCallStack_StoppedResultIsNotLive()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+
+		CallStackResult result = service.GetCallStack(nameof(CpuType.Nes), 1).Value!;
+
+		Assert.False(result.Live);
+		Assert.Single(result.Frames);
+	}
+
 	private static McpEmulatorService CreateService(FakeBreakpointCollection collection, FakeMcpEmulatorApi? api = null)
 	{
 		return new McpEmulatorService(
@@ -371,6 +553,30 @@ public sealed class McpDebuggerServiceTests
 		},
 		BreakpointId = nativeBreakpointId
 	};
+
+	private static CodeLineData[] CreateDisassemblyRows(int count, uint start)
+	{
+		return Enumerable.Range(0, count).Select(index => new CodeLineData(CpuType.Nes) {
+			Address = (int)start + index,
+			AbsoluteAddress = new AddressInfo { Address = index, Type = MemoryType.NesPrgRom },
+			OpSize = 1,
+			ByteCode = [(byte)index],
+			Text = "NOP"
+		}).ToArray();
+	}
+
+	private static StackFrameInfo[] CreateStackFrames(int count)
+	{
+		return Enumerable.Range(0, count).Select(index => new StackFrameInfo {
+			Source = (uint)(0x8000 + index),
+			AbsSource = new AddressInfo { Address = index, Type = MemoryType.NesPrgRom },
+			Target = (uint)(0x9000 + index),
+			AbsTarget = new AddressInfo { Address = 0x100 + index, Type = MemoryType.NesPrgRom },
+			Return = (uint)(0xA000 + index),
+			AbsReturn = new AddressInfo { Address = 0x200 + index, Type = MemoryType.NesPrgRom },
+			Flags = index == 0 ? StackFrameFlags.Nmi : StackFrameFlags.None
+		}).ToArray();
+	}
 
 	private static NotificationEventArgs Notification(IntPtr pointer) => new() {
 		NotificationType = ConsoleNotificationType.CodeBreak,
