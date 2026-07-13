@@ -495,6 +495,52 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
+	public async Task DebuggerBlockState_ConcurrentUnblocksLeaveSnapshotUnblockedAndRecover()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		for(int i = 0; i < 200; i++) {
+			api.BeginDebuggerRequestBlock();
+			api.BeginDebuggerRequestBlock();
+			using Barrier barrier = new(3);
+			Task first = Task.Run(() => {
+				barrier.SignalAndWait(TimeSpan.FromSeconds(5));
+				api.EndDebuggerRequestBlock();
+			});
+			Task second = Task.Run(() => {
+				barrier.SignalAndWait(TimeSpan.FromSeconds(5));
+				api.EndDebuggerRequestBlock();
+			});
+			Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+			await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+			Assert.Equal(0UL, api.DebuggerRequestBlockState & 1);
+			Assert.Equal(0UL, (api.DebuggerRequestBlockState >> 1) & uint.MaxValue);
+		}
+
+		Assert.True(new McpEmulatorService(api).ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).IsSuccess);
+	}
+
+	[Fact]
+	public void DebuggerBlockState_WhenMutationThrows_UnblocksAndRecovers()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.OnRead = () => {
+			api.BeginDebuggerRequestBlock();
+			try {
+				throw new InvalidOperationException("load failure");
+			} finally {
+				api.EndDebuggerRequestBlock();
+			}
+		};
+		McpEmulatorService service = new(api);
+
+		Assert.Equal("state_changed", service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).Error!.Code);
+		Assert.Equal(0UL, api.DebuggerRequestBlockState & 1);
+
+		api.OnRead = null;
+		Assert.True(service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).IsSuccess);
+	}
+
+	[Fact]
 	public void EmulatorOperation_WhenDebuggerBlockStartsAndEndsAroundDefaultInteropResult_ReturnsStateChanged()
 	{
 		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
@@ -606,6 +652,7 @@ public sealed class McpEmulatorServiceTests
 		public Action? OnRead { get; set; }
 		private readonly object _debuggerRequestBlockStateLock = new();
 		private ulong _debuggerRequestBlockState;
+		private int _debuggerRequestBlockCount;
 		public ulong DebuggerRequestBlockState
 		{
 			get
@@ -644,9 +691,38 @@ public sealed class McpEmulatorServiceTests
 
 		public void SetDebuggerRequestBlocked(bool blocked)
 		{
-			lock(_debuggerRequestBlockStateLock) {
-				_debuggerRequestBlockState = (((_debuggerRequestBlockState >> 1) + 1) << 1) | (blocked ? 1UL : 0);
+			if(blocked) {
+				BeginDebuggerRequestBlock();
+			} else {
+				EndDebuggerRequestBlock();
 			}
+		}
+
+		public void BeginDebuggerRequestBlock()
+		{
+			lock(_debuggerRequestBlockStateLock) {
+				_debuggerRequestBlockCount++;
+				UpdateDebuggerRequestBlockState(true);
+			}
+		}
+
+		public void EndDebuggerRequestBlock()
+		{
+			lock(_debuggerRequestBlockStateLock) {
+				Assert.True(_debuggerRequestBlockCount > 0);
+				if(_debuggerRequestBlockCount <= 0) {
+					return;
+				}
+				_debuggerRequestBlockCount--;
+				UpdateDebuggerRequestBlockState(_debuggerRequestBlockCount > 0);
+			}
+		}
+
+		private void UpdateDebuggerRequestBlockState(bool blocked)
+		{
+			_debuggerRequestBlockState = (((_debuggerRequestBlockState >> 33) + 1) << 33)
+				| ((ulong)_debuggerRequestBlockCount << 1)
+				| (blocked ? 1UL : 0);
 		}
 
 		public bool IsPaused() => Paused;

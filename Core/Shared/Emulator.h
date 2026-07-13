@@ -65,10 +65,12 @@ private:
 	{
 	private:
 		Emulator* _emu;
+		bool _active = true;
 
 	public:
 		explicit DebuggerRequestBlockGuard(Emulator* emu);
 		~DebuggerRequestBlockGuard();
+		void Release();
 		DebuggerRequestBlockGuard(const DebuggerRequestBlockGuard&) = delete;
 		DebuggerRequestBlockGuard& operator=(const DebuggerRequestBlockGuard&) = delete;
 	};
@@ -119,8 +121,8 @@ private:
 
 	int _debugRequestCount;
 	unordered_map<thread::id, int> _debugRequestCountsByOwner;
-	atomic<int> _blockDebuggerRequestCount;
-	// Low bit is the current blocked state; upper bits are an epoch updated at every block boundary.
+	bool _terminalDebuggerRequestBlock = false;
+	// Low bit is blocked, the next 32 bits are the block count, and upper bits are the boundary epoch.
 	atomic<uint64_t> _debuggerRequestBlockState;
 
 	atomic<bool> _isRunAheadFrame;
@@ -156,10 +158,13 @@ private:
 
 	void BlockDebuggerRequests();
 	void UnblockDebuggerRequests();
-	void UpdateDebuggerRequestBlockState(bool blocked);
+	bool BlockAllDebuggerRequests();
+	uint32_t ChangeDebuggerRequestBlockCount(int delta);
 	void RegisterDebuggerRequest(thread::id ownerThreadId);
 	void UnregisterDebuggerRequest(thread::id ownerThreadId);
 	int GetOtherThreadDebuggerRequestCount(thread::id ownerThreadId);
+	int GetDebuggerRequestCount(thread::id ownerThreadId);
+	int GetDebuggerRequestCount();
 	void ResetDebugger(bool startDebugger = false);
 
 	double GetFrameDelay();
@@ -178,7 +183,7 @@ public:
 	~Emulator();
 
 	void Initialize(bool enableShortcuts = true);
-	void Release();
+	bool Release();
 
 	void Run();
 	void Stop(bool sendNotification, bool preventRecentGameSave = false, bool saveBattery = true);
@@ -216,7 +221,7 @@ public:
 	void Unlock();
 	bool IsThreadPaused();
 
-	bool IsDebuggerBlocked() { return _blockDebuggerRequestCount > 0; }
+	bool IsDebuggerBlocked() { return (_debuggerRequestBlockState.load() & 1) != 0; }
 	uint64_t GetDebuggerRequestBlockState() { return _debuggerRequestBlockState.load(); }
 	void SuspendDebugger(bool release);
 

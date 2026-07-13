@@ -41,7 +41,9 @@ extern "C"
 
 	DllExport void __stdcall HistoryViewerRelease()
 	{
-		_historyPlayer->Release();
+		if(!_historyPlayer->Release()) {
+			return;
+		}
 		_historyRenderer.reset();
 		_historySoundManager.reset();
 		_historyPlayer.reset();

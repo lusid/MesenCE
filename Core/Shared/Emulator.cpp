@@ -75,7 +75,6 @@ Emulator::Emulator()
 	_threadPaused = false;
 
 	_debugRequestCount = 0;
-	_blockDebuggerRequestCount = 0;
 	_debuggerRequestBlockState = 0;
 
 	_videoDecoder->Init();
@@ -83,6 +82,10 @@ Emulator::Emulator()
 
 Emulator::~Emulator()
 {
+	if(!BlockAllDebuggerRequests()) {
+		assert(false);
+		std::terminate();
+	}
 }
 
 void Emulator::Initialize(bool enableShortcuts)
@@ -97,8 +100,12 @@ void Emulator::Initialize(bool enableShortcuts)
 	_videoRenderer->StartThread();
 }
 
-void Emulator::Release()
+bool Emulator::Release()
 {
+	if(!BlockAllDebuggerRequests()) {
+		return false;
+	}
+
 	Stop(true);
 
 	_gameClient->Disconnect();
@@ -107,6 +114,7 @@ void Emulator::Release()
 	_videoDecoder->StopThread();
 	_videoRenderer->StopThread();
 	_shortcutKeyHandler.reset();
+	return true;
 }
 
 void Emulator::Run()
@@ -275,7 +283,7 @@ void Emulator::ProcessEndOfFrame()
 
 void Emulator::Stop(bool sendNotification, bool preventRecentGameSave, bool saveBattery)
 {
-	BlockDebuggerRequests();
+	DebuggerRequestBlockGuard debuggerBlock(this);
 
 	_stopFlag = true;
 
@@ -316,7 +324,6 @@ void Emulator::Stop(bool sendNotification, bool preventRecentGameSave, bool save
 		_notificationManager->SendNotification(ConsoleNotificationType::EmulationStopped);
 	}
 
-	UnblockDebuggerRequests();
 }
 
 void Emulator::Reset()
@@ -393,7 +400,7 @@ bool Emulator::InternalLoadRom(VirtualFile romFile, VirtualFile patchFile, bool 
 		_threadPaused = true;
 	}
 
-	BlockDebuggerRequests();
+	DebuggerRequestBlockGuard debuggerBlock(this);
 
 	auto emuLock = AcquireLock();
 	auto dbgLock = _debuggerLock.AcquireSafe();
@@ -449,7 +456,6 @@ bool Emulator::InternalLoadRom(VirtualFile romFile, VirtualFile patchFile, bool 
 			_internalDebugger = _debugger.get();
 			debugger->ResetSuspendCounter();
 		}
-		UnblockDebuggerRequests();
 		return false;
 	}
 
@@ -514,7 +520,7 @@ bool Emulator::InternalLoadRom(VirtualFile romFile, VirtualFile patchFile, bool 
 
 	//Mark the thread as paused, and release the debugger lock to avoid
 	//deadlocks with DebugBreakHelper if GameLoaded event starts the debugger
-	UnblockDebuggerRequests();
+	debuggerBlock.Release();
 	dbgLock.Release();
 
 	_threadPaused = true;
@@ -1053,8 +1059,7 @@ void Emulator::BlockDebuggerRequests()
 {
 	//Block all new debugger calls
 	auto lock = _debuggerLock.AcquireSafe();
-	_blockDebuggerRequestCount++;
-	UpdateDebuggerRequestBlockState(true);
+	ChangeDebuggerRequestBlockCount(1);
 	if(_debugger) {
 		//Ensure any thread waiting on DebugBreakHelper is allowed to resume/finish (prevent deadlock)
 		_debugger->ResetSuspendCounter();
@@ -1075,22 +1080,65 @@ Emulator::DebuggerRequestBlockGuard::DebuggerRequestBlockGuard(Emulator* emu)
 
 Emulator::DebuggerRequestBlockGuard::~DebuggerRequestBlockGuard()
 {
-	_emu->UnblockDebuggerRequests();
+	Release();
+}
+
+void Emulator::DebuggerRequestBlockGuard::Release()
+{
+	if(_active) {
+		_active = false;
+		_emu->UnblockDebuggerRequests();
+	}
 }
 
 void Emulator::UnblockDebuggerRequests()
 {
-	int blockCount = --_blockDebuggerRequestCount;
-	UpdateDebuggerRequestBlockState(blockCount > 0);
+	auto lock = _debuggerLock.AcquireSafe();
+	ChangeDebuggerRequestBlockCount(-1);
 }
 
-void Emulator::UpdateDebuggerRequestBlockState(bool blocked)
+bool Emulator::BlockAllDebuggerRequests()
+{
+	auto lock = _debuggerLock.AcquireSafe();
+	if(_terminalDebuggerRequestBlock) {
+		return true;
+	}
+
+	ChangeDebuggerRequestBlockCount(1);
+	thread::id currentThreadId = std::this_thread::get_id();
+	int currentThreadRequestCount = GetDebuggerRequestCount(currentThreadId);
+	assert(currentThreadRequestCount == 0);
+	if(currentThreadRequestCount > 0) {
+		ChangeDebuggerRequestBlockCount(-1);
+		return false;
+	}
+
+	while(GetDebuggerRequestCount() > 0) {
+		std::this_thread::sleep_for(std::chrono::duration<int, std::milli>(10));
+	}
+	_terminalDebuggerRequestBlock = true;
+	return true;
+}
+
+uint32_t Emulator::ChangeDebuggerRequestBlockCount(int delta)
 {
 	uint64_t state = _debuggerRequestBlockState.load();
 	uint64_t updatedState;
+	uint32_t updatedCount;
 	do {
-		updatedState = (((state >> 1) + 1) << 1) | (blocked ? 1 : 0);
+		uint32_t count = (uint32_t)((state >> 1) & UINT32_MAX);
+		assert(delta > 0 || count > 0);
+		if(delta < 0 && count == 0) {
+			return 0;
+		}
+		assert(delta < 0 || count < UINT32_MAX);
+		if(delta > 0 && count == UINT32_MAX) {
+			return count;
+		}
+		updatedCount = delta > 0 ? count + 1 : count - 1;
+		updatedState = (((state >> 33) + 1) << 33) | ((uint64_t)updatedCount << 1) | (updatedCount > 0 ? 1 : 0);
 	} while(!_debuggerRequestBlockState.compare_exchange_weak(state, updatedState));
+	return updatedCount;
 }
 
 void Emulator::RegisterDebuggerRequest(thread::id ownerThreadId)
@@ -1127,11 +1175,24 @@ int Emulator::GetOtherThreadDebuggerRequestCount(thread::id ownerThreadId)
 	return _debugRequestCount >= requestCountForOwner ? _debugRequestCount - requestCountForOwner : _debugRequestCount;
 }
 
+int Emulator::GetDebuggerRequestCount(thread::id ownerThreadId)
+{
+	auto lock = _debugRequestLock.AcquireSafe();
+	auto ownerRequestCount = _debugRequestCountsByOwner.find(ownerThreadId);
+	return ownerRequestCount != _debugRequestCountsByOwner.end() ? ownerRequestCount->second : 0;
+}
+
+int Emulator::GetDebuggerRequestCount()
+{
+	auto lock = _debugRequestLock.AcquireSafe();
+	return _debugRequestCount;
+}
+
 DebuggerRequest Emulator::GetDebugger(bool autoInit)
 {
-	if(IsRunning() && _blockDebuggerRequestCount == 0) {
+	if(IsRunning() && !IsDebuggerBlocked()) {
 		auto lock = _debuggerLock.AcquireSafe();
-		if(IsRunning() && _blockDebuggerRequestCount == 0) {
+		if(IsRunning() && !IsDebuggerBlocked()) {
 			if(!_debugger && autoInit) {
 				InitDebugger();
 			}
