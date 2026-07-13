@@ -142,6 +142,43 @@ public sealed class McpServerTests
 		await Assert.ThrowsAsync<HttpRequestException>(() => httpClient.GetAsync(endpoint));
 	}
 
+	[Fact]
+	public async Task Stop_WithBlockedToolCall_IsBoundedAndDoesNotResurrectHost()
+	{
+		using ManualResetEventSlim readEntered = new();
+		using ManualResetEventSlim releaseRead = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.OnRead = () => {
+			readEntered.Set();
+			releaseRead.Wait(TimeSpan.FromSeconds(5));
+		};
+		using McpServer server = new(new McpEmulatorService(api));
+		await server.StartAsync(0);
+		Uri endpoint = server.Endpoint;
+		await using McpClient client = await CreateClientAsync(endpoint);
+		Task<CallToolResult> read = client.CallToolAsync("read_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			count = 2
+		})).AsTask();
+		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromSeconds(30));
+
+		Assert.InRange(Environment.TickCount64 - started, 0, 2500);
+		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
+		Action restart = () => { _ = server.StartAsync(0); };
+		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
+		releaseRead.Set();
+		Exception requestFailure = await Assert.ThrowsAnyAsync<Exception>(async () => await read.WaitAsync(TimeSpan.FromSeconds(5)));
+		Assert.IsNotType<TimeoutException>(requestFailure);
+		server.Stop(TimeSpan.FromSeconds(2));
+		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
+		using HttpClient httpClient = new();
+		await Assert.ThrowsAsync<HttpRequestException>(() => httpClient.GetAsync(endpoint));
+	}
+
 	private static async Task<McpClient> CreateClientAsync(Uri endpoint)
 	{
 		HttpClientTransport transport = new(new HttpClientTransportOptions {

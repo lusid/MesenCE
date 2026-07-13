@@ -17,11 +17,8 @@ internal sealed class McpServer : IDisposable
 	private static readonly TimeSpan MaximumStopTimeout = TimeSpan.FromSeconds(2);
 	private readonly object _lifecycleLock = new();
 	private readonly McpEmulatorService _service;
-	private WebApplication? _application;
-	private Task? _startTask;
-	private CancellationTokenSource? _startCancellation;
-	private Uri? _endpoint;
-	private bool _stopping;
+	private LifecycleGeneration? _generation;
+	private long _nextGenerationId;
 	private bool _disposed;
 
 	internal McpServer(McpEmulatorService service)
@@ -33,7 +30,7 @@ internal sealed class McpServer : IDisposable
 	{
 		get {
 			lock(_lifecycleLock) {
-				return _endpoint ?? throw new InvalidOperationException("The MCP server is not running.");
+				return _generation?.Endpoint ?? throw new InvalidOperationException("The MCP server is not running.");
 			}
 		}
 	}
@@ -42,70 +39,48 @@ internal sealed class McpServer : IDisposable
 	{
 		lock(_lifecycleLock) {
 			ObjectDisposedException.ThrowIf(_disposed, this);
-			if(_startTask is not null) {
-				return _startTask;
+			if(_generation is not null) {
+				if(_generation.Stopping) {
+					throw new InvalidOperationException("The previous MCP server generation is still stopping.");
+				}
+				return _generation.StartTask;
 			}
 
-			_startCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-			_startTask = StartCoreAsync(port, _startCancellation.Token);
-			return _startTask;
+			LifecycleGeneration generation = new(++_nextGenerationId, cancellationToken);
+			_generation = generation;
+			generation.StartTask = StartCoreAsync(generation, port);
+			return generation.StartTask;
 		}
 	}
 
 	internal void Stop(TimeSpan timeout)
 	{
-		WebApplication? application;
-		Task? startTask;
-		CancellationTokenSource? startCancellation;
-		lock(_lifecycleLock) {
-			if(_stopping) {
-				return;
-			}
-			application = _application;
-			startTask = _startTask;
-			if(application is null && startTask is null) {
-				return;
-			}
-			_stopping = true;
-			startCancellation = _startCancellation;
-		}
-
 		TimeSpan boundedTimeout = timeout <= TimeSpan.Zero
 			? TimeSpan.Zero
 			: timeout < MaximumStopTimeout ? timeout : MaximumStopTimeout;
-		DateTime deadline = DateTime.UtcNow + boundedTimeout;
+		LifecycleGeneration? generation;
+		Task? shutdownTask;
+		lock(_lifecycleLock) {
+			generation = _generation;
+			if(generation is null) {
+				return;
+			}
+			if(!generation.Stopping) {
+				generation.Stopping = true;
+				generation.Endpoint = null;
+				generation.ForcedShutdownCancellation = new CancellationTokenSource(boundedTimeout);
+				generation.ShutdownTask = StopCoreAsync(generation, generation.ForcedShutdownCancellation.Token);
+			}
+			shutdownTask = generation.ShutdownTask;
+		}
+
+		TryCancel(generation.StartCancellation);
+		TryCancel(generation.RequestCancellation);
+		TryStopApplication(generation.Application);
 		try {
-			startCancellation?.Cancel();
-			application?.Lifetime.StopApplication();
-			if(startTask is not null && !startTask.IsCompleted) {
-				startTask.Wait(boundedTimeout);
-			}
-
-			application = _application;
-			if(application is not null) {
-				TimeSpan remaining = deadline - DateTime.UtcNow;
-				if(remaining > TimeSpan.Zero) {
-					using CancellationTokenSource stopCancellation = new(remaining);
-					application.StopAsync(stopCancellation.Token).Wait(remaining);
-				}
-
-				remaining = deadline - DateTime.UtcNow;
-				if(remaining > TimeSpan.Zero) {
-					application.DisposeAsync().AsTask().Wait(remaining);
-				}
-			}
-		} catch(Exception ex) when(ex is AggregateException or OperationCanceledException or TimeoutException) {
+			shutdownTask?.Wait(boundedTimeout);
+		} catch(AggregateException ex) {
 			Log($"[MCP] Stop did not complete cleanly: {ex.GetBaseException().Message}");
-		} finally {
-			startCancellation?.Dispose();
-			lock(_lifecycleLock) {
-				_endpoint = null;
-				_application = null;
-				_startTask = null;
-				_startCancellation = null;
-				_stopping = false;
-			}
-			Log("[MCP] Server stopped.");
 		}
 	}
 
@@ -120,37 +95,150 @@ internal sealed class McpServer : IDisposable
 		Stop(MaximumStopTimeout);
 	}
 
-	private async Task StartCoreAsync(ushort port, CancellationToken cancellationToken)
+	private async Task StartCoreAsync(LifecycleGeneration generation, ushort port)
 	{
-		WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
-		builder.Logging.ClearProviders();
-		builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
-		builder.Services.AddMcpServer()
-			.WithHttpTransport()
-			.WithTools(McpTools.Create(_service));
-
-		WebApplication application = builder.Build();
-		application.MapMcp("/mcp");
-		lock(_lifecycleLock) {
-			_application = application;
-		}
-
+		await Task.Yield();
+		WebApplication? application = null;
 		try {
-			await application.StartAsync(cancellationToken).ConfigureAwait(false);
+			WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
+			builder.Logging.ClearProviders();
+			builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+			builder.Services.AddMcpServer()
+				.WithHttpTransport()
+				.WithTools(McpTools.Create(_service));
+
+			application = builder.Build();
+			application.Use(async (context, next) => {
+				using CancellationTokenSource requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+					context.RequestAborted,
+					generation.RequestCancellation.Token
+				);
+				context.RequestAborted = requestCancellation.Token;
+				try {
+					await next(context).ConfigureAwait(false);
+				} catch(OperationCanceledException) when(generation.RequestCancellation.IsCancellationRequested) {
+					context.Abort();
+				}
+				if(generation.RequestCancellation.IsCancellationRequested) {
+					context.Abort();
+				}
+			});
+			application.MapMcp("/mcp");
+			bool mayStart;
+			lock(_lifecycleLock) {
+				generation.Application = application;
+				mayStart = ReferenceEquals(_generation, generation) && !generation.Stopping;
+			}
+			if(!mayStart) {
+				throw new OperationCanceledException(generation.StartCancellation.Token);
+			}
+			await application.StartAsync(generation.StartCancellation.Token).ConfigureAwait(false);
 			string address = application.Services.GetRequiredService<IServer>()
 				.Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+			bool published;
 			lock(_lifecycleLock) {
-				_endpoint = new Uri(new Uri(address), "/mcp");
+				published = ReferenceEquals(_generation, generation) && !generation.Stopping;
+				if(published) {
+					generation.Endpoint = new Uri(new Uri(address), "/mcp");
+				}
+			}
+			if(!published) {
+				throw new OperationCanceledException(generation.StartCancellation.Token);
 			}
 			Log($"[MCP] Server started at {address}/mcp.");
 		} catch(Exception ex) {
-			Log($"[MCP] Server failed to start: {ex.Message}");
+			bool stopping;
 			lock(_lifecycleLock) {
-				_application = null;
-				_startTask = null;
+				stopping = generation.Stopping;
+				generation.Endpoint = null;
 			}
-			await application.DisposeAsync().ConfigureAwait(false);
+			if(!stopping) {
+				Log($"[MCP] Server failed to start: {ex.Message}");
+				if(application is not null) {
+					await EnsureApplicationCleanupAsync(generation, application, CancellationToken.None).ConfigureAwait(false);
+				}
+				generation.StartCancellation.Dispose();
+				generation.RequestCancellation.Dispose();
+				lock(_lifecycleLock) {
+					if(ReferenceEquals(_generation, generation)) {
+						_generation = null;
+					}
+				}
+			}
 			throw;
+		}
+	}
+
+	private async Task StopCoreAsync(LifecycleGeneration generation, CancellationToken forcedShutdownToken)
+	{
+		await Task.Yield();
+		try {
+			try {
+				await generation.StartTask.ConfigureAwait(false);
+			} catch(Exception) {
+				// Startup cancellation and failure are cleaned up by this generation.
+			}
+
+			WebApplication? application = generation.Application;
+			if(application is not null) {
+				await EnsureApplicationCleanupAsync(generation, application, forcedShutdownToken).ConfigureAwait(false);
+			}
+		} finally {
+			generation.StartCancellation.Dispose();
+			generation.RequestCancellation.Dispose();
+			generation.ForcedShutdownCancellation?.Dispose();
+			lock(_lifecycleLock) {
+				generation.Endpoint = null;
+				generation.Application = null;
+				if(ReferenceEquals(_generation, generation)) {
+					_generation = null;
+				}
+			}
+			Log($"[MCP] Server generation {generation.Id} stopped.");
+		}
+	}
+
+	private Task EnsureApplicationCleanupAsync(LifecycleGeneration generation, WebApplication application, CancellationToken forcedShutdownToken)
+	{
+		lock(_lifecycleLock) {
+			generation.ApplicationCleanupTask ??= StopAndDisposeApplicationAsync(application, forcedShutdownToken);
+			return generation.ApplicationCleanupTask;
+		}
+	}
+
+	private static async Task StopAndDisposeApplicationAsync(WebApplication application, CancellationToken forcedShutdownToken)
+	{
+		application.Lifetime.StopApplication();
+		try {
+			await application.StopAsync(forcedShutdownToken).ConfigureAwait(false);
+		} catch(OperationCanceledException) when(forcedShutdownToken.IsCancellationRequested) {
+			Log("[MCP] Active HTTP requests exceeded the shutdown grace period and were closed.");
+		} catch(Exception ex) {
+			Log($"[MCP] HTTP host stop failed: {ex.Message}");
+		}
+
+		try {
+			await application.DisposeAsync().ConfigureAwait(false);
+		} catch(Exception ex) {
+			Log($"[MCP] HTTP host disposal failed: {ex.Message}");
+		}
+	}
+
+	private static void TryCancel(CancellationTokenSource cancellation)
+	{
+		try {
+			cancellation.Cancel();
+		} catch(ObjectDisposedException) {
+			// Generation cleanup won the race with an idempotent Stop call.
+		}
+	}
+
+	private static void TryStopApplication(WebApplication? application)
+	{
+		try {
+			application?.Lifetime.StopApplication();
+		} catch(ObjectDisposedException) {
+			// Generation cleanup won the race with an idempotent Stop call.
 		}
 	}
 
@@ -163,5 +251,26 @@ internal sealed class McpServer : IDisposable
 		} catch(EntryPointNotFoundException) {
 			// Unit tests do not load the native emulator core.
 		}
+	}
+
+	private sealed class LifecycleGeneration
+	{
+		internal LifecycleGeneration(long id, CancellationToken cancellationToken)
+		{
+			Id = id;
+			StartCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+			RequestCancellation = new CancellationTokenSource();
+		}
+
+		internal long Id { get; }
+		internal CancellationTokenSource StartCancellation { get; }
+		internal CancellationTokenSource RequestCancellation { get; }
+		internal Task StartTask { get; set; } = Task.CompletedTask;
+		internal WebApplication? Application { get; set; }
+		internal Uri? Endpoint { get; set; }
+		internal bool Stopping { get; set; }
+		internal CancellationTokenSource? ForcedShutdownCancellation { get; set; }
+		internal Task? ShutdownTask { get; set; }
+		internal Task? ApplicationCleanupTask { get; set; }
 	}
 }
