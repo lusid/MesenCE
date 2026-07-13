@@ -321,7 +321,8 @@ void Emulator::Stop(bool sendNotification, bool preventRecentGameSave, bool save
 
 void Emulator::Reset()
 {
-	Lock();
+	DebuggerRequestBlockGuard debuggerBlock(this);
+	auto lock = AcquireLock(false);
 
 	_console->Reset();
 
@@ -335,8 +336,6 @@ void Emulator::Reset()
 
 	_notificationManager->SendNotification(ConsoleNotificationType::GameReset);
 	ProcessEvent(EventType::Reset);
-
-	Unlock();
 }
 
 void Emulator::ReloadRom(bool forPowerCycle)
@@ -983,6 +982,8 @@ DeserializeResult Emulator::Deserialize(istream& in, uint32_t fileFormatVersion,
 		}
 	}
 
+	DebuggerRequestBlockGuard debuggerBlock(this);
+
 	if(includeSettings) {
 		SV(_settings);
 	}
@@ -1059,10 +1060,22 @@ void Emulator::BlockDebuggerRequests()
 		_debugger->ResetSuspendCounter();
 	}
 
-	while(_debugRequestCount > 0) {
+	// Deserialize can run beneath an EmulatorLock-owned debugger request on this thread.
+	while(_debugRequestCount > GetCurrentThreadDebugRequestCount()) {
 		//Wait until debugger calls are all done
 		std::this_thread::sleep_for(std::chrono::duration<int, std::milli>(10));
 	}
+}
+
+Emulator::DebuggerRequestBlockGuard::DebuggerRequestBlockGuard(Emulator* emu)
+	: _emu(emu)
+{
+	_emu->BlockDebuggerRequests();
+}
+
+Emulator::DebuggerRequestBlockGuard::~DebuggerRequestBlockGuard()
+{
+	_emu->UnblockDebuggerRequests();
 }
 
 void Emulator::UnblockDebuggerRequests()
@@ -1078,6 +1091,27 @@ void Emulator::UpdateDebuggerRequestBlockState(bool blocked)
 	do {
 		updatedState = (((state >> 1) + 1) << 1) | (blocked ? 1 : 0);
 	} while(!_debuggerRequestBlockState.compare_exchange_weak(state, updatedState));
+}
+
+void Emulator::RegisterDebuggerRequest()
+{
+	_currentThreadDebugRequestCounts[this]++;
+	_debugRequestCount++;
+}
+
+void Emulator::UnregisterDebuggerRequest()
+{
+	_debugRequestCount--;
+	auto requestCount = _currentThreadDebugRequestCounts.find(this);
+	if(--requestCount->second == 0) {
+		_currentThreadDebugRequestCounts.erase(requestCount);
+	}
+}
+
+int Emulator::GetCurrentThreadDebugRequestCount()
+{
+	auto count = _currentThreadDebugRequestCounts.find(this);
+	return count != _currentThreadDebugRequestCounts.end() ? count->second : 0;
 }
 
 DebuggerRequest Emulator::GetDebugger(bool autoInit)
@@ -1236,3 +1270,4 @@ template void Emulator::AddDebugEvent<CpuType::Nes>(DebugEventType evtType);
 template void Emulator::AddDebugEvent<CpuType::Pce>(DebugEventType evtType);
 
 thread_local std::thread::id Emulator::_currentThreadId = std::this_thread::get_id();
+thread_local unordered_map<Emulator*, int> Emulator::_currentThreadDebugRequestCounts;

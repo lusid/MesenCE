@@ -61,6 +61,18 @@ private:
 	friend class DebuggerRequest;
 	friend class EmulatorLock;
 
+	class DebuggerRequestBlockGuard
+	{
+	private:
+		Emulator* _emu;
+
+	public:
+		explicit DebuggerRequestBlockGuard(Emulator* emu);
+		~DebuggerRequestBlockGuard();
+		DebuggerRequestBlockGuard(const DebuggerRequestBlockGuard&) = delete;
+		DebuggerRequestBlockGuard& operator=(const DebuggerRequestBlockGuard&) = delete;
+	};
+
 	safe_ptr<IConsole> _console;
 
 	//Used by the Process[..] debugger hooks which run exclusively on the emulation thread.
@@ -92,6 +104,7 @@ private:
 	const shared_ptr<RewindManager> _rewindManager;
 
 	thread_local static thread::id _currentThreadId;
+	thread_local static unordered_map<Emulator*, int> _currentThreadDebugRequestCounts;
 	thread::id _emulationThreadId;
 
 	atomic<uint32_t> _lockCounter;
@@ -143,6 +156,9 @@ private:
 	void BlockDebuggerRequests();
 	void UnblockDebuggerRequests();
 	void UpdateDebuggerRequestBlockState(bool blocked);
+	void RegisterDebuggerRequest();
+	void UnregisterDebuggerRequest();
+	int GetCurrentThreadDebugRequestCount();
 	void ResetDebugger(bool startDebugger = false);
 
 	double GetFrameDelay();

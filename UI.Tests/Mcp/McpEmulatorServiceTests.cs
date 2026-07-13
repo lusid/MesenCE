@@ -438,6 +438,36 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
+	public void EmulatorOperation_BeginningDuringResetMutation_ReturnsStateChangedAndRecoversAfterward()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.SetDebuggerRequestBlocked(true);
+		McpEmulatorService service = new(api);
+
+		Assert.Equal("state_changed", service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).Error!.Code);
+		Assert.Equal(0, api.GetMemoryValuesCalls);
+
+		api.SetDebuggerRequestBlocked(false);
+		Assert.True(service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).IsSuccess);
+		Assert.Equal(1, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public void EmulatorOperation_BeginningDuringDeserializeMutation_ReturnsStateChangedAndRecoversAfterward()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.SetDebuggerRequestBlocked(true);
+		McpEmulatorService service = new(api);
+
+		Assert.Equal("state_changed", service.GetCpuRegisters().Error!.Code);
+		Assert.Equal(0, api.GetNesCpuStateCalls);
+
+		api.SetDebuggerRequestBlocked(false);
+		Assert.True(service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).IsSuccess);
+		Assert.Equal(1, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
 	public void EmulatorOperation_WhenDebuggerBlockStartsAndEndsAroundDefaultInteropResult_ReturnsStateChanged()
 	{
 		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
@@ -463,6 +493,33 @@ public sealed class McpEmulatorServiceTests
 
 		Assert.Equal("interop_failure", result.Error!.Code);
 		Assert.DoesNotContain("native details", result.Error.Message);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenInitialDebuggerBlockSnapshotThrows_ReturnsSanitizedInteropFailure()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.ThrowOnDebuggerRequestBlockStateCall = 1;
+
+		McpServiceResult<MemoryRead> result = new McpEmulatorService(api).ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("interop_failure", result.Error!.Code);
+		Assert.Equal("Native emulator interop failed.", result.Error.Message);
+		Assert.Equal(0, api.IsRunningCalls);
+		Assert.Equal(0, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenFinalDebuggerBlockSnapshotThrows_ReturnsSanitizedInteropFailure()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.ThrowOnDebuggerRequestBlockStateCall = 2;
+
+		McpServiceResult<MemoryRead> result = new McpEmulatorService(api).ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("interop_failure", result.Error!.Code);
+		Assert.Equal("Native emulator interop failed.", result.Error.Message);
+		Assert.Equal(1, api.GetMemoryValuesCalls);
 	}
 
 	[Fact]
@@ -522,6 +579,7 @@ public sealed class McpEmulatorServiceTests
 		public Action? OnRead { get; set; }
 		public ulong DebuggerRequestBlockState { get; private set; }
 		public int DebuggerRequestBlockStateCalls { get; private set; }
+		public int ThrowOnDebuggerRequestBlockStateCall { get; set; }
 		public int IsRunningCalls { get; private set; }
 		public int GetRomInfoCalls { get; private set; }
 		public int GetMemoryValuesCalls { get; private set; }
@@ -541,6 +599,9 @@ public sealed class McpEmulatorServiceTests
 		public ulong GetDebuggerRequestBlockState()
 		{
 			DebuggerRequestBlockStateCalls++;
+			if(DebuggerRequestBlockStateCalls == ThrowOnDebuggerRequestBlockStateCall) {
+				throw new InvalidOperationException("native snapshot details");
+			}
 			return DebuggerRequestBlockState;
 		}
 

@@ -204,7 +204,9 @@ internal sealed class McpEmulatorService
 			}
 
 			long generation = Volatile.Read(ref _emulatorGeneration);
-			ulong debuggerBlockState = _api.GetDebuggerRequestBlockState();
+			if(!TryGetDebuggerRequestBlockState(out ulong debuggerBlockState)) {
+				return InteropFailure<T>();
+			}
 			if(Volatile.Read(ref _transitionActive) != 0 || IsDebuggerRequestBlocked(debuggerBlockState)) {
 				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
 			}
@@ -216,10 +218,12 @@ internal sealed class McpEmulatorService
 			try {
 				result = operation();
 			} catch(Exception) {
-				result = McpServiceResult<T>.Failure("interop_failure", "Native emulator interop failed.");
+				result = InteropFailure<T>();
 			}
 
-			ulong endingDebuggerBlockState = _api.GetDebuggerRequestBlockState();
+			if(!TryGetDebuggerRequestBlockState(out ulong endingDebuggerBlockState)) {
+				return InteropFailure<T>();
+			}
 			if(generation != Volatile.Read(ref _emulatorGeneration)
 				|| Volatile.Read(ref _transitionActive) != 0
 				|| debuggerBlockState != endingDebuggerBlockState
@@ -230,6 +234,22 @@ internal sealed class McpEmulatorService
 		} finally {
 			_emulatorSemaphore.Release();
 		}
+	}
+
+	private bool TryGetDebuggerRequestBlockState(out ulong state)
+	{
+		try {
+			state = _api.GetDebuggerRequestBlockState();
+			return true;
+		} catch(Exception) {
+			state = 0;
+			return false;
+		}
+	}
+
+	private static McpServiceResult<T> InteropFailure<T>()
+	{
+		return McpServiceResult<T>.Failure("interop_failure", "Native emulator interop failed.");
 	}
 
 	private static bool IsDebuggerRequestBlocked(ulong state) => (state & 1) != 0;
