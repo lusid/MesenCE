@@ -468,6 +468,33 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
+	public async Task EmulatorOperation_WhenAnotherThreadOwnsBlockWindow_ReturnsStateChangedAndRecoversAfterward()
+	{
+		using ManualResetEventSlim mutationActive = new();
+		using ManualResetEventSlim releaseMutation = new();
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		McpEmulatorService service = new(api);
+		Task mutation = Task.Run(() => {
+			api.SetDebuggerRequestBlocked(true);
+			mutationActive.Set();
+			releaseMutation.Wait(TimeSpan.FromSeconds(5));
+			api.SetDebuggerRequestBlocked(false);
+		});
+		Assert.True(mutationActive.Wait(TimeSpan.FromSeconds(5)));
+
+		try {
+			Assert.Equal("state_changed", service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).Error!.Code);
+			Assert.Equal(0, api.GetMemoryValuesCalls);
+		} finally {
+			releaseMutation.Set();
+		}
+		await mutation.WaitAsync(TimeSpan.FromSeconds(5));
+
+		Assert.True(service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1).IsSuccess);
+		Assert.Equal(1, api.GetMemoryValuesCalls);
+	}
+
+	[Fact]
 	public void EmulatorOperation_WhenDebuggerBlockStartsAndEndsAroundDefaultInteropResult_ReturnsStateChanged()
 	{
 		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
@@ -577,7 +604,17 @@ public sealed class McpEmulatorServiceTests
 		public byte[] ReadData { get; set; } = [0];
 		public NesCpuState NesCpuState { get; init; }
 		public Action? OnRead { get; set; }
-		public ulong DebuggerRequestBlockState { get; private set; }
+		private readonly object _debuggerRequestBlockStateLock = new();
+		private ulong _debuggerRequestBlockState;
+		public ulong DebuggerRequestBlockState
+		{
+			get
+			{
+				lock(_debuggerRequestBlockStateLock) {
+					return _debuggerRequestBlockState;
+				}
+			}
+		}
 		public int DebuggerRequestBlockStateCalls { get; private set; }
 		public int ThrowOnDebuggerRequestBlockStateCall { get; set; }
 		public int IsRunningCalls { get; private set; }
@@ -607,7 +644,9 @@ public sealed class McpEmulatorServiceTests
 
 		public void SetDebuggerRequestBlocked(bool blocked)
 		{
-			DebuggerRequestBlockState = (((DebuggerRequestBlockState >> 1) + 1) << 1) | (blocked ? 1UL : 0);
+			lock(_debuggerRequestBlockStateLock) {
+				_debuggerRequestBlockState = (((_debuggerRequestBlockState >> 1) + 1) << 1) | (blocked ? 1UL : 0);
+			}
 		}
 
 		public bool IsPaused() => Paused;

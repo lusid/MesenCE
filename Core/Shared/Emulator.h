@@ -104,7 +104,6 @@ private:
 	const shared_ptr<RewindManager> _rewindManager;
 
 	thread_local static thread::id _currentThreadId;
-	thread_local static unordered_map<Emulator*, int> _currentThreadDebugRequestCounts;
 	thread::id _emulationThreadId;
 
 	atomic<uint32_t> _lockCounter;
@@ -112,12 +111,14 @@ private:
 	SimpleLock _loadLock;
 
 	SimpleLock _debuggerLock;
+	SimpleLock _debugRequestLock;
 	atomic<bool> _stopFlag;
 	atomic<bool> _paused;
 	atomic<bool> _pauseOnNextFrame;
 	atomic<bool> _threadPaused;
 
-	atomic<int> _debugRequestCount;
+	int _debugRequestCount;
+	unordered_map<thread::id, int> _debugRequestCountsByOwner;
 	atomic<int> _blockDebuggerRequestCount;
 	// Low bit is the current blocked state; upper bits are an epoch updated at every block boundary.
 	atomic<uint64_t> _debuggerRequestBlockState;
@@ -156,9 +157,9 @@ private:
 	void BlockDebuggerRequests();
 	void UnblockDebuggerRequests();
 	void UpdateDebuggerRequestBlockState(bool blocked);
-	void RegisterDebuggerRequest();
-	void UnregisterDebuggerRequest();
-	int GetCurrentThreadDebugRequestCount();
+	void RegisterDebuggerRequest(thread::id ownerThreadId);
+	void UnregisterDebuggerRequest(thread::id ownerThreadId);
+	int GetOtherThreadDebuggerRequestCount(thread::id ownerThreadId);
 	void ResetDebugger(bool startDebugger = false);
 
 	double GetFrameDelay();

@@ -1061,7 +1061,7 @@ void Emulator::BlockDebuggerRequests()
 	}
 
 	// Deserialize can run beneath an EmulatorLock-owned debugger request on this thread.
-	while(_debugRequestCount > GetCurrentThreadDebugRequestCount()) {
+	while(GetOtherThreadDebuggerRequestCount(std::this_thread::get_id()) > 0) {
 		//Wait until debugger calls are all done
 		std::this_thread::sleep_for(std::chrono::duration<int, std::milli>(10));
 	}
@@ -1093,25 +1093,38 @@ void Emulator::UpdateDebuggerRequestBlockState(bool blocked)
 	} while(!_debuggerRequestBlockState.compare_exchange_weak(state, updatedState));
 }
 
-void Emulator::RegisterDebuggerRequest()
+void Emulator::RegisterDebuggerRequest(thread::id ownerThreadId)
 {
-	_currentThreadDebugRequestCounts[this]++;
+	auto lock = _debugRequestLock.AcquireSafe();
+	_debugRequestCountsByOwner[ownerThreadId]++;
 	_debugRequestCount++;
 }
 
-void Emulator::UnregisterDebuggerRequest()
+void Emulator::UnregisterDebuggerRequest(thread::id ownerThreadId)
 {
+	auto lock = _debugRequestLock.AcquireSafe();
+	auto ownerRequestCount = _debugRequestCountsByOwner.find(ownerThreadId);
+	bool validOwnerCount = ownerRequestCount != _debugRequestCountsByOwner.end() && ownerRequestCount->second > 0;
+	assert(validOwnerCount);
+	assert(_debugRequestCount > 0);
+	assert(!validOwnerCount || _debugRequestCount >= ownerRequestCount->second);
+	if(!validOwnerCount || _debugRequestCount <= 0 || _debugRequestCount < ownerRequestCount->second) {
+		return;
+	}
+
 	_debugRequestCount--;
-	auto requestCount = _currentThreadDebugRequestCounts.find(this);
-	if(--requestCount->second == 0) {
-		_currentThreadDebugRequestCounts.erase(requestCount);
+	if(--ownerRequestCount->second == 0) {
+		_debugRequestCountsByOwner.erase(ownerRequestCount);
 	}
 }
 
-int Emulator::GetCurrentThreadDebugRequestCount()
+int Emulator::GetOtherThreadDebuggerRequestCount(thread::id ownerThreadId)
 {
-	auto count = _currentThreadDebugRequestCounts.find(this);
-	return count != _currentThreadDebugRequestCounts.end() ? count->second : 0;
+	auto lock = _debugRequestLock.AcquireSafe();
+	auto ownerRequestCount = _debugRequestCountsByOwner.find(ownerThreadId);
+	int requestCountForOwner = ownerRequestCount != _debugRequestCountsByOwner.end() ? ownerRequestCount->second : 0;
+	assert(_debugRequestCount >= requestCountForOwner);
+	return _debugRequestCount >= requestCountForOwner ? _debugRequestCount - requestCountForOwner : _debugRequestCount;
 }
 
 DebuggerRequest Emulator::GetDebugger(bool autoInit)
@@ -1270,4 +1283,3 @@ template void Emulator::AddDebugEvent<CpuType::Nes>(DebugEventType evtType);
 template void Emulator::AddDebugEvent<CpuType::Pce>(DebugEventType evtType);
 
 thread_local std::thread::id Emulator::_currentThreadId = std::this_thread::get_id();
-thread_local unordered_map<Emulator*, int> Emulator::_currentThreadDebugRequestCounts;
