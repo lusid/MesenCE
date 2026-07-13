@@ -33,8 +33,8 @@
 		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 		<WarningsNotAsErrors>IL2026;IL2070;IL2075;IL2104;IL3050;IL3053</WarningsNotAsErrors>
 	</PropertyGroup>
-	<PropertyGroup Condition="'$(RuntimeIdentifier)'=='osx-x64' Or '$(RuntimeIdentifier)'=='osx-arm64' Or '$(RuntimeIdentifier)'=='linux-x64' Or '$(RuntimeIdentifier)'=='linux-arm64'">
-		<SolutionDir>..</SolutionDir>
+	<PropertyGroup>
+		<SolutionDir Condition="'$(SolutionDir)'=='' Or '$(SolutionDir)'=='*Undefined*'">..</SolutionDir>
 	</PropertyGroup>
 	<PropertyGroup Condition="'$(Configuration)'=='Debug'">
     <OutputPath>$(SolutionDir)\bin\$(RuntimeIdentifier)\Debug\</OutputPath>
@@ -128,6 +128,7 @@
     <PackageReference Include="Dock.Model.Mvvm" Version="12.0.0.2" />
     <PackageReference Include="Dotnet.Bundle" Version="*" />
     <PackageReference Include="ELFSharp" Version="2.17.3" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.0.0-preview.2" />
    </ItemGroup>
   <ItemGroup>
     <Compile Update="Controls\ButtonWithIcon.axaml.cs">
