@@ -55,6 +55,81 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
+	public void GetCpuRegisters_WhenNoGameIsLoaded_DoesNotRequestCpuState()
+	{
+		FakeMcpEmulatorApi api = new() { Running = false };
+		McpEmulatorService service = new(api);
+
+		McpServiceResult<CpuRegisters> result = service.GetCpuRegisters();
+
+		Assert.Equal("no_game", result.Error!.Code);
+		Assert.Equal(0, api.GetRomInfoCalls);
+		Assert.Equal(0, api.GetNesCpuStateCalls);
+	}
+
+	[Fact]
+	public void GetCpuRegisters_WhenNesCpuIsUnavailable_ReturnsStructuredUnsupportedError()
+	{
+		FakeMcpEmulatorApi api = new() {
+			Running = true,
+			RomInfo = new RomInfo {
+				ConsoleType = ConsoleType.Nes,
+				CpuTypes = [CpuType.Snes]
+			}
+		};
+		McpEmulatorService service = new(api);
+
+		McpServiceResult<CpuRegisters> result = service.GetCpuRegisters();
+
+		Assert.Equal("registers_not_supported", result.Error!.Code);
+		Assert.Equal(0, api.GetNesCpuStateCalls);
+	}
+
+	[Fact]
+	public void GetCpuRegisters_WhenNesCpuIsAvailable_ReturnsOrderedRawRegisterValues()
+	{
+		FakeMcpEmulatorApi api = new() {
+			Running = true,
+			RomInfo = new RomInfo {
+				ConsoleType = ConsoleType.Nes,
+				CpuTypes = [CpuType.Nes]
+			},
+			NesCpuState = new NesCpuState {
+				A = 0x0A,
+				X = 0xB1,
+				Y = 0x02,
+				SP = 0x03,
+				PC = 0x04D5,
+				PS = 0x13,
+				IRQFlag = 0x06,
+				NMIFlag = true,
+				CycleCount = 0x789ABCDEF
+			}
+		};
+		McpEmulatorService service = new(api);
+
+		McpServiceResult<CpuRegisters> result = service.GetCpuRegisters();
+
+		Assert.True(result.IsSuccess);
+		Assert.Equal(nameof(ConsoleType.Nes), result.Value!.System);
+		Assert.Equal(nameof(CpuType.Nes), result.Value.Cpu);
+		Assert.Equal("6502", result.Value.Architecture);
+		Assert.Collection(
+			result.Value.Registers,
+			register => AssertRegister(register, "A", 0x0A, 8, "0A"),
+			register => AssertRegister(register, "X", 0xB1, 8, "B1"),
+			register => AssertRegister(register, "Y", 0x02, 8, "02"),
+			register => AssertRegister(register, "SP", 0x03, 8, "03"),
+			register => AssertRegister(register, "PC", 0x04D5, 16, "04D5"),
+			register => AssertRegister(register, "PS", 0x13, 8, "13"),
+			register => AssertRegister(register, "IRQFlag", 0x06, 8, "06"),
+			register => AssertRegister(register, "NMIFlag", 1, 1, "1"),
+			register => AssertRegister(register, "CycleCount", 0x789ABCDEF, 64, "0000000789ABCDEF")
+		);
+		Assert.Equal(1, api.GetNesCpuStateCalls);
+	}
+
+	[Fact]
 	public void ListMemorySpaces_ReturnsOnlyPositiveActiveEnumValues()
 	{
 		FakeMcpEmulatorApi api = new() { Running = true };
@@ -266,6 +341,14 @@ public sealed class McpEmulatorServiceTests
 		return api;
 	}
 
+	private static void AssertRegister(CpuRegister register, string name, ulong value, int bits, string hex)
+	{
+		Assert.Equal(name, register.Name);
+		Assert.Equal(value, register.Value);
+		Assert.Equal(bits, register.Bits);
+		Assert.Equal(hex, register.Hex);
+	}
+
 	private sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	{
 		public bool Running { get; init; }
@@ -274,11 +357,13 @@ public sealed class McpEmulatorServiceTests
 		public Dictionary<MemoryType, int> MemorySizes { get; } = [];
 		public int DefaultMemorySize { get; init; }
 		public byte[] ReadData { get; set; } = [0];
+		public NesCpuState NesCpuState { get; init; }
 		public Action? OnRead { get; set; }
 		public int IsRunningCalls { get; private set; }
 		public int GetRomInfoCalls { get; private set; }
 		public int GetMemoryValuesCalls { get; private set; }
 		public int SetMemoryValuesCalls { get; private set; }
+		public int GetNesCpuStateCalls { get; private set; }
 		public uint LastReadStart { get; private set; }
 		public uint LastReadEndInclusive { get; private set; }
 		public uint LastWriteStart { get; private set; }
@@ -316,6 +401,10 @@ public sealed class McpEmulatorServiceTests
 			LastWriteData = data;
 		}
 
-		public NesCpuState GetNesCpuState() => default;
+		public NesCpuState GetNesCpuState()
+		{
+			GetNesCpuStateCalls++;
+			return NesCpuState;
+		}
 	}
 }

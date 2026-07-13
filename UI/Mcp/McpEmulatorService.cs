@@ -65,6 +65,38 @@ internal sealed class McpEmulatorService
 		});
 	}
 
+	public McpServiceResult<CpuRegisters> GetCpuRegisters()
+	{
+		return Execute(() => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<CpuRegisters>.Failure("no_game", "No game is currently loaded.");
+			}
+
+			RomInfo romInfo = _api.GetRomInfo();
+			if(!romInfo.CpuTypes.Contains(CpuType.Nes)) {
+				return McpServiceResult<CpuRegisters>.Failure("registers_not_supported", "CPU registers are not supported for the current system.");
+			}
+
+			NesCpuState state = _api.GetNesCpuState();
+			return McpServiceResult<CpuRegisters>.Success(new(
+				romInfo.ConsoleType.ToString(),
+				CpuType.Nes.ToString(),
+				"6502",
+				[
+					Register("A", state.A, 8),
+					Register("X", state.X, 8),
+					Register("Y", state.Y, 8),
+					Register("SP", state.SP, 8),
+					Register("PC", state.PC, 16),
+					Register("PS", state.PS, 8),
+					Register("IRQFlag", state.IRQFlag, 8),
+					Register("NMIFlag", state.NMIFlag ? 1UL : 0UL, 1),
+					Register("CycleCount", state.CycleCount, 64)
+				]
+			));
+		});
+	}
+
 	public McpServiceResult<MemoryRead> ReadMemory(string space, uint address, int count)
 	{
 		return Execute(() => {
@@ -120,6 +152,12 @@ internal sealed class McpEmulatorService
 
 		size = _api.GetMemorySize(type);
 		return size > 0;
+	}
+
+	private static CpuRegister Register(string name, ulong value, int bits)
+	{
+		int digits = (bits + 3) / 4;
+		return new(name, value, bits, value.ToString($"X{digits}"));
 	}
 
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
