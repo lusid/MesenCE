@@ -1,0 +1,283 @@
+using Mesen.Interop;
+using Mesen.Mcp;
+
+namespace UI.Tests.Mcp;
+
+public sealed class McpEmulatorGateTests
+{
+	[Fact]
+	public async Task Execute_SerializesOperations()
+	{
+		using ManualResetEventSlim firstEntered = new();
+		using ManualResetEventSlim releaseFirst = new();
+		using ManualResetEventSlim secondStarted = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+
+		Task<McpServiceResult<int>> first = Task.Run(() => gate.Execute(() => {
+			firstEntered.Set();
+			releaseFirst.Wait(TimeSpan.FromSeconds(5));
+			return McpServiceResult<int>.Success(1);
+		}));
+		Assert.True(firstEntered.Wait(TimeSpan.FromSeconds(5)));
+		Task<McpServiceResult<int>> second = Task.Run(() => {
+			secondStarted.Set();
+			return gate.Execute(() => McpServiceResult<int>.Success(2));
+		});
+		Assert.True(secondStarted.Wait(TimeSpan.FromSeconds(5)));
+		Assert.NotSame(second, await Task.WhenAny(second, Task.Delay(100)));
+
+		releaseFirst.Set();
+		McpServiceResult<int>[] results = await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.All(results, result => Assert.True(result.IsSuccess));
+	}
+
+	[Fact]
+	public void Execute_WhenTransitionBeginsDuringOperation_ReturnsStateChanged()
+	{
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+
+		McpServiceResult<int> result = gate.Execute(() => {
+			gate.BeginEmulatorTransition();
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void Execute_WhenTransitionBeginsAndEndsDuringOperation_ReturnsStateChanged()
+	{
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+
+		McpServiceResult<int> result = gate.Execute(() => {
+			gate.BeginEmulatorTransition();
+			gate.EndEmulatorTransition();
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void Execute_WhenTransitionIsActive_RejectsBeforeOperationAndRecoversAfterEnd()
+	{
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+		bool called = false;
+		gate.BeginEmulatorTransition();
+
+		McpServiceResult<int> blocked = gate.Execute(() => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", blocked.Error!.Code);
+		Assert.False(called);
+		gate.EndEmulatorTransition();
+		Assert.True(gate.Execute(() => McpServiceResult<int>.Success(1)).IsSuccess);
+	}
+
+	[Fact]
+	public void Execute_WhenDebuggerRequestsAreBlocked_RejectsBeforeOperationAndRecoversAfterward()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.SetDebuggerRequestBlocked(true);
+		McpEmulatorGate gate = new(api);
+		bool called = false;
+
+		McpServiceResult<int> blocked = gate.Execute(() => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", blocked.Error!.Code);
+		Assert.False(called);
+		api.SetDebuggerRequestBlocked(false);
+		Assert.True(gate.Execute(() => McpServiceResult<int>.Success(1)).IsSuccess);
+	}
+
+	[Fact]
+	public void Execute_WhenDebuggerBlockStartsAndEndsDuringOperation_ReturnsStateChanged()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api);
+
+		McpServiceResult<int> result = gate.Execute(() => {
+			api.SetDebuggerRequestBlocked(true);
+			api.SetDebuggerRequestBlocked(false);
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void Execute_WhenOperationThrows_ReturnsSanitizedInteropFailure()
+	{
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+
+		McpServiceResult<int> result = gate.Execute<int>(() => throw new InvalidOperationException("native details"));
+
+		Assert.Equal("interop_failure", result.Error!.Code);
+		Assert.Equal("Native emulator interop failed.", result.Error.Message);
+	}
+
+	[Theory]
+	[InlineData(1, false)]
+	[InlineData(2, true)]
+	public void Execute_WhenDebuggerBlockSnapshotThrows_ReturnsSanitizedInteropFailure(int throwOnCall, bool operationCalled)
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.ThrowOnDebuggerRequestBlockStateCall = throwOnCall;
+		McpEmulatorGate gate = new(api);
+		bool called = false;
+
+		McpServiceResult<int> result = gate.Execute(() => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("interop_failure", result.Error!.Code);
+		Assert.Equal("Native emulator interop failed.", result.Error.Message);
+		Assert.Equal(operationCalled, called);
+	}
+
+	[Fact]
+	public void Execute_WhenGenerationChangesDuringOperation_ReturnsStateChanged()
+	{
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+
+		McpServiceResult<int> result = gate.Execute(() => {
+			gate.NotifyEmulatorStateChanged();
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void ExecuteWithTicket_PassesCapturedTicketWithoutReacquiringGate()
+	{
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+		McpOperationTicket captured = default;
+
+		McpServiceResult<int> result = gate.ExecuteWithTicket(ticket => {
+			captured = ticket;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.True(result.IsSuccess);
+		Assert.Equal(gate.Generation, captured.Generation);
+	}
+
+	[Fact]
+	public void ExecuteForTicket_WhenGenerationChanged_ReturnsStateChangedWithoutRunningCompletion()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api);
+		McpOperationTicket ticket = gate.CaptureTicket().Value!;
+		gate.NotifyEmulatorStateChanged();
+		bool called = false;
+
+		McpServiceResult<int> result = gate.ExecuteForTicket(ticket, () => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", result.Error!.Code);
+		Assert.False(called);
+	}
+
+	[Fact]
+	public void ExecuteForTicket_WhenDebuggerBlockStateChanged_ReturnsStateChangedWithoutRunningCompletion()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api);
+		McpOperationTicket ticket = gate.CaptureTicket().Value!;
+		api.SetDebuggerRequestBlocked(true);
+		api.SetDebuggerRequestBlocked(false);
+		bool called = false;
+
+		McpServiceResult<int> result = gate.ExecuteForTicket(ticket, () => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("state_changed", result.Error!.Code);
+		Assert.False(called);
+	}
+
+	[Fact]
+	public async Task BeginShutdown_CancelsTokenRejectsQueuedOperationAndDrainWaitsForActiveOperation()
+	{
+		using ManualResetEventSlim operationEntered = new();
+		using ManualResetEventSlim releaseOperation = new();
+		using ManualResetEventSlim operationExited = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());
+		Task<McpServiceResult<int>> active = Task.Run(() => gate.Execute(() => {
+			operationEntered.Set();
+			releaseOperation.Wait(TimeSpan.FromSeconds(5));
+			operationExited.Set();
+			return McpServiceResult<int>.Success(1);
+		}));
+		Assert.True(operationEntered.Wait(TimeSpan.FromSeconds(5)));
+		Task<McpServiceResult<int>> queued = Task.Run(() => gate.Execute(() => McpServiceResult<int>.Success(2)));
+		await Task.Delay(100);
+
+		gate.BeginShutdown();
+		Task drain = Task.Run(gate.DrainOperations);
+
+		Assert.True(gate.ShutdownToken.IsCancellationRequested);
+		Assert.False(drain.IsCompleted);
+		releaseOperation.Set();
+		await drain.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.True(operationExited.IsSet);
+		Assert.True((await active).IsSuccess);
+		Assert.Equal("server_stopping", (await queued).Error!.Code);
+	}
+
+	private sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
+	{
+		private readonly object _debuggerRequestBlockStateLock = new();
+		private ulong _debuggerRequestBlockState;
+		private int _debuggerRequestBlockCount;
+		private int _debuggerRequestBlockStateCalls;
+
+		public int ThrowOnDebuggerRequestBlockStateCall { get; set; }
+
+		public static FakeMcpEmulatorApi RunningNes() => new();
+
+		public ulong GetDebuggerRequestBlockState()
+		{
+			int call = Interlocked.Increment(ref _debuggerRequestBlockStateCalls);
+			if(call == ThrowOnDebuggerRequestBlockStateCall) {
+				throw new InvalidOperationException("native snapshot details");
+			}
+			lock(_debuggerRequestBlockStateLock) {
+				return _debuggerRequestBlockState;
+			}
+		}
+
+		public void SetDebuggerRequestBlocked(bool blocked)
+		{
+			lock(_debuggerRequestBlockStateLock) {
+				if(blocked) {
+					_debuggerRequestBlockCount++;
+				} else {
+					Assert.True(_debuggerRequestBlockCount > 0);
+					_debuggerRequestBlockCount--;
+				}
+				_debuggerRequestBlockState = (((_debuggerRequestBlockState >> 33) + 1) << 33)
+					| ((ulong)_debuggerRequestBlockCount << 1)
+					| (_debuggerRequestBlockCount > 0 ? 1UL : 0);
+			}
+		}
+
+		public bool IsRunning() => true;
+		public bool IsPaused() => false;
+		public RomInfo GetRomInfo() => new() { ConsoleType = ConsoleType.Nes, RomPath = "game.nes" };
+		public int GetMemorySize(MemoryType type) => 0;
+		public byte[] GetMemoryValues(MemoryType type, uint start, uint endInclusive) => [];
+		public void SetMemoryValues(MemoryType type, uint start, byte[] data) { }
+		public NesCpuState GetNesCpuState() => default;
+	}
+}

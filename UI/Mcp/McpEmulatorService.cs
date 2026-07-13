@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
-using System.Threading;
 using Mesen.Interop;
 
 [assembly: InternalsVisibleTo("UI.Tests")]
@@ -15,14 +14,12 @@ internal sealed class McpEmulatorService
 	private static readonly string MesenVersion = typeof(McpEmulatorService).Assembly.GetName().Version?.ToString(3) ?? "unknown";
 
 	private readonly IMcpEmulatorApi _api;
-	private readonly SemaphoreSlim _emulatorSemaphore = new(1, 1);
-	private long _emulatorGeneration;
-	private int _transitionActive;
-	private int _shutdownStarted;
+	private readonly McpEmulatorGate _gate;
 
-	public McpEmulatorService(IMcpEmulatorApi api)
+	internal McpEmulatorService(IMcpEmulatorApi api, McpEmulatorGate? gate = null)
 	{
 		_api = api;
+		_gate = gate ?? new McpEmulatorGate(api);
 	}
 
 	public McpServiceResult<EmulatorStatus> GetStatus()
@@ -169,88 +166,31 @@ internal sealed class McpEmulatorService
 
 	internal void NotifyEmulatorStateChanged()
 	{
-		Interlocked.Increment(ref _emulatorGeneration);
+		_gate.NotifyEmulatorStateChanged();
 	}
 
 	internal void BeginEmulatorTransition()
 	{
-		Interlocked.Exchange(ref _transitionActive, 1);
-		Interlocked.Increment(ref _emulatorGeneration);
+		_gate.BeginEmulatorTransition();
 	}
 
 	internal void EndEmulatorTransition()
 	{
-		Interlocked.Increment(ref _emulatorGeneration);
-		Interlocked.Exchange(ref _transitionActive, 0);
+		_gate.EndEmulatorTransition();
 	}
 
 	internal void BeginShutdown()
 	{
-		Interlocked.Exchange(ref _shutdownStarted, 1);
+		_gate.BeginShutdown();
 	}
 
 	internal void DrainOperations()
 	{
-		_emulatorSemaphore.Wait();
-		_emulatorSemaphore.Release();
+		_gate.DrainOperations();
 	}
 
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
 	{
-		_emulatorSemaphore.Wait();
-		try {
-			if(Volatile.Read(ref _shutdownStarted) != 0) {
-				return McpServiceResult<T>.Failure("server_stopping", "The MCP server is shutting down.");
-			}
-
-			long generation = Volatile.Read(ref _emulatorGeneration);
-			if(!TryGetDebuggerRequestBlockState(out ulong debuggerBlockState)) {
-				return InteropFailure<T>();
-			}
-			if(Volatile.Read(ref _transitionActive) != 0 || IsDebuggerRequestBlocked(debuggerBlockState)) {
-				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
-			}
-			if(generation != Volatile.Read(ref _emulatorGeneration)) {
-				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
-			}
-
-			McpServiceResult<T> result;
-			try {
-				result = operation();
-			} catch(Exception) {
-				result = InteropFailure<T>();
-			}
-
-			if(!TryGetDebuggerRequestBlockState(out ulong endingDebuggerBlockState)) {
-				return InteropFailure<T>();
-			}
-			if(generation != Volatile.Read(ref _emulatorGeneration)
-				|| Volatile.Read(ref _transitionActive) != 0
-				|| debuggerBlockState != endingDebuggerBlockState
-				|| IsDebuggerRequestBlocked(endingDebuggerBlockState)) {
-				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
-			}
-			return result;
-		} finally {
-			_emulatorSemaphore.Release();
-		}
+		return _gate.Execute(operation);
 	}
-
-	private bool TryGetDebuggerRequestBlockState(out ulong state)
-	{
-		try {
-			state = _api.GetDebuggerRequestBlockState();
-			return true;
-		} catch(Exception) {
-			state = 0;
-			return false;
-		}
-	}
-
-	private static McpServiceResult<T> InteropFailure<T>()
-	{
-		return McpServiceResult<T>.Failure("interop_failure", "Native emulator interop failed.");
-	}
-
-	private static bool IsDebuggerRequestBlocked(ulong state) => (state & 1) != 0;
 }
