@@ -3,6 +3,7 @@ using Avalonia.Threading;
 using Mesen.Config;
 using Mesen.Debugger.Labels;
 using Mesen.Debugger.Windows;
+using Mesen.Interop;
 using Mesen.Utilities;
 using System;
 using System.Collections.Concurrent;
