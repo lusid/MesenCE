@@ -13,7 +13,7 @@ namespace UI.Tests.Mcp;
 public sealed class McpServerTests
 {
 	[Fact]
-	public async Task MainWindowLifecycle_ForwardsBreakNotificationSynchronously()
+	public async Task MainWindowNotification_ForwardsCodeBreakSynchronously()
 	{
 		McpEmulatorService service = new(
 			FakeMcpEmulatorApi.RunningNes(),
@@ -502,7 +502,9 @@ public sealed class McpServerTests
 	{
 		FakeMcpEmulatorApi api = CreateRunningApi();
 		using McpServer server = new(new McpEmulatorService(api));
-		api.OnRead = server.NotifyEmulatorStateChanged;
+		api.OnRead = () => server.ProcessNotification(new NotificationEventArgs {
+			NotificationType = ConsoleNotificationType.StateLoaded
+		});
 		await server.StartAsync(0);
 		await using McpClient client = await CreateClientAsync(server.Endpoint);
 
@@ -580,7 +582,7 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
-	public async Task Stop_WithBlockedToolCall_IsBoundedAndDoesNotResurrectHost()
+	public async Task Stop_WithBlockedToolCall_WaitsForNativeDrainAndDoesNotResurrectHost()
 	{
 		using ManualResetEventSlim readEntered = new();
 		using ManualResetEventSlim releaseRead = new();
@@ -600,14 +602,15 @@ public sealed class McpServerTests
 		})).AsTask();
 		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
 
-		long started = Environment.TickCount64;
-		server.Stop(TimeSpan.FromSeconds(30));
+		Task stop = Task.Run(() => server.Stop(TimeSpan.FromSeconds(30)));
+		await Task.Delay(TimeSpan.FromMilliseconds(2200));
+		Assert.False(stop.IsCompleted);
+		releaseRead.Set();
+		await stop.WaitAsync(TimeSpan.FromSeconds(5));
 
-		Assert.InRange(Environment.TickCount64 - started, 0, 2500);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
 		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
-		releaseRead.Set();
 		Exception requestFailure = await Assert.ThrowsAnyAsync<Exception>(async () => await read.WaitAsync(TimeSpan.FromSeconds(5)));
 		Assert.IsNotType<TimeoutException>(requestFailure);
 		server.Stop(TimeSpan.FromSeconds(2));

@@ -21,6 +21,7 @@ internal sealed class McpServer : IDisposable
 	private readonly Action<string> _toolLog;
 	private LifecycleGeneration? _generation;
 	private long _nextGenerationId;
+	private bool _stopping;
 	private bool _disposed;
 
 	internal McpServer(McpEmulatorService service, Action<string>? toolLog = null)
@@ -43,6 +44,9 @@ internal sealed class McpServer : IDisposable
 	{
 		lock(_lifecycleLock) {
 			ObjectDisposedException.ThrowIf(_disposed, this);
+			if(_stopping) {
+				throw new InvalidOperationException("The MCP server is stopping.");
+			}
 			if(_generation is not null) {
 				if(_generation.Stopping) {
 					throw new InvalidOperationException("The previous MCP server generation is still stopping.");
@@ -59,7 +63,10 @@ internal sealed class McpServer : IDisposable
 
 	internal void Stop(TimeSpan timeout)
 	{
-		_service.BeginShutdown();
+		lock(_lifecycleLock) {
+			_stopping = true;
+		}
+		_service.BeginServiceShutdown();
 		TimeSpan boundedTimeout = timeout <= TimeSpan.Zero
 			? TimeSpan.Zero
 			: timeout < MaximumStopTimeout ? timeout : MaximumStopTimeout;
@@ -67,46 +74,35 @@ internal sealed class McpServer : IDisposable
 		Task? shutdownTask;
 		lock(_lifecycleLock) {
 			generation = _generation;
-			if(generation is null) {
-				return;
-			}
-			if(!generation.Stopping) {
+			if(generation is not null && !generation.Stopping) {
 				generation.Stopping = true;
 				generation.Endpoint = null;
 				generation.ForcedShutdownCancellation = new CancellationTokenSource(boundedTimeout);
 				generation.ShutdownTask = StopCoreAsync(generation, generation.ForcedShutdownCancellation.Token);
 			}
-			shutdownTask = generation.ShutdownTask;
+			shutdownTask = generation?.ShutdownTask;
 		}
 
-		TryCancel(generation.StartCancellation);
-		TryCancel(generation.RequestCancellation);
-		TryStopApplication(generation.Application);
+		if(generation is not null) {
+			TryCancel(generation.StartCancellation);
+			TryCancel(generation.RequestCancellation);
+			TryStopApplication(generation.Application);
+		}
 		try {
-			shutdownTask?.Wait(boundedTimeout);
+			shutdownTask?.GetAwaiter().GetResult();
 		} catch(AggregateException ex) {
 			Log($"[MCP] Stop did not complete cleanly: {ex.GetBaseException().Message}");
+		} catch(Exception ex) {
+			Log($"[MCP] Stop did not complete cleanly: {ex.GetBaseException().Message}");
 		}
-	}
 
-	internal void NotifyEmulatorStateChanged()
-	{
-		_service.NotifyEmulatorStateChanged();
+		_service.CleanupDebuggerResources();
+		_service.Dispose();
 	}
 
 	internal void ProcessNotification(NotificationEventArgs e)
 	{
 		_service.ProcessNotification(e);
-	}
-
-	internal void BeginEmulatorTransition()
-	{
-		_service.BeginEmulatorTransition();
-	}
-
-	internal void EndEmulatorTransition()
-	{
-		_service.EndEmulatorTransition();
 	}
 
 	internal void DrainEmulatorOperations()

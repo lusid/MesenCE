@@ -122,9 +122,132 @@ public sealed class McpDebuggerServiceTests
 		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
 		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
 
-		service.NotifyEmulatorStateChanged();
+		service.ProcessNotification(Notification(ConsoleNotificationType.StateLoaded));
 
 		Assert.Equal("state_changed", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
+	}
+
+	[Fact]
+	public async Task StateLoaded_InvalidatesBreakContextMappingAndTraceGeneration()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection, api);
+		long stableId = SetBreakpoint(service, 0x8000).Value!.Id;
+		int oldNativeId = collection.GetNativeId(stableId);
+		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
+		SendBreak(service, CreateBreakEvent(oldNativeId));
+		int snapshotsBeforeNotification = collection.Snapshots.Count;
+		int traceCallsBeforeNotification = api.SetTraceOptionsCalls;
+		using ManualResetEventSlim nativeCallEntered = new();
+		using ManualResetEventSlim releaseNativeCall = new();
+		api.GetMemoryValuesHandler = (_, _, _) => {
+			nativeCallEntered.Set();
+			releaseNativeCall.Wait(TimeSpan.FromSeconds(5));
+			return [0];
+		};
+		Task<McpServiceResult<MemoryRead>> active = Task.Run(() =>
+			service.ReadMemory(nameof(MemoryType.NesMemory), 0, 1));
+		Assert.True(nativeCallEntered.Wait(TimeSpan.FromSeconds(2)));
+
+		Task notification = Task.Run(() => service.ProcessNotification(Notification(ConsoleNotificationType.StateLoaded)));
+		bool notificationCompletedWithoutGate;
+		try {
+			await notification.WaitAsync(TimeSpan.FromSeconds(2));
+			notificationCompletedWithoutGate = true;
+		} catch(TimeoutException) {
+			notificationCompletedWithoutGate = false;
+		}
+		releaseNativeCall.Set();
+		await Task.WhenAll(active, notification);
+
+		Assert.True(notificationCompletedWithoutGate);
+		Assert.Equal(snapshotsBeforeNotification, collection.Snapshots.Count);
+		Assert.Equal(traceCallsBeforeNotification, api.SetTraceOptionsCalls);
+		Assert.Equal("stale_context", service.GetBreakContext(0, 0, 1).Error!.Code);
+		Assert.Equal(1, api.ClearExecutionTraceCalls);
+		Assert.Equal(traceCallsBeforeNotification + 1, api.SetTraceOptionsCalls);
+		Assert.Equal(snapshotsBeforeNotification + 2, collection.Snapshots.Count);
+		Assert.NotEqual(oldNativeId, collection.GetNativeId(stableId));
+		Assert.Equal(1, service.MapAddress(nameof(CpuType.Nes), nameof(MemoryType.NesMemory), 0).Value!.Generation);
+	}
+
+	[Fact]
+	public async Task GameReset_CancelsWaiterAndPreservesMcpBreakpointDefinitions()
+	{
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection);
+		long stableId = SetBreakpoint(service, 0x8000).Value!.Id;
+		int oldNativeId = collection.GetNativeId(stableId);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+
+		service.ProcessNotification(Notification(ConsoleNotificationType.GameReset));
+
+		Assert.Equal("state_changed", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
+		Assert.Equal(stableId, Assert.Single(service.ListBreakpoints().Value!).Id);
+		Assert.NotEqual(oldNativeId, collection.GetNativeId(stableId));
+	}
+
+	[Fact]
+	public async Task BeforeGameUnload_CancelsWaiterRemovesNativeMcpEntriesAndReleasesLease()
+	{
+		bool running = true;
+		int releases = 0;
+		FakeMcpEmulatorApi api = CreateApi();
+		api.IsRunningHandler = () => running;
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => releases++),
+			breakpointCollection: collection
+		);
+		SetBreakpoint(service, 0x8000);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		int snapshotsBeforeNotification = collection.Snapshots.Count;
+
+		service.ProcessNotification(Notification(ConsoleNotificationType.BeforeGameUnload));
+
+		Assert.Equal(snapshotsBeforeNotification, collection.Snapshots.Count);
+		Assert.Equal("state_changed", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
+		running = false;
+		service.ProcessNotification(Notification(ConsoleNotificationType.EmulationStopped));
+		Assert.Equal("no_game", service.ListBreakpoints().Error!.Code);
+		Assert.Empty(collection.Snapshots[^1]);
+		Assert.Equal(1, releases);
+	}
+
+	[Fact]
+	public void GameLoaded_AllowsLazyLeaseAndReinstallsOwnedBreakpoints()
+	{
+		bool running = true;
+		int memorySize = 0x10000;
+		int initializes = 0;
+		int releases = 0;
+		FakeMcpEmulatorApi api = CreateApi();
+		api.IsRunningHandler = () => running;
+		api.GetMemorySizeHandler = type => type == MemoryType.NesMemory ? memorySize : 0;
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => initializes++, () => releases++),
+			breakpointCollection: collection
+		);
+		long stableId = SetBreakpoint(service, 0x8000).Value!.Id;
+		SetBreakpoint(service, 0xF000);
+		service.ProcessNotification(Notification(ConsoleNotificationType.BeforeGameUnload));
+		running = false;
+		service.ProcessNotification(Notification(ConsoleNotificationType.EmulationStopped));
+		service.GetStatus();
+		Assert.Equal((1, 1), (initializes, releases));
+
+		running = true;
+		memorySize = 0x9000;
+		service.ProcessNotification(Notification(ConsoleNotificationType.GameLoaded));
+		Assert.Equal(1, initializes);
+
+		Assert.Equal(stableId, Assert.Single(service.ListBreakpoints().Value!).Id);
+		Assert.Equal(2, initializes);
+		Assert.Equal(stableId, Assert.Single(collection.Snapshots[^1]).StableId);
 	}
 
 	[Fact]
@@ -133,7 +256,7 @@ public sealed class McpDebuggerServiceTests
 		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
 		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
 
-		service.BeginShutdown();
+		service.BeginServiceShutdown();
 
 		Assert.Equal("server_stopping", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
 	}
@@ -346,7 +469,7 @@ public sealed class McpDebuggerServiceTests
 		Assert.Equal("stale_context", service.GetBreakContext(0, 0, 1).Error!.Code);
 
 		SendBreak(service, breakEvent);
-		service.NotifyEmulatorStateChanged();
+		service.ProcessNotification(Notification(ConsoleNotificationType.StateLoaded));
 		Assert.Equal("stale_context", service.GetBreakContext(0, 0, 1).Error!.Code);
 	}
 
@@ -634,7 +757,7 @@ public sealed class McpDebuggerServiceTests
 		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
 		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
 
-		service.NotifyEmulatorStateChanged();
+		service.ProcessNotification(Notification(ConsoleNotificationType.StateLoaded));
 
 		Assert.Single(options);
 		Assert.Equal(0, api.ClearExecutionTraceCalls);
@@ -647,7 +770,7 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
-	public void Shutdown_DisablesAndClearsOwnedTrace()
+	public async Task Shutdown_RemovesBreakpointsDisablesTraceCancelsWaiterBeforeDrain()
 	{
 		FakeMcpEmulatorApi api = CreateApi();
 		List<InteropTraceLoggerOptions> options = [];
@@ -656,9 +779,15 @@ public sealed class McpDebuggerServiceTests
 		using McpEmulatorService service = CreateService(collection, api);
 		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
 		SetBreakpoint(service, 0x8000);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
 
-		service.BeginShutdown();
-		service.BeginShutdown();
+		service.BeginServiceShutdown();
+
+		Assert.Equal("server_stopping", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
+		Assert.Single(collection.Snapshots[^1]);
+		Assert.Single(options);
+		service.CleanupDebuggerResources();
+		service.CleanupDebuggerResources();
 
 		Assert.Equal(2, options.Count);
 		Assert.False(options[^1].Enabled);
@@ -666,6 +795,22 @@ public sealed class McpDebuggerServiceTests
 		Assert.Empty(collection.Snapshots[^1]);
 		Assert.Equal(1, collection.DisposeCalls);
 		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
+	}
+
+	[Fact]
+	public void Shutdown_WithOpenUiLeaseDoesNotInvokeFinalNativeDebuggerRelease()
+	{
+		int releases = 0;
+		DebuggerLifetimeCoordinator lifetime = new(() => { }, () => releases++);
+		using IDisposable uiLease = lifetime.Acquire();
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = new(CreateApi(), debuggerLifetime: lifetime, breakpointCollection: collection);
+		SetBreakpoint(service, 0x8000);
+
+		service.BeginServiceShutdown();
+		service.CleanupDebuggerResources();
+
+		Assert.Equal(0, releases);
 	}
 
 	private static McpEmulatorService CreateService(FakeBreakpointCollection collection, FakeMcpEmulatorApi? api = null)
@@ -767,6 +912,10 @@ public sealed class McpDebuggerServiceTests
 	private static NotificationEventArgs Notification(IntPtr pointer) => new() {
 		NotificationType = ConsoleNotificationType.CodeBreak,
 		Parameter = pointer
+	};
+
+	private static NotificationEventArgs Notification(ConsoleNotificationType type) => new() {
+		NotificationType = type
 	};
 
 	private static void SendBreak(McpEmulatorService service, BreakEvent breakEvent)
