@@ -39,6 +39,7 @@ namespace Mesen.Debugger.ViewModels
 		[ObservableProperty] public partial string? TraceFile { get; set; } = null;
 		[ObservableProperty] public partial bool AllowOpenTraceFile { get; private set; } = false;
 		[ObservableProperty] public partial bool IsStartLoggingEnabled { get; set; }
+		[ObservableProperty] public partial bool TraceOwnershipConflict { get; private set; }
 
 		[ObservableProperty] public partial bool ShowByteCode { get; private set; }
 
@@ -57,9 +58,14 @@ namespace Mesen.Debugger.ViewModels
 		public QuickSearchViewModel QuickSearch { get; } = new();
 
 		private DisassemblyViewer? _viewer = null;
+		private readonly ITraceLoggerCoordinator _traceCoordinator;
+		private readonly object _traceOwner = new();
 
-		public TraceLoggerViewModel()
+		public TraceLoggerViewModel() : this(TraceLoggerCoordinator.Shared) { }
+
+		internal TraceLoggerViewModel(ITraceLoggerCoordinator traceCoordinator)
 		{
+			_traceCoordinator = traceCoordinator;
 			Config = ConfigManager.Config.Debug.TraceLogger;
 			StyleProvider = new TraceLoggerStyleProvider(this);
 
@@ -246,23 +252,47 @@ namespace Mesen.Debugger.ViewModels
 			UpdateLog();
 		}
 
-		public void UpdateCoreOptions()
+		public bool UpdateCoreOptions()
 		{
 			RomInfo romInfo = EmuApi.GetRomInfo();
-			foreach(CpuType cpuType in romInfo.CpuTypes) {
-				TraceLoggerCpuConfig cfg = Config.GetCpuConfig(cpuType);
-				InteropTraceLoggerOptions options = new InteropTraceLoggerOptions() {
-					Enabled = romInfo.CpuTypes.Count == 1 || cfg.Enabled,
-					UseLabels = cfg.UseLabels,
-					IndentCode = cfg.IndentCode,
-					Format = Encoding.UTF8.GetBytes(cfg.UseCustomFormat ? cfg.Format : TraceLoggerOptionTab.GetAutoFormat(cfg, cpuType)),
-					Condition = Encoding.UTF8.GetBytes(cfg.Condition)
-				};
+			bool updated = _traceCoordinator.TryAcquireAndExecute(_traceOwner, () => {
+				foreach(CpuType cpuType in romInfo.CpuTypes) {
+					TraceLoggerCpuConfig cfg = Config.GetCpuConfig(cpuType);
+					InteropTraceLoggerOptions options = new InteropTraceLoggerOptions() {
+						Enabled = romInfo.CpuTypes.Count == 1 || cfg.Enabled,
+						UseLabels = cfg.UseLabels,
+						IndentCode = cfg.IndentCode,
+						Format = Encoding.UTF8.GetBytes(cfg.UseCustomFormat ? cfg.Format : TraceLoggerOptionTab.GetAutoFormat(cfg, cpuType)),
+						Condition = Encoding.UTF8.GetBytes(cfg.Condition)
+					};
 
-				Array.Resize(ref options.Condition, 1000);
-				Array.Resize(ref options.Format, 1000);
+					Array.Resize(ref options.Condition, 1000);
+					Array.Resize(ref options.Format, 1000);
 
-				DebugApi.SetTraceOptions(cpuType, options);
+					DebugApi.SetTraceOptions(cpuType, options);
+				}
+			});
+			TraceOwnershipConflict = !updated;
+			return updated;
+		}
+
+		public bool ClearTrace()
+		{
+			bool cleared = _traceCoordinator.TryExecute(_traceOwner, DebugApi.ClearExecutionTrace);
+			TraceOwnershipConflict = !cleared;
+			return cleared;
+		}
+
+		public void ReleaseTraceOwnership()
+		{
+			try {
+				_traceCoordinator.TryReleaseAndExecute(_traceOwner, () => {
+					foreach(CpuType cpuType in Enum.GetValues<CpuType>()) {
+						DebugApi.SetTraceOptions(cpuType, new());
+					}
+				});
+			} finally {
+				_traceCoordinator.Release(_traceOwner);
 			}
 		}
 

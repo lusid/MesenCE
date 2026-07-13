@@ -235,4 +235,30 @@ public sealed class McpEmulatorGateTests
 		Assert.Equal("server_stopping", (await queued).Error!.Code);
 	}
 
+	[Theory]
+	[InlineData(true)]
+	[InlineData(false)]
+	public void ExecuteTerminalCleanup_BypassesTransitionOrDebuggerBlockAndSanitizesExceptions(bool transition)
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api);
+		if(transition) {
+			gate.BeginEmulatorTransition();
+		} else {
+			api.SetDebuggerRequestBlocked(true);
+		}
+		bool called = false;
+
+		McpServiceResult<int> result = gate.ExecuteTerminalCleanup(() => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+		McpServiceResult<int> failed = gate.ExecuteTerminalCleanup<int>(() => throw new InvalidOperationException("native details"));
+
+		Assert.True(result.IsSuccess);
+		Assert.True(called);
+		Assert.Equal("interop_failure", failed.Error!.Code);
+		Assert.Equal("Native emulator interop failed.", failed.Error.Message);
+	}
+
 }

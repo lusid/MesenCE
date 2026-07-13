@@ -74,6 +74,20 @@ internal sealed class McpEmulatorGate
 		_emulatorSemaphore.Release();
 	}
 
+	internal McpServiceResult<T> ExecuteTerminalCleanup<T>(Func<McpServiceResult<T>> operation)
+	{
+		_emulatorSemaphore.Wait();
+		try {
+			try {
+				return operation();
+			} catch(Exception) {
+				return InteropFailure<T>();
+			}
+		} finally {
+			_emulatorSemaphore.Release();
+		}
+	}
+
 	private McpServiceResult<T> ExecuteLocked<T>(Func<McpOperationTicket, McpServiceResult<T>> operation)
 	{
 		_emulatorSemaphore.Wait();

@@ -75,6 +75,84 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
+	public async Task ContinueUntilBreak_CompetingResumeAndStepCannotMixBreakEventWithRunningCpuState()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		uint programCounter = 0x8000;
+		int resumeDebuggerCalls = 0;
+		api.GetProgramCounterHandler = (_, _) => programCounter;
+		api.GetNesCpuStateHandler = () => new NesCpuState { PC = (ushort)programCounter };
+		api.ResumeDebuggerHandler = () => {
+			if(++resumeDebuggerCalls > 1) {
+				programCounter = 0x9000;
+			}
+		};
+		api.StepHandler = (_, _, _) => programCounter = 0xA000;
+		using ManualResetEventSlim gateEntered = new();
+		using ManualResetEventSlim releaseGate = new();
+		api.GetMemoryValuesHandler = (_, _, _) => {
+			gateEntered.Set();
+			releaseGate.Wait(TimeSpan.FromSeconds(5));
+			return [0];
+		};
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		Task<McpServiceResult<MemoryRead>> blocker = Task.Run(() => service.ReadMemory(nameof(MemoryType.NesMemory), 0, 1));
+		Assert.True(gateEntered.Wait(TimeSpan.FromSeconds(2)));
+		using ManualResetEventSlim resumeStarted = new();
+		using ManualResetEventSlim stepStarted = new();
+		Task<McpServiceResult<ExecutionState>> resume = Task.Run(() => {
+			resumeStarted.Set();
+			return service.Resume();
+		});
+		Task<McpServiceResult<ExecutionState>> step = Task.Run(() => {
+			stepStarted.Set();
+			return service.Step(nameof(CpuType.Nes), "instruction");
+		});
+		Assert.True(resumeStarted.Wait(TimeSpan.FromSeconds(2)));
+		Assert.True(stepStarted.Wait(TimeSpan.FromSeconds(2)));
+
+		SendBreak(service, new BreakEvent { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 });
+		releaseGate.Set();
+
+		ContinueResult result = (await wait.WaitAsync(TimeSpan.FromSeconds(5))).Value!;
+		await blocker;
+		await Task.WhenAll(resume, step).WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.Equal(0x8000U, result.Context!.ProgramCounter);
+		Assert.Equal(0x8000UL, result.Context.Registers.Registers.Single(register => register.Name == "PC").Value);
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_CapturesStableBreakpointIdBeforeUiReordersNativeMap()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection, api);
+		long firstId = SetBreakpoint(service, 0x8000).Value!.Id;
+		long secondId = SetBreakpoint(service, 0x9000).Value!.Id;
+		int originalNativeId = collection.GetNativeId(firstId);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		using ManualResetEventSlim gateEntered = new();
+		using ManualResetEventSlim releaseGate = new();
+		api.GetMemoryValuesHandler = (_, _, _) => {
+			gateEntered.Set();
+			releaseGate.Wait(TimeSpan.FromSeconds(5));
+			return [0];
+		};
+		Task<McpServiceResult<MemoryRead>> blocker = Task.Run(() => service.ReadMemory(nameof(MemoryType.NesMemory), 0, 1));
+		Assert.True(gateEntered.Wait(TimeSpan.FromSeconds(2)));
+
+		SendBreak(service, CreateBreakEvent(originalNativeId));
+		collection.RemapNativeId(originalNativeId, secondId);
+		Assert.NotEqual(firstId, collection.GetStableId(originalNativeId));
+		releaseGate.Set();
+
+		McpServiceResult<ContinueResult> result = await wait.WaitAsync(TimeSpan.FromSeconds(5));
+		await blocker;
+		Assert.Equal(firstId, result.Value!.Context!.BreakpointId);
+	}
+
+	[Fact]
 	public async Task ContinueUntilBreak_RejectsSecondWaiterForSameCpu()
 	{
 		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
@@ -410,6 +488,26 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
+	public void ListAndUnknownRemoval_DoNotInitializeOrAcquireDebuggerLifetime()
+	{
+		int initializes = 0;
+		int releases = 0;
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = new(
+			CreateApi(),
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => initializes++, () => releases++),
+			breakpointCollection: collection
+		);
+
+		Assert.Empty(service.ListBreakpoints().Value!);
+		Assert.Equal("breakpoint_not_owned", service.RemoveBreakpoint(42).Error!.Code);
+
+		Assert.Equal(0, initializes);
+		Assert.Equal(0, releases);
+		Assert.Empty(collection.Snapshots);
+	}
+
+	[Fact]
 	public void RemoveAllBreakpoints_RemovesOnlyMcpEntries()
 	{
 		FakeBreakpointCollection collection = new() { UnownedEntryCount = 2 };
@@ -708,6 +806,33 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
+	public void ConfigureExecutionTrace_CoordinatesOwnershipWithUiAndReleasesOnDisable()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		TraceLoggerCoordinator coordinator = new();
+		object uiOwner = new();
+		using McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new FakeBreakpointCollection(),
+			traceCoordinator: coordinator
+		);
+		Assert.True(coordinator.TryAcquireAndExecute(uiOwner, () => { }));
+
+		McpServiceResult<TraceConfiguration> conflict = service.ConfigureExecutionTrace(
+			nameof(CpuType.Nes), "enable", false, false, null, null
+		);
+		Assert.Equal("operation_in_progress", conflict.Error!.Code);
+		Assert.Equal(0, api.SetTraceOptionsCalls);
+
+		coordinator.Release(uiOwner);
+		Assert.True(service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null).IsSuccess);
+		Assert.False(coordinator.TryAcquireAndExecute(uiOwner, () => Assert.Fail("UI must not overwrite MCP trace options.")));
+		Assert.True(service.ConfigureExecutionTrace(nameof(CpuType.Nes), "disable", false, false, null, null).IsSuccess);
+		Assert.True(coordinator.TryAcquireAndExecute(uiOwner, () => { }));
+	}
+
+	[Fact]
 	public void GetExecutionTrace_ReturnsBoundedTailInChronologicalOrder()
 	{
 		FakeMcpEmulatorApi api = CreateApi();
@@ -795,6 +920,43 @@ public sealed class McpDebuggerServiceTests
 		Assert.Empty(collection.Snapshots[^1]);
 		Assert.Equal(1, collection.DisposeCalls);
 		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
+	}
+
+	[Theory]
+	[InlineData(true)]
+	[InlineData(false)]
+	public void ShutdownCleanup_RunsDuringTransitionOrDebuggerBlockAndIsIdempotent(bool transition)
+	{
+		int releases = 0;
+		FakeMcpEmulatorApi api = CreateApi();
+		FakeBreakpointCollection collection = new();
+		McpEmulatorGate gate = new(api);
+		TraceLoggerCoordinator traceCoordinator = new();
+		using McpEmulatorService service = new(
+			api,
+			gate,
+			new DebuggerLifetimeCoordinator(() => { }, () => releases++),
+			collection,
+			traceCoordinator
+		);
+		service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null);
+		SetBreakpoint(service, 0x8000);
+		if(transition) {
+			gate.BeginEmulatorTransition();
+		} else {
+			api.SetDebuggerRequestBlocked(true);
+		}
+
+		service.BeginServiceShutdown();
+		service.CleanupDebuggerResources();
+		service.CleanupDebuggerResources();
+
+		Assert.Empty(collection.Snapshots[^1]);
+		Assert.Equal(1, collection.DisposeCalls);
+		Assert.Equal(1, api.ClearExecutionTraceCalls);
+		Assert.Equal(2, api.SetTraceOptionsCalls);
+		Assert.Equal(1, releases);
+		Assert.True(traceCoordinator.TryAcquireAndExecute(new object(), () => { }));
 	}
 
 	[Fact]
@@ -955,6 +1117,10 @@ public sealed class McpDebuggerServiceTests
 
 		internal int GetNativeId(long stableId) =>
 			_stableIdsByNativeId.Single(entry => entry.Value == stableId).Key;
+
+		internal long GetStableId(int nativeId) => _stableIdsByNativeId[nativeId];
+
+		internal void RemapNativeId(int nativeId, long stableId) => _stableIdsByNativeId[nativeId] = stableId;
 
 		public void Dispose() => DisposeCalls++;
 	}
