@@ -15,20 +15,24 @@ namespace Mesen.Mcp;
 internal sealed class McpServer : IDisposable
 {
 	private static readonly TimeSpan MaximumStopTimeout = TimeSpan.FromSeconds(2);
+	private const long MaximumRequestBodySize = 512 * 1024;
 	private readonly object _lifecycleLock = new();
 	private readonly McpEmulatorService _service;
+	private readonly Action<string> _toolLog;
 	private LifecycleGeneration? _generation;
 	private long _nextGenerationId;
 	private bool _disposed;
 
-	internal McpServer(McpEmulatorService service)
+	internal McpServer(McpEmulatorService service, Action<string>? toolLog = null)
 	{
 		_service = service;
+		_toolLog = toolLog ?? Log;
 	}
 
 	internal Uri Endpoint
 	{
-		get {
+		get
+		{
 			lock(_lifecycleLock) {
 				return _generation?.Endpoint ?? throw new InvalidOperationException("The MCP server is not running.");
 			}
@@ -55,6 +59,7 @@ internal sealed class McpServer : IDisposable
 
 	internal void Stop(TimeSpan timeout)
 	{
+		_service.BeginShutdown();
 		TimeSpan boundedTimeout = timeout <= TimeSpan.Zero
 			? TimeSpan.Zero
 			: timeout < MaximumStopTimeout ? timeout : MaximumStopTimeout;
@@ -84,6 +89,16 @@ internal sealed class McpServer : IDisposable
 		}
 	}
 
+	internal void NotifyEmulatorStateChanged()
+	{
+		_service.NotifyEmulatorStateChanged();
+	}
+
+	internal void DrainEmulatorOperations()
+	{
+		_service.DrainOperations();
+	}
+
 	public void Dispose()
 	{
 		lock(_lifecycleLock) {
@@ -103,9 +118,10 @@ internal sealed class McpServer : IDisposable
 			WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
 			builder.Logging.ClearProviders();
 			builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+			builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = MaximumRequestBodySize);
 			builder.Services.AddMcpServer()
 				.WithHttpTransport()
-				.WithTools(McpTools.Create(_service));
+				.WithTools(McpTools.Create(_service, _toolLog));
 
 			application = builder.Build();
 			application.Use(async (context, next) => {

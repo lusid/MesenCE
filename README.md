@@ -48,9 +48,9 @@ The endpoint exposes exactly five tools:
 
 Pass numeric inputs such as `address`, `count`, and every `data` byte as decimal JSON numbers, not `$`-prefixed or `0x`-prefixed strings. Each write byte must be an integer from `0` through `255`; for example, two bytes are `"data": [0, 255]`. Pass the case-sensitive enum-name `id` returned by `list_memory_spaces` as `space`; for example, use `NesInternalRam` only when discovery returns that ID.
 
-All tool calls inspect the live emulator without pausing it. A multi-byte read or write is not an atomic snapshot relative to emulation, concurrent protocol calls are serialized, and writes modify emulator state immediately. Record the original value before a diagnostic write and restore that same value when finished.
+All tool calls inspect the live emulator without pausing it. A multi-byte read or write is not an atomic snapshot relative to emulation, concurrent protocol calls are serialized, and writes modify emulator state immediately. Record the original value before a diagnostic write and restore that same value when finished. Valid writes use Mesen's synchronous bulk setter only for spaces with a complete native write path; it has no partial-failure result, so MCP reports a count only after that call returns and never fabricates `bytesWritten` on failure.
 
-The server binds only to `127.0.0.1`, but every local process and every MCP client granted access to it is inside the trust boundary and may invoke destructive writes. Server lifecycle and tool failures are written to Mesen's log with an `[MCP]` prefix.
+The server binds only to `127.0.0.1`, but every local process and every MCP client granted access to it is inside the trust boundary and may invoke destructive writes. Server lifecycle and tool outcomes are written to Mesen's log with an `[MCP]` prefix, request type, result, and duration; arguments and memory payloads are never logged.
 
 ### Build and Test
 
@@ -69,12 +69,12 @@ Use `osx-x64` instead of `osx-arm64` on Intel macOS. The app is produced at `bin
 
 ### Syncing Upstream
 
-Keep `origin` pointed at this fork and `upstream` pointed at `https://github.com/nesdev-org/MesenCE.git`. Update the fork only after rebasing and repeating the complete test, normal-build, Native AOT build, and live MCP smoke test:
+Keep `origin` pointed at this fork and `upstream` pointed at `https://github.com/nesdev-org/MesenCE.git`. Update the fork only after merging upstream and repeating the complete test, normal-build, Native AOT build, and live MCP smoke test:
 
 ```bash
 git switch master
-git fetch origin upstream
-git rebase upstream/master
+git fetch upstream
+git merge upstream/master
 dotnet test UI.Tests/UI.Tests.csproj -c Release -p:RuntimeIdentifier=osx-arm64
 make clean
 make
@@ -83,7 +83,7 @@ USE_AOT=true make
 git push origin master
 ```
 
-Resolve rebase conflicts without dropping MCP behavior. Do not update a consuming repository's submodule pointer until the rebased fork revision has passed all gates.
+Resolve merge conflicts without dropping MCP behavior. Do not update a consuming repository's submodule pointer until the merged fork revision has passed all gates.
 
 ## Contributing
 

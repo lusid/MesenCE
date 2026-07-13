@@ -149,19 +149,35 @@ public sealed class McpEmulatorServiceTests
 	}
 
 	[Fact]
-	public void ListMemorySpaces_UsesRomClassificationAsTheSingleReadOnlyRule()
+	public void MemoryCapabilities_ClassifyEveryMemoryTypeAndKnownNoOpSpacesAsReadOnly()
 	{
+		MemoryType[] readOnly = [
+			MemoryType.NecDspMemory,
+			MemoryType.SnesPrgRom, MemoryType.SnesRegister, MemoryType.SpcRom,
+			MemoryType.DspProgramRom, MemoryType.DspDataRom,
+			MemoryType.St018PrgRom, MemoryType.St018DataRom,
+			MemoryType.SufamiTurboFirmware, MemoryType.SufamiTurboSecondCart,
+			MemoryType.GbPrgRom, MemoryType.GbBootRom,
+			MemoryType.NesPrgRom, MemoryType.NesChrRom,
+			MemoryType.PcePrgRom,
+			MemoryType.SmsPrgRom, MemoryType.SmsBootRom, MemoryType.SmsPort,
+			MemoryType.GbaPrgRom, MemoryType.GbaBootRom,
+			MemoryType.WsPrgRom, MemoryType.WsBootRom, MemoryType.WsPort,
+			MemoryType.None
+		];
+
+		foreach(MemoryType type in Enum.GetValues<MemoryType>()) {
+			Assert.Equal(!readOnly.Contains(type), McpMemoryCapabilities.CanWrite(type));
+		}
+
 		FakeMcpEmulatorApi api = new() { Running = true, DefaultMemorySize = 1 };
-		McpEmulatorService service = new(api);
-
-		IReadOnlyList<MemorySpace> spaces = service.ListMemorySpaces().Value!;
-
-		Assert.All(spaces, space => {
-			MemoryType type = Enum.Parse<MemoryType>(space.Id);
-			Assert.Equal(!type.IsRomMemory(), space.CanWrite);
-		});
-		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.NesPrgRom) && !x.CanWrite);
+		IReadOnlyList<MemorySpace> spaces = new McpEmulatorService(api).ListMemorySpaces().Value!;
+		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.SnesRegister) && !x.CanWrite);
+		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.SmsPort) && !x.CanWrite);
+		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.WsPort) && !x.CanWrite);
+		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.WsBootRom) && !x.CanWrite);
 		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.NesWorkRam) && x.CanWrite);
+		Assert.Contains(spaces, x => x.Id == nameof(MemoryType.NesMemory) && x.CanWrite);
 	}
 
 	[Fact]
@@ -278,6 +294,21 @@ public sealed class McpEmulatorServiceTests
 		Assert.Equal(0, api.SetMemoryValuesCalls);
 	}
 
+	[Theory]
+	[InlineData(MemoryType.SnesRegister)]
+	[InlineData(MemoryType.SmsPort)]
+	[InlineData(MemoryType.WsPort)]
+	[InlineData(MemoryType.WsBootRom)]
+	[InlineData(MemoryType.NecDspMemory)]
+	public void WriteMemory_WhenNativeBulkSetterCannotWriteWholeSpace_RejectsWithoutInterop(MemoryType type)
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(type, 16);
+		McpServiceResult<MemoryWrite> result = new McpEmulatorService(api).WriteMemory(type.ToString(), 0, [1]);
+
+		Assert.Equal("memory_space_read_only", result.Error!.Code);
+		Assert.Equal(0, api.SetMemoryValuesCalls);
+	}
+
 	[Fact]
 	public void WriteMemory_WhenSpaceIdIsNotAnExactNamedActiveSpace_DoesNotWrite()
 	{
@@ -332,6 +363,60 @@ public sealed class McpEmulatorServiceTests
 		await Task.WhenAll(read, status).WaitAsync(TimeSpan.FromSeconds(5));
 		Assert.True((await read).IsSuccess);
 		Assert.True((await status).IsSuccess);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenGenerationChangesDuringInterop_ReturnsStateChanged()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		McpEmulatorService service = new(api);
+		api.OnRead = service.NotifyEmulatorStateChanged;
+
+		McpServiceResult<MemoryRead> result = service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("state_changed", result.Error!.Code);
+	}
+
+	[Fact]
+	public void EmulatorOperation_WhenInteropThrows_ReturnsInteropFailure()
+	{
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.OnRead = () => throw new InvalidOperationException("native details");
+
+		McpServiceResult<MemoryRead> result = new McpEmulatorService(api).ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1);
+
+		Assert.Equal("interop_failure", result.Error!.Code);
+		Assert.DoesNotContain("native details", result.Error.Message);
+	}
+
+	[Fact]
+	public async Task Shutdown_RejectsQueuedOperationAndDrainsActiveInteropBeforeRelease()
+	{
+		using ManualResetEventSlim readEntered = new();
+		using ManualResetEventSlim releaseRead = new();
+		using ManualResetEventSlim readExited = new();
+		FakeMcpEmulatorApi api = CreateApiWithMemory(MemoryType.NesWorkRam, 16);
+		api.OnRead = () => {
+			readEntered.Set();
+			releaseRead.Wait(TimeSpan.FromSeconds(5));
+			readExited.Set();
+		};
+		McpEmulatorService service = new(api);
+
+		Task<McpServiceResult<MemoryRead>> active = Task.Run(() => service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1));
+		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
+		Task<McpServiceResult<EmulatorStatus>> queued = Task.Run(service.GetStatus);
+		await Task.Delay(100);
+		service.BeginShutdown();
+		Task drain = Task.Run(service.DrainOperations);
+		Assert.False(drain.IsCompleted);
+
+		releaseRead.Set();
+		await drain.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.True(readExited.IsSet);
+		Assert.True((await active).IsSuccess);
+		Assert.Equal("server_stopping", (await queued).Error!.Code);
+		Assert.Equal(1, api.IsRunningCalls);
 	}
 
 	private static FakeMcpEmulatorApi CreateApiWithMemory(MemoryType type, int size)

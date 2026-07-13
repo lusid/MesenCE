@@ -16,6 +16,8 @@ internal sealed class McpEmulatorService
 
 	private readonly IMcpEmulatorApi _api;
 	private readonly SemaphoreSlim _emulatorSemaphore = new(1, 1);
+	private long _emulatorGeneration;
+	private int _shutdownStarted;
 
 	public McpEmulatorService(IMcpEmulatorApi api)
 	{
@@ -57,7 +59,7 @@ internal sealed class McpEmulatorService
 
 				int size = _api.GetMemorySize(type);
 				if(size > 0) {
-					spaces.Add(new(type.ToString(), type.GetShortName(), size, true, !type.IsRomMemory()));
+					spaces.Add(new(type.ToString(), type.GetShortName(), size, true, McpMemoryCapabilities.CanWrite(type)));
 				}
 			}
 
@@ -129,7 +131,7 @@ internal sealed class McpEmulatorService
 				return McpServiceResult<MemoryWrite>.Failure("unknown_memory_space", "The selected memory space is not available.");
 			}
 
-			if(type.IsRomMemory()) {
+			if(!McpMemoryCapabilities.CanWrite(type)) {
 				return McpServiceResult<MemoryWrite>.Failure("memory_space_read_only", "The selected memory space does not support writes.");
 			}
 
@@ -160,11 +162,42 @@ internal sealed class McpEmulatorService
 		return new(name, value, bits, value.ToString($"X{digits}"));
 	}
 
+	internal void NotifyEmulatorStateChanged()
+	{
+		Interlocked.Increment(ref _emulatorGeneration);
+	}
+
+	internal void BeginShutdown()
+	{
+		Interlocked.Exchange(ref _shutdownStarted, 1);
+	}
+
+	internal void DrainOperations()
+	{
+		_emulatorSemaphore.Wait();
+		_emulatorSemaphore.Release();
+	}
+
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
 	{
 		_emulatorSemaphore.Wait();
 		try {
-			return operation();
+			if(Volatile.Read(ref _shutdownStarted) != 0) {
+				return McpServiceResult<T>.Failure("server_stopping", "The MCP server is shutting down.");
+			}
+
+			long generation = Volatile.Read(ref _emulatorGeneration);
+			McpServiceResult<T> result;
+			try {
+				result = operation();
+			} catch(Exception) {
+				result = McpServiceResult<T>.Failure("interop_failure", "Native emulator interop failed.");
+			}
+
+			if(generation != Volatile.Read(ref _emulatorGeneration)) {
+				return McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
+			return result;
 		} finally {
 			_emulatorSemaphore.Release();
 		}

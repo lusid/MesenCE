@@ -89,6 +89,43 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
+	public async Task MainWindowLifecycle_DrainsActiveAndRejectsQueuedInteropBeforeCoreRelease()
+	{
+		using ManualResetEventSlim readEntered = new();
+		using ManualResetEventSlim releaseRead = new();
+		using ManualResetEventSlim readExited = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.OnRead = () => {
+			readEntered.Set();
+			releaseRead.Wait(TimeSpan.FromSeconds(5));
+			readExited.Set();
+		};
+		McpEmulatorService service = new(api);
+		using McpServer server = new(service);
+		MainWindowMcpLifecycle lifecycle = new(() => server, (_, _) => Task.CompletedTask, _ => { }, _ => { });
+		await lifecycle.StartAsync(true, 7342);
+
+		Task<McpServiceResult<MemoryRead>> active = Task.Run(() => service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1));
+		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
+		Task<McpServiceResult<EmulatorStatus>> queued = Task.Run(service.GetStatus);
+		await Task.Delay(100);
+		bool releasedBeforeDrain = false;
+		Task shutdown = Task.Run(() => lifecycle.StopBeforeCoreRelease(
+			() => { },
+			() => { },
+			() => releasedBeforeDrain = !readExited.IsSet
+		));
+		await Task.Delay(100);
+		Assert.False(shutdown.IsCompleted);
+
+		releaseRead.Set();
+		await shutdown.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.False(releasedBeforeDrain);
+		Assert.True((await active).IsSuccess);
+		Assert.Equal("server_stopping", (await queued).Error!.Code);
+	}
+
+	[Fact]
 	public async Task Discovery_ExposesExactlyFiveToolsOnLoopbackMcpRoute()
 	{
 		using McpServer server = new(new McpEmulatorService(new FakeMcpEmulatorApi()));
@@ -113,7 +150,12 @@ public sealed class McpServerTests
 		JsonElement writeSchema = tools.Single(tool => tool.Name == "write_memory").JsonSchema;
 		JsonElement dataSchema = writeSchema.GetProperty("properties").GetProperty("request").GetProperty("properties").GetProperty("data");
 		Assert.Equal("array", dataSchema.GetProperty("type").GetString());
+		Assert.Equal(McpEmulatorService.MaxTransferSize, dataSchema.GetProperty("maxItems").GetInt32());
 		Assert.Equal("integer", dataSchema.GetProperty("items").GetProperty("type").GetString());
+		Assert.Equal(0, dataSchema.GetProperty("items").GetProperty("minimum").GetInt32());
+		Assert.Equal(byte.MaxValue, dataSchema.GetProperty("items").GetProperty("maximum").GetInt32());
+		Assert.False(tools.Single(tool => tool.Name == "write_memory").ProtocolTool.Annotations!.IdempotentHint);
+		Assert.All(tools.Where(tool => tool.Name != "write_memory"), tool => Assert.True(tool.ProtocolTool.Annotations!.IdempotentHint));
 	}
 
 	[Fact]
@@ -185,6 +227,86 @@ public sealed class McpServerTests
 		AssertInvalidByteValue(tooLarge);
 		Assert.Equal(0, api.IsRunningCalls);
 		Assert.Equal(0, api.SetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public async Task WriteMemory_RejectsOversizePayloadBeforeScanningOrCallingService()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		using McpServer server = new(new McpEmulatorService(api));
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+		int[] data = new int[McpEmulatorService.MaxTransferSize + 1];
+		data[0] = -1;
+
+		CallToolResult result = await client.CallToolAsync("write_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			data
+		}));
+
+		Assert.True(result.IsError);
+		Assert.Equal("payload_too_large", result.StructuredContent!.Value.GetProperty("code").GetString());
+		Assert.Equal(0, api.IsRunningCalls);
+		Assert.Equal(0, api.SetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public async Task Host_RejectsRequestBodiesAboveConfiguredCeiling()
+	{
+		using McpServer server = new(new McpEmulatorService(CreateRunningApi()));
+		await server.StartAsync(0);
+		using HttpClient client = new();
+		client.DefaultRequestHeaders.Accept.ParseAdd("application/json, text/event-stream");
+		using ByteArrayContent content = new(new byte[600 * 1024]);
+		content.Headers.ContentType = new("application/json");
+
+		using HttpResponseMessage response = await client.PostAsync(server.Endpoint, content);
+
+		Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+	}
+
+	[Fact]
+	public async Task ToolLogs_ContainOnlyRequestTypeOutcomeCodeAndDuration()
+	{
+		List<string> logs = [];
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		using McpServer server = new(new McpEmulatorService(api), logs.Add);
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		await client.CallToolAsync("get_emulator_status");
+		await client.CallToolAsync("read_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 15U,
+			count = 173
+		}));
+
+		Assert.Collection(
+			logs,
+			log => Assert.Matches(@"^\[MCP\] Tool get_emulator_status succeeded in \d+ ms\.$", log),
+			log => Assert.Matches(@"^\[MCP\] Tool read_memory failed with invalid_range in \d+ ms\.$", log)
+		);
+		Assert.DoesNotContain(logs, log => log.Contains("NesWorkRam") || log.Contains("173") || log.Contains("A1B2"));
+	}
+
+	[Fact]
+	public async Task ToolCall_WhenGenerationChangesDuringInterop_ReturnsStateChanged()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		using McpServer server = new(new McpEmulatorService(api));
+		api.OnRead = server.NotifyEmulatorStateChanged;
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult result = await client.CallToolAsync("read_memory", Request(new {
+			space = nameof(MemoryType.NesWorkRam),
+			address = 0U,
+			count = 2
+		}));
+
+		Assert.True(result.IsError);
+		Assert.Equal("state_changed", result.StructuredContent!.Value.GetProperty("code").GetString());
 	}
 
 	[Fact]

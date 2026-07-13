@@ -323,6 +323,17 @@ namespace Mesen.Windows
 		private void OnNotification(NotificationEventArgs e)
 		{
 			DebugWindowManager.ProcessNotification(e);
+			if(e.NotificationType is ConsoleNotificationType.StateLoaded
+				or ConsoleNotificationType.GameReset
+				or ConsoleNotificationType.BeforeEmulationStop
+				or ConsoleNotificationType.BeforeGameLoad
+				or ConsoleNotificationType.GameLoaded
+				or ConsoleNotificationType.GameLoadFailed
+				or ConsoleNotificationType.BeforeGameUnload
+				or ConsoleNotificationType.EmulationStopped
+				or ConsoleNotificationType.AfterInitConsole) {
+				_mcpLifecycle.NotifyEmulatorStateChanged();
+			}
 
 			switch(e.NotificationType) {
 				case ConsoleNotificationType.GameLoaded:
@@ -837,6 +848,7 @@ namespace Mesen.Windows
 		private readonly Action<McpServer> _disposeServer;
 		private readonly Action<string> _log;
 		private McpServer? _server;
+		private McpServer? _stoppingServer;
 		private bool _stopped;
 
 		internal MainWindowMcpLifecycle()
@@ -909,14 +921,27 @@ namespace Mesen.Windows
 				_stopped = true;
 				server = _server;
 				_server = null;
+				_stoppingServer = server;
 			}
 
 			if(server != null) {
+				server.Stop(TimeSpan.FromSeconds(2));
 				_disposeServer(server);
+				server.DrainEmulatorOperations();
+			}
+			lock(_lock) {
+				_stoppingServer = null;
 			}
 			stopCore();
 			disposeListener();
 			releaseCore();
+		}
+
+		internal void NotifyEmulatorStateChanged()
+		{
+			lock(_lock) {
+				(_server ?? _stoppingServer)?.NotifyEmulatorStateChanged();
+			}
 		}
 	}
 }
