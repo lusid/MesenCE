@@ -323,6 +323,7 @@ namespace Mesen.Windows
 		private void OnNotification(NotificationEventArgs e)
 		{
 			DebugWindowManager.ProcessNotification(e);
+			_mcpLifecycle.ProcessNotification(e);
 			if(e.NotificationType is ConsoleNotificationType.BeforeEmulationStop
 				or ConsoleNotificationType.BeforeGameLoad
 				or ConsoleNotificationType.BeforeGameUnload) {
@@ -943,6 +944,13 @@ namespace Mesen.Windows
 		{
 			lock(_lock) {
 				(_server ?? _stoppingServer)?.NotifyEmulatorStateChanged();
+			}
+		}
+
+		internal void ProcessNotification(NotificationEventArgs e)
+		{
+			lock(_lock) {
+				(_server ?? _stoppingServer)?.ProcessNotification(e);
 			}
 		}
 

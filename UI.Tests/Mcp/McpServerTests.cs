@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using Mesen.Debugger.Utilities;
 using Mesen.Interop;
 using Mesen.Mcp;
 using Mesen.Windows;
@@ -10,6 +11,33 @@ namespace UI.Tests.Mcp;
 
 public sealed class McpServerTests
 {
+	[Fact]
+	public async Task MainWindowLifecycle_ForwardsBreakNotificationSynchronously()
+	{
+		McpEmulatorService service = new(
+			FakeMcpEmulatorApi.RunningNes(),
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { })
+		);
+		using McpServer server = new(service);
+		MainWindowMcpLifecycle lifecycle = new(() => server, (_, _) => Task.CompletedTask, _ => { }, _ => { });
+		await lifecycle.StartAsync(true, 7342);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		BreakEvent breakEvent = new() { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 };
+		IntPtr pointer = System.Runtime.InteropServices.Marshal.AllocHGlobal(System.Runtime.InteropServices.Marshal.SizeOf<BreakEvent>());
+		try {
+			System.Runtime.InteropServices.Marshal.StructureToPtr(breakEvent, pointer, false);
+			lifecycle.ProcessNotification(new NotificationEventArgs {
+				NotificationType = ConsoleNotificationType.CodeBreak,
+				Parameter = pointer
+			});
+			System.Runtime.InteropServices.Marshal.StructureToPtr(new BreakEvent { Source = BreakSource.Nmi }, pointer, false);
+		} finally {
+			System.Runtime.InteropServices.Marshal.FreeHGlobal(pointer);
+		}
+
+		Assert.Equal("pause", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Value!.Reason);
+	}
+
 	[Fact]
 	public async Task MainWindowLifecycle_AppliesConfigBeforeStartingAndStopsBeforeCoreRelease()
 	{

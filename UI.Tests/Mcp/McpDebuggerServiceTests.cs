@@ -2,12 +2,179 @@ using Mesen.Debugger;
 using Mesen.Debugger.Utilities;
 using Mesen.Interop;
 using Mesen.Mcp;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using static Mesen.Debugger.BreakpointManager;
 
 namespace UI.Tests.Mcp;
 
 public sealed class McpDebuggerServiceTests
 {
+	[Fact]
+	public async Task ProcessNotification_CodeBreakCopiesStructBeforeCallbackReturns()
+	{
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection);
+		long stableId = SetBreakpoint(service, 0x8000).Value!.Id;
+		BreakEvent original = CreateBreakEvent(collection.GetNativeId(stableId));
+		IntPtr pointer = Marshal.AllocHGlobal(Marshal.SizeOf<BreakEvent>());
+		try {
+			Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+			Marshal.StructureToPtr(original, pointer, false);
+			service.ProcessNotification(Notification(pointer));
+			Marshal.StructureToPtr(new BreakEvent { Source = BreakSource.Nmi, SourceCpu = CpuType.Spc }, pointer, false);
+
+			McpServiceResult<ContinueResult> result = await wait.WaitAsync(TimeSpan.FromSeconds(5));
+			BreakEvent copied = Assert.IsType<BreakEvent>(GetPrivateField(service, "_latestBreakEvent"));
+			Assert.Equal(original.Source, copied.Source);
+			Assert.Equal(original.SourceCpu, copied.SourceCpu);
+			Assert.Equal(original.Operation.Address, copied.Operation.Address);
+			Assert.Equal(original.Operation.Value, copied.Operation.Value);
+			Assert.Equal(original.Operation.Type, copied.Operation.Type);
+			Assert.Equal(original.Operation.MemType, copied.Operation.MemType);
+			Assert.Equal(original.BreakpointId, copied.BreakpointId);
+			Assert.Equal(stableId, result.Value!.Context!.BreakpointId);
+		} finally {
+			Marshal.FreeHGlobal(pointer);
+		}
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_ReleasesGateWhileWaiting()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		using CancellationTokenSource cancellation = new();
+
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, cancellation.Token);
+		McpServiceResult<EmulatorStatus> status = await Task.Run(service.GetStatus).WaitAsync(TimeSpan.FromSeconds(2));
+
+		Assert.True(status.IsSuccess);
+		cancellation.Cancel();
+		Assert.Equal("cancelled", (await wait).Error!.Code);
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_CorrelatesNativeHitToStableMcpId()
+	{
+		FakeBreakpointCollection collection = new();
+		using McpEmulatorService service = CreateService(collection);
+		long stableId = SetBreakpoint(service, 0x8000).Value!.Id;
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+
+		SendBreak(service, CreateBreakEvent(collection.GetNativeId(stableId)));
+
+		McpServiceResult<ContinueResult> result = await wait.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.Equal("breakpoint", result.Value!.Reason);
+		Assert.Equal(stableId, result.Value.Context!.BreakpointId);
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_RejectsSecondWaiterForSameCpu()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		using CancellationTokenSource cancellation = new();
+		Task<McpServiceResult<ContinueResult>> first = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, cancellation.Token);
+
+		McpServiceResult<ContinueResult> second = await service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+
+		Assert.Equal("operation_in_progress", second.Error!.Code);
+		cancellation.Cancel();
+		await first;
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_TimesOutAndRemovesWaiter()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+
+		McpServiceResult<ContinueResult> timedOut = await service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 1, CancellationToken.None);
+		Task<McpServiceResult<ContinueResult>> next = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		SendBreak(service, new BreakEvent { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 });
+
+		Assert.Equal("timeout", timedOut.Error!.Code);
+		Assert.Equal("pause", (await next).Value!.Reason);
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_CancellationRemovesWaiter()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		using CancellationTokenSource cancellation = new();
+		Task<McpServiceResult<ContinueResult>> cancelled = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, cancellation.Token);
+
+		cancellation.Cancel();
+		Assert.Equal("cancelled", (await cancelled).Error!.Code);
+
+		Task<McpServiceResult<ContinueResult>> next = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		SendBreak(service, new BreakEvent { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 });
+		Assert.True((await next).IsSuccess);
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_StateGenerationChangeReturnsStateChanged()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+
+		service.NotifyEmulatorStateChanged();
+
+		Assert.Equal("state_changed", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_ShutdownReturnsServerStopping()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+
+		service.BeginShutdown();
+
+		Assert.Equal("server_stopping", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Error!.Code);
+	}
+
+	[Fact]
+	public void Resume_InvalidatesLatestContext()
+	{
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection());
+		SendBreak(service, new BreakEvent { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 });
+		Assert.NotNull(GetPrivateField(service, "_latestBreakEvent"));
+
+		Assert.True(service.Resume().IsSuccess);
+
+		Assert.Null(GetPrivateField(service, "_latestBreakEvent"));
+		Assert.Equal(-1L, GetPrivateField(service, "_latestBreakGeneration"));
+	}
+
+	[Fact]
+	public void Step_UnsupportedFeatureReturnsInvalidStepTypeWithoutNativeCall()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		McpServiceResult<ExecutionState> result = service.Step(nameof(CpuType.Nes), "over");
+
+		Assert.Equal("invalid_step_type", result.Error!.Code);
+		Assert.Equal(0, api.StepCalls);
+	}
+
+	[Fact]
+	public void Pause_UsesNormalPauseAndResumeSelectsDebuggerOrNormalPath()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		bool executionStopped = true;
+		api.IsExecutionStoppedHandler = () => executionStopped;
+		using McpEmulatorService service = CreateService(new FakeBreakpointCollection(), api);
+
+		Assert.True(service.Pause().IsSuccess);
+		Assert.True(service.Resume().IsSuccess);
+		executionStopped = false;
+		Assert.True(service.Resume().IsSuccess);
+
+		Assert.Equal(1, api.PauseCalls);
+		Assert.Equal(1, api.ResumeDebuggerCalls);
+		Assert.Equal(1, api.ResumeCalls);
+	}
+
 	[Fact]
 	public void SetBreakpoint_PreservesExistingCollectionEntriesAndReturnsStableId()
 	{
@@ -192,6 +359,37 @@ public sealed class McpDebuggerServiceTests
 		Assert.True(entry.Breakpoint.BreakOnExec);
 		Assert.Equal(condition, entry.Breakpoint.Condition);
 	}
+
+	private static BreakEvent CreateBreakEvent(int nativeBreakpointId) => new() {
+		Source = BreakSource.Breakpoint,
+		SourceCpu = CpuType.Nes,
+		Operation = new MemoryOperationInfo {
+			Address = 0x8123,
+			Value = 0x42,
+			Type = MemoryOperationType.ExecOpCode,
+			MemType = MemoryType.NesMemory
+		},
+		BreakpointId = nativeBreakpointId
+	};
+
+	private static NotificationEventArgs Notification(IntPtr pointer) => new() {
+		NotificationType = ConsoleNotificationType.CodeBreak,
+		Parameter = pointer
+	};
+
+	private static void SendBreak(McpEmulatorService service, BreakEvent breakEvent)
+	{
+		IntPtr pointer = Marshal.AllocHGlobal(Marshal.SizeOf<BreakEvent>());
+		try {
+			Marshal.StructureToPtr(breakEvent, pointer, false);
+			service.ProcessNotification(Notification(pointer));
+		} finally {
+			Marshal.FreeHGlobal(pointer);
+		}
+	}
+
+	private static object? GetPrivateField(McpEmulatorService service, string name) =>
+		typeof(McpEmulatorService).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service);
 
 	private sealed class FakeBreakpointCollection : IMcpBreakpointCollection
 	{
