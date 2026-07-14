@@ -35,6 +35,7 @@ private:
 	FrameInfo _baseFrameSize = {};
 	FrameInfo _lastFrameSize = {};
 	RenderedFrame _frame = {};
+	vector<uint32_t> _displayBuffer;
 
 	VideoFilterType _videoFilterType = VideoFilterType::None;
 	shared_ptr<BaseVideoFilter> _videoFilter;

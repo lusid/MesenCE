@@ -217,21 +217,32 @@ public sealed class McpNativeInteropTests
 	}
 
 	[Fact]
-	public void ScreenshotNativeCapture_HudDrawAndDisplayCopyAreInsideFrameLock()
+	public void ScreenshotNativeCapture_BaseCopyIsHudFreeAndDisplayOrderIsPreserved()
 	{
 		string filter = ReadRepositoryFile("Core/Shared/Video/BaseVideoFilter.cpp");
+		string filterHeader = ReadRepositoryFile("Core/Shared/Video/BaseVideoFilter.h");
 		string decoder = ReadRepositoryFile("Core/Shared/Video/VideoDecoder.cpp");
-		int methodStart = filter.IndexOf("BaseVideoFilter::SendFrameWithHud", StringComparison.Ordinal);
+		string decoderHeader = ReadRepositoryFile("Core/Shared/Video/VideoDecoder.h");
+		int methodStart = filter.IndexOf("BaseVideoFilter::SendFrameInternal", StringComparison.Ordinal);
 		int lockIndex = filter.IndexOf("_frameLock.AcquireSafe()", methodStart, StringComparison.Ordinal);
 		int filterIndex = filter.IndexOf("ApplyFilter(ppuOutputBuffer)", lockIndex, StringComparison.Ordinal);
-		int hudIndex = filter.IndexOf("debugHud->Draw", filterIndex, StringComparison.Ordinal);
-		int copyIndex = filter.IndexOf("memcpy(_displayBuffer", hudIndex, StringComparison.Ordinal);
+		int copyIndex = filter.IndexOf("displayBuffer->assign", filterIndex, StringComparison.Ordinal);
+		int captureIndex = filter.IndexOf("BaseVideoFilter::CaptureScreenshot", StringComparison.Ordinal);
+		int captureCopyIndex = filter.IndexOf("memcpy(frameBuffer.data(), GetOutputBuffer()", captureIndex, StringComparison.Ordinal);
+		int sendIndex = decoder.IndexOf("SendFrameForDisplay", StringComparison.Ordinal);
+		int rotateIndex = decoder.IndexOf("_rotateFilter->ApplyFilter", sendIndex, StringComparison.Ordinal);
+		int hudIndex = decoder.IndexOf("GetDebugHud()->Draw", rotateIndex, StringComparison.Ordinal);
+		int scaleIndex = decoder.IndexOf("_scaleFilter->ApplyFilter", hudIndex, StringComparison.Ordinal);
 
 		Assert.True(methodStart >= 0 && lockIndex > methodStart);
-		Assert.True(filterIndex > lockIndex && hudIndex > filterIndex && copyIndex > hudIndex);
-		Assert.Contains("SendFrameWithHud", decoder);
-		Assert.DoesNotContain("GetDebugHud()->Draw", decoder);
+		Assert.True(filterIndex > lockIndex && copyIndex > filterIndex);
+		Assert.True(captureIndex >= 0 && captureCopyIndex > captureIndex);
+		Assert.True(sendIndex >= 0 && rotateIndex > sendIndex && hudIndex > rotateIndex && scaleIndex > hudIndex);
+		Assert.DoesNotContain("DebugHud", filter);
+		Assert.DoesNotContain("DebugHud", filterHeader);
+		Assert.DoesNotContain("SendFrameWithHud", filterHeader);
 		Assert.DoesNotContain("videoFilter->GetOutputBuffer()", decoder);
+		Assert.Contains("vector<uint32_t> _displayBuffer", decoderHeader);
 	}
 
 	[Fact]
