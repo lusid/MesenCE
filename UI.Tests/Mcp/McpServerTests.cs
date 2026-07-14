@@ -374,6 +374,7 @@ public sealed class McpServerTests
 
 		Assert.False(status.IsError);
 		Assert.True(status.StructuredContent!.Value.GetProperty("gameLoaded").GetBoolean());
+		Assert.Equal("2.0", status.StructuredContent.Value.GetProperty("mcpVersion").GetString());
 		Assert.False(spaces.IsError);
 		Assert.Equal(nameof(MemoryType.NesWorkRam), spaces.StructuredContent!.Value[0].GetProperty("id").GetString());
 		Assert.False(read.IsError);

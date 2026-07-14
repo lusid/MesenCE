@@ -16,7 +16,7 @@ namespace Mesen.Mcp;
 internal sealed class McpEmulatorService : IDisposable
 {
 	public const int MaxTransferSize = 65536;
-	private const string McpVersion = "1.0";
+	private const string McpVersion = "2.0";
 	private static readonly string MesenVersion = typeof(McpEmulatorService).Assembly.GetName().Version?.ToString(3) ?? "unknown";
 
 	private readonly IMcpEmulatorApi _api;
