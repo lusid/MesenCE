@@ -644,6 +644,59 @@ public sealed class McpExperimentServiceTests
 	}
 
 	[Fact]
+	public async Task RunAsync_RuntimeTimeoutCleanupWaitsForCorrelatedPauseAndPreservesTimeout()
+	{
+		using ExperimentFixture fixture = new(cleanupSafetyTimeout: TimeSpan.FromSeconds(1));
+		using ManualResetEventSlim pauseRequested = new();
+		int stopped = 1;
+		fixture.Api.IsExecutionStoppedHandler = () => Volatile.Read(ref stopped) != 0;
+		fixture.Api.StepHandler = (_, _, _) => Volatile.Write(ref stopped, 0);
+		fixture.Api.PauseHandler = pauseRequested.Set;
+		RunExperimentRequest request = BasicRequest() with {
+			Segments = [new(1, [new(0, ["A"])], null)],
+			TimeoutMs = 50
+		};
+
+		Task<McpServiceResult<McpExperimentCapture>> run = fixture.Experiments.RunAsync(request, CancellationToken.None);
+		Assert.True(pauseRequested.Wait(TimeSpan.FromSeconds(1)));
+		Assert.False(run.IsCompleted);
+		Volatile.Write(ref stopped, 1);
+		fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GamePaused });
+
+		RunExperimentResult result = AssertSuccess(await run);
+		Assert.Equal(McpExperimentStatus.Failed, result.Status);
+		Assert.Equal(McpExperimentReason.Timeout, result.Reason);
+		Assert.True(result.Cleanup.StopConfirmed);
+		Assert.True(result.Cleanup.InputReleased);
+		Assert.True(result.Cleanup.LeaseReleased);
+		Assert.False(result.Cleanup.Quarantined);
+		Assert.Equal(1, fixture.Api.PauseCalls);
+	}
+
+	[Fact]
+	public async Task RunAsync_CleanupSafetyExpiryReleasesInputAndQuarantinesQuickly()
+	{
+		using ExperimentFixture fixture = new(cleanupSafetyTimeout: TimeSpan.FromMilliseconds(10));
+		int stopped = 1;
+		fixture.Api.IsExecutionStoppedHandler = () => Volatile.Read(ref stopped) != 0;
+		fixture.Api.StepHandler = (_, _, _) => Volatile.Write(ref stopped, 0);
+		RunExperimentRequest request = BasicRequest() with {
+			Segments = [new(1, [new(0, ["A"])], null)],
+			TimeoutMs = 50
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(request, CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.CleanupFailed, result.Reason);
+		Assert.False(result.Cleanup.StopConfirmed);
+		Assert.True(result.Cleanup.InputReleased);
+		Assert.True(result.Cleanup.LeaseReleased);
+		Assert.True(result.Cleanup.Quarantined);
+		Assert.Equal(1, fixture.Api.PauseCalls);
+		Assert.Equal(1, fixture.Api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
 	public async Task RunAsync_DeadlineExpiredBeforeRestoreDoesNotLoadState()
 	{
 		ManualClock clock = new();
@@ -743,7 +796,7 @@ public sealed class McpExperimentServiceTests
 	[Fact]
 	public async Task RunAsync_UnconfirmedCleanupReleasesInputThenQuarantines()
 	{
-		using ExperimentFixture fixture = new();
+		using ExperimentFixture fixture = new(cleanupSafetyTimeout: TimeSpan.FromMilliseconds(10));
 		fixture.Api.IsExecutionStoppedHandler = () => fixture.Api.StepCalls == 0;
 		RunExperimentRequest request = BasicRequest() with {
 			Segments = [new(1, [new(0, ["A"])], null)],
@@ -836,7 +889,8 @@ public sealed class McpExperimentServiceTests
 			Action? afterScreenshotAssigned = null,
 			Action<FakeMcpEmulatorApi>? debuggerInitialize = null,
 			bool paused = false,
-			Action? afterPreparation = null)
+			Action? afterPreparation = null,
+			TimeSpan? cleanupSafetyTimeout = null)
 		{
 			Api = FakeMcpEmulatorApi.RunningNes(paused);
 			Api.MemorySizes[MemoryType.NesMemory] = 0x100;
@@ -856,7 +910,7 @@ public sealed class McpExperimentServiceTests
 			Automation = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates);
 			Experiments = new(
 				Emulator, new McpAutomationAdapterRegistry(Api), SaveStates, Automation,
-				clock, afterScreenshotAssigned, afterPreparation);
+				clock, afterScreenshotAssigned, afterPreparation, cleanupSafetyTimeout);
 		}
 
 		internal FakeMcpEmulatorApi Api { get; }

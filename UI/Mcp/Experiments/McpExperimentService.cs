@@ -10,6 +10,7 @@ namespace Mesen.Mcp;
 
 internal sealed class McpExperimentService
 {
+	private static readonly TimeSpan MaximumCleanupSafetyTimeout = TimeSpan.FromSeconds(5);
 	private readonly McpEmulatorService _emulator;
 	private readonly McpAutomationAdapterRegistry _adapters;
 	private readonly McpSaveStateStore _saveStates;
@@ -17,6 +18,7 @@ internal sealed class McpExperimentService
 	private readonly IMcpMonotonicClock _clock;
 	private readonly Action _afterScreenshotAssigned;
 	private readonly Action _afterPreparation;
+	private readonly TimeSpan _cleanupSafetyTimeout;
 
 	internal McpExperimentService(
 		McpEmulatorService emulator,
@@ -25,8 +27,13 @@ internal sealed class McpExperimentService
 		McpAutomationService automation,
 		IMcpMonotonicClock? clock = null,
 		Action? afterScreenshotAssigned = null,
-		Action? afterPreparation = null)
+		Action? afterPreparation = null,
+		TimeSpan? cleanupSafetyTimeout = null)
 	{
+		TimeSpan configuredCleanupTimeout = cleanupSafetyTimeout ?? MaximumCleanupSafetyTimeout;
+		if(configuredCleanupTimeout <= TimeSpan.Zero || configuredCleanupTimeout > MaximumCleanupSafetyTimeout) {
+			throw new ArgumentOutOfRangeException(nameof(cleanupSafetyTimeout));
+		}
 		_emulator = emulator;
 		_adapters = adapters;
 		_saveStates = saveStates;
@@ -34,6 +41,7 @@ internal sealed class McpExperimentService
 		_clock = clock ?? McpMonotonicClock.Instance;
 		_afterScreenshotAssigned = afterScreenshotAssigned ?? (() => { });
 		_afterPreparation = afterPreparation ?? (() => { });
+		_cleanupSafetyTimeout = configuredCleanupTimeout;
 	}
 
 	internal async Task<McpServiceResult<McpExperimentCapture>> RunAsync(
@@ -278,26 +286,24 @@ internal sealed class McpExperimentService
 		}
 
 	Cleanup:
+		long cleanupStarted = _clock.GetTimestamp();
+		TimeSpan runtimeRemaining = Remaining(started, prepared.Experiment.TimeoutMs);
 		McpServiceResult<bool> cleanupIdentity = VerifyExpectedIdentity(
 			lease.LeaseId, expectedIdentity, stateContext);
 		if(!cleanupIdentity.IsSuccess && !HasEstablishedSpecificReason()) {
 			SetFailure(cleanupIdentity.Error!.Code);
 		}
-		TimeSpan cleanupBudget = Remaining(started, prepared.Experiment.TimeoutMs);
-		if(cleanupBudget <= TimeSpan.Zero && !HasEstablishedSpecificReason()
+		if(runtimeRemaining <= TimeSpan.Zero && !HasEstablishedSpecificReason()
 			&& reason != McpExperimentReason.StateChanged) {
 			SetFailure("timeout");
 		}
+		TimeSpan cleanupBudget = RemainingCleanup(cleanupStarted);
 		try {
 			McpStopResult cleanupStop = await _emulator.EnsureStoppedAsync(
 				lease.LeaseId, cleanupBudget, quarantineOnFailure: false).ConfigureAwait(false);
 			stopConfirmed = cleanupStop.StopConfirmed;
 		} catch(Exception) {
 			stopConfirmed = false;
-		}
-		if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero
-			&& !HasEstablishedSpecificReason() && reason != McpExperimentReason.StateChanged) {
-			SetFailure("timeout");
 		}
 
 		try {
@@ -314,10 +320,6 @@ internal sealed class McpExperimentService
 			}
 		} catch(Exception) {
 			inputReleased = false;
-		}
-		if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero
-			&& !HasEstablishedSpecificReason() && reason != McpExperimentReason.StateChanged) {
-			SetFailure("timeout");
 		}
 		if(!stopConfirmed || !inputReleased) {
 			_emulator.ExecutionCoordinator.EnterQuarantineForOwner(lease.LeaseId);
@@ -683,6 +685,12 @@ internal sealed class McpExperimentService
 	{
 		TimeSpan remaining = TimeSpan.FromMilliseconds(timeoutMs)
 			- _clock.GetElapsedTime(started, _clock.GetTimestamp());
+		return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+	}
+
+	private TimeSpan RemainingCleanup(long started)
+	{
+		TimeSpan remaining = _cleanupSafetyTimeout - _clock.GetElapsedTime(started, _clock.GetTimestamp());
 		return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
 	}
 
