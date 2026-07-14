@@ -174,11 +174,10 @@ public sealed class McpExperimentServiceTests
 	}
 
 	[Theory]
-	[InlineData(ConsoleNotificationType.GameReset, McpExperimentReason.Reset)]
-	[InlineData(ConsoleNotificationType.BeforeGameLoad, McpExperimentReason.RomTransition)]
+	[InlineData(ConsoleNotificationType.GameReset)]
+	[InlineData(ConsoleNotificationType.BeforeGameLoad)]
 	public async Task RunAsync_LifecycleChangeReturnsInterruptedPartialResult(
-		ConsoleNotificationType notification,
-		string expectedReason)
+		ConsoleNotificationType notification)
 	{
 		using ExperimentFixture fixture = new();
 		fixture.Api.StepHandler = (_, _, _) => {
@@ -191,8 +190,75 @@ public sealed class McpExperimentServiceTests
 		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(BasicRequest(), CancellationToken.None));
 
 		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
-		Assert.Equal(expectedReason, result.Reason);
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
 		Assert.Equal(0, result.CompletedFrames);
+	}
+
+	[Theory]
+	[InlineData(ConsoleNotificationType.GameReset)]
+	[InlineData(ConsoleNotificationType.BeforeGameLoad)]
+	public async Task RunAsync_LifecycleChangeBetweenInputAndStepDoesNotUsePreparedNativeIndices(
+		ConsoleNotificationType notification)
+	{
+		using ExperimentFixture fixture = new();
+		fixture.Api.SetExclusiveControllerOverrideHandler = _ => {
+			fixture.Emulator.ProcessNotification(new() { NotificationType = notification });
+			if(notification == ConsoleNotificationType.BeforeGameLoad) {
+				fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameLoaded });
+			}
+			return true;
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { Segments = [new(1, [new(0, ["A"])], null)] }, CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
+		Assert.Equal(0, fixture.Api.StepCalls);
+		Assert.Empty(result.CompletedSegments);
+	}
+
+	[Fact]
+	public async Task RunAsync_StateChangeAfterCorrelatedStepPreservesFramesAndSkipsCheckpoint()
+	{
+		using ExperimentFixture fixture = new();
+		fixture.Api.StepHandler = (_, _, _) => {
+			SendBreak(fixture.Emulator, new BreakEvent { Source = BreakSource.PpuStep, SourceCpu = CpuType.Nes });
+			fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameReset });
+		};
+		RunExperimentRequest request = BasicRequest() with { Segments = [new(3, [], "after")] };
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(request, CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
+		Assert.Equal(3, result.CompletedFrames);
+		Assert.Equal([0], result.CompletedSegments);
+		Assert.Equal(["initial"], result.Checkpoints.Select(item => item.Name));
+	}
+
+	[Fact]
+	public async Task RunAsync_StateChangeBeforeScreenshotSkipsStaleCapture()
+	{
+		using ExperimentFixture fixture = new();
+		fixture.CompleteEveryStep();
+		int stoppedCalls = 0;
+		fixture.Api.IsExecutionStoppedHandler = () => {
+			if(++stoppedCalls == 4) {
+				fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameReset });
+			}
+			return true;
+		};
+		fixture.Api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
+			new(new(1, 1, 1, 1, 0, 0), [1]));
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { CaptureFinalScreenshot = true }, CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
+		Assert.Null(result.Screenshot);
+		Assert.Equal(0, fixture.Api.CaptureScreenshotCalls);
 	}
 
 	[Fact]
@@ -227,6 +293,103 @@ public sealed class McpExperimentServiceTests
 	}
 
 	[Fact]
+	public async Task RunAsync_DeadlineExpiredBeforeRestoreDoesNotLoadState()
+	{
+		ManualClock clock = new();
+		using ExperimentFixture fixture = new(clock);
+		fixture.Api.CreateSaveStateHandler = () => McpServiceResult<byte[]>.Success([1]);
+		McpSaveStateMetadata state = AssertSuccess(fixture.Automation.CreateSaveState());
+		IReadOnlyList<McpControllerTopology> topology = fixture.Api.ControllerTopology;
+		fixture.Api.GetControllerTopologyHandler = () => {
+			clock.Advance(TimeSpan.FromMilliseconds(1001));
+			return topology;
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { SaveStateId = state.Id }, CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.Timeout, result.Reason);
+		Assert.Equal(0, fixture.Api.LoadSaveStateCalls);
+		Assert.Empty(result.Checkpoints);
+	}
+
+	[Fact]
+	public async Task RunAsync_ObservationOverrunKeepsCheckpointButSkipsExecution()
+	{
+		ManualClock clock = new();
+		using ExperimentFixture fixture = new(clock);
+		fixture.Api.GetMemoryValuesHandler = (_, _, _) => {
+			clock.Advance(TimeSpan.FromMilliseconds(1001));
+			return [1];
+		};
+		RunExperimentRequest request = BasicRequest() with {
+			Observations = [new("value", "initial", nameof(MemoryType.NesMemory), 0, 1, null)]
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(request, CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.Timeout, result.Reason);
+		Assert.Equal(["initial"], result.Checkpoints.Select(item => item.Name));
+		Assert.Equal(0, fixture.Api.StepCalls);
+	}
+
+	[Fact]
+	public async Task RunAsync_ExpirationAfterFinalCheckpointSkipsScreenshotAndCompletion()
+	{
+		ManualClock clock = new();
+		using ExperimentFixture fixture = new(clock);
+		fixture.CompleteEveryStep();
+		fixture.Api.GetMemoryValuesHandler = (_, _, _) => {
+			clock.Advance(TimeSpan.FromMilliseconds(1001));
+			return [1];
+		};
+		fixture.Api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
+			new(new(1, 1, 1, 1, 0, 0), [1]));
+		RunExperimentRequest request = BasicRequest() with {
+			Observations = [new("value", "final", nameof(MemoryType.NesMemory), 0, 1, null)],
+			CaptureFinalScreenshot = true
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(request, CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.Timeout, result.Reason);
+		Assert.Equal(["initial", "final"], result.Checkpoints.Select(item => item.Name));
+		Assert.Null(result.Screenshot);
+		Assert.Equal(0, fixture.Api.CaptureScreenshotCalls);
+	}
+
+	[Fact]
+	public async Task RunAsync_StaleBreakpointIdentityReturnsStateChangedWithoutContext()
+	{
+		using ExperimentFixture fixture = new();
+		fixture.Api.StepHandler = (_, _, _) => {
+			SendBreak(fixture.Emulator, new BreakEvent { Source = BreakSource.Breakpoint, SourceCpu = CpuType.Nes });
+			fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameReset });
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(BasicRequest(), CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
+		Assert.Null(result.Interruption?.BreakContext);
+	}
+
+	[Fact]
+	public async Task RunAsync_BreakContextBuildFailureReturnsStateChangedWithoutContext()
+	{
+		using ExperimentFixture fixture = new();
+		fixture.Api.StepHandler = (_, _, _) => SendBreak(fixture.Emulator, new BreakEvent {
+			Source = BreakSource.Breakpoint,
+			SourceCpu = CpuType.Spc
+		});
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(BasicRequest(), CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
+		Assert.Null(result.Interruption?.BreakContext);
+	}
+
+	[Fact]
 	public async Task RunAsync_UnconfirmedCleanupReleasesInputThenQuarantines()
 	{
 		using ExperimentFixture fixture = new();
@@ -245,6 +408,45 @@ public sealed class McpExperimentServiceTests
 		Assert.True(result.Cleanup.Quarantined);
 		Assert.Equal("clear-input", fixture.Api.NativeCallLog[^1]);
 		Assert.Equal("execution_state_unknown", (await fixture.Coordinator.TryAcquireAsync(CancellationToken.None)).Error?.Code);
+	}
+
+	[Fact]
+	public async Task RunAsync_InputReleaseFailureQuarantinesAndStillReleasesLease()
+	{
+		using ExperimentFixture fixture = new();
+		fixture.CompleteEveryStep();
+		fixture.Api.ClearExclusiveControllerOverridesHandler = () => throw new InvalidOperationException("native details");
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(BasicRequest(), CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.CleanupFailed, result.Reason);
+		Assert.True(result.Cleanup.StopConfirmed);
+		Assert.False(result.Cleanup.InputReleased);
+		Assert.True(result.Cleanup.LeaseReleased);
+		Assert.True(result.Cleanup.Quarantined);
+		Assert.Equal("execution_state_unknown", (await fixture.Coordinator.TryAcquireAsync(CancellationToken.None)).Error?.Code);
+	}
+
+	[Fact]
+	public async Task RunAsync_StopObservationExceptionReportsCleanupAndReleasesLease()
+	{
+		using ExperimentFixture fixture = new();
+		fixture.CompleteEveryStep();
+		int calls = 0;
+		fixture.Api.IsExecutionStoppedHandler = () => {
+			if(++calls >= 4) {
+				throw new InvalidOperationException("native details");
+			}
+			return true;
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(BasicRequest(), CancellationToken.None));
+
+		Assert.Equal(McpExperimentReason.CleanupFailed, result.Reason);
+		Assert.False(result.Cleanup.StopConfirmed);
+		Assert.True(result.Cleanup.InputReleased);
+		Assert.True(result.Cleanup.LeaseReleased);
+		Assert.True(result.Cleanup.Quarantined);
 	}
 
 	private static RunExperimentRequest BasicRequest() => new(
@@ -269,7 +471,7 @@ public sealed class McpExperimentServiceTests
 
 	private sealed class ExperimentFixture : IDisposable
 	{
-		internal ExperimentFixture()
+		internal ExperimentFixture(IMcpMonotonicClock? clock = null)
 		{
 			Api = FakeMcpEmulatorApi.RunningNes();
 			Api.MemorySizes[MemoryType.NesMemory] = 0x100;
@@ -286,7 +488,7 @@ public sealed class McpExperimentServiceTests
 				executionCoordinator: Coordinator);
 			SaveStates = new();
 			Automation = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates);
-			Experiments = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates);
+			Experiments = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates, clock);
 		}
 
 		internal FakeMcpEmulatorApi Api { get; }
@@ -311,5 +513,14 @@ public sealed class McpExperimentServiceTests
 		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints) { }
 		public bool TryGetStableId(int nativeBreakpointId, out long stableId) { stableId = 0; return false; }
 		public void Dispose() { }
+	}
+
+	private sealed class ManualClock : IMcpMonotonicClock
+	{
+		private long _milliseconds;
+
+		public long GetTimestamp() => Interlocked.Read(ref _milliseconds);
+		public TimeSpan GetElapsedTime(long start, long end) => TimeSpan.FromMilliseconds(end - start);
+		internal void Advance(TimeSpan elapsed) => Interlocked.Add(ref _milliseconds, (long)elapsed.TotalMilliseconds);
 	}
 }

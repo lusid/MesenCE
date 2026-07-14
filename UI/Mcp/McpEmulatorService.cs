@@ -577,7 +577,8 @@ internal sealed class McpEmulatorService : IDisposable
 	internal async Task<McpStopResult> EnsureStoppedAsync(
 		long leaseId,
 		TimeSpan remainingBudget,
-		bool quarantineOnFailure = true)
+		bool quarantineOnFailure = true,
+		McpStateIdentity? expectedIdentity = null)
 	{
 		McpExecutionWaiter.Registration? waiter = null;
 		bool alreadyStopped = false;
@@ -586,9 +587,15 @@ internal sealed class McpEmulatorService : IDisposable
 				return ServiceStopping<bool>();
 			}
 			ReconcilePendingResources();
+			if(expectedIdentity.HasValue && _emulatorIdentity.Current != expectedIdentity.Value) {
+				return McpServiceResult<bool>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
 			if(_api.IsExecutionStopped()) {
 				alreadyStopped = true;
 				return McpServiceResult<bool>.Success(true);
+			}
+			if(expectedIdentity.HasValue && _emulatorIdentity.Current != expectedIdentity.Value) {
+				return McpServiceResult<bool>.Failure("state_changed", "Emulator state changed during the operation.");
 			}
 			waiter = _executionWaiter.TryRegisterStop(leaseId, _emulatorIdentity.Current);
 			if(waiter is null) {
@@ -1503,16 +1510,26 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 	}
 
-	internal McpServiceResult<BreakContext> GetOwnedBreakContext(long leaseId, BreakEvent breakEvent)
+	internal McpServiceResult<BreakContext> GetOwnedBreakContext(
+		long leaseId,
+		BreakEvent breakEvent,
+		McpStateIdentity eventStateIdentity,
+		McpStateIdentity expectedStateIdentity)
 	{
-		return ExecuteOwned(leaseId, (api, _) => {
-			if(!api.IsExecutionStopped()) {
-				return McpServiceResult<BreakContext>.Failure("stale_context", "No current stopped break context is available.");
+		return ExecuteOwned(leaseId, (api, currentIdentity) => {
+			if(eventStateIdentity != expectedStateIdentity
+				|| currentIdentity != expectedStateIdentity
+				|| !api.IsExecutionStopped()) {
+				return McpServiceResult<BreakContext>.Failure("state_changed", "Emulator state changed before break context could be captured.");
 			}
 			long? stableBreakpointId = _breakpointCollection.TryGetStableId(breakEvent.BreakpointId, out long stableId)
 				? stableId
 				: null;
-			return BuildBreakContext(breakEvent, stableBreakpointId, _gate.Generation, 8, 8, McpDebuggerLimits.MaxCallStackDepth);
+			McpServiceResult<BreakContext> context = BuildBreakContext(
+				breakEvent, stableBreakpointId, _gate.Generation, 8, 8, McpDebuggerLimits.MaxCallStackDepth);
+			return context.IsSuccess && _emulatorIdentity.Current == expectedStateIdentity
+				? context
+				: McpServiceResult<BreakContext>.Failure("state_changed", "Emulator state changed before break context could be captured.");
 		});
 	}
 

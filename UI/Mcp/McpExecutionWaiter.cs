@@ -23,7 +23,8 @@ internal readonly record struct McpStopResult(
 	McpStopReason Reason,
 	int? CompletedFrames,
 	BreakEvent? BreakEvent,
-	bool StopConfirmed);
+	bool StopConfirmed,
+	McpStateIdentity? EventStateIdentity = null);
 
 internal sealed class McpExecutionWaiter
 {
@@ -64,7 +65,7 @@ internal sealed class McpExecutionWaiter
 				McpStopReason reason = copied.Source == BreakSource.Pause
 					? McpStopReason.Pause
 					: McpStopReason.Breakpoint;
-				result = new(reason, null, copied, true);
+				result = new(reason, null, copied, true, stateIdentity);
 			}
 		}
 		active.Completion.TrySetResult(result);

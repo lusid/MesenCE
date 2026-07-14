@@ -62,6 +62,7 @@ internal sealed class McpExperimentService
 		bool leaseReleased = false;
 		bool quarantined = false;
 		bool halted = false;
+		McpStateIdentity expectedIdentity = prepared.PreflightIdentity;
 
 		try {
 			if(prepared.Experiment.SaveStateId is not null) {
@@ -72,9 +73,17 @@ internal sealed class McpExperimentService
 					return FailureFrom<RunExperimentResult, McpPinnedResource<McpSaveStateResource>>(pinResult);
 				}
 				statePin = pinResult.Value!;
-				McpServiceResult<bool> load = LoadOwnedState(lease.LeaseId, statePin.Value, cancellationToken);
+				if(CheckDeadline()) {
+					goto Cleanup;
+				}
+				McpServiceResult<McpStateIdentity> load = LoadOwnedState(
+					lease.LeaseId, statePin.Value, expectedIdentity, cancellationToken);
 				if(!load.IsSuccess) {
 					SetFailure(load.Error!.Code);
+					goto Cleanup;
+				}
+				expectedIdentity = load.Value!;
+				if(CheckDeadline()) {
 					goto Cleanup;
 				}
 			}
@@ -83,33 +92,47 @@ internal sealed class McpExperimentService
 				SetFailure("cancelled");
 				goto Cleanup;
 			}
-			if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero) {
-				SetFailure("timeout");
+			if(CheckDeadline()) {
 				goto Cleanup;
 			}
 
-			McpServiceResult<bool> enabled = ApplyInput(lease.LeaseId, prepared.InitialStates);
+			McpServiceResult<bool> enabled = ApplyInput(lease.LeaseId, expectedIdentity, prepared.InitialStates);
 			if(!enabled.IsSuccess) {
 				SetFailure(enabled.Error!.Code);
+				goto Cleanup;
+			}
+			if(CheckDeadline()) {
 				goto Cleanup;
 			}
 
 			McpStopResult initialStop = await _emulator.EnsureStoppedAsync(
 				lease.LeaseId,
 				Remaining(started, prepared.Experiment.TimeoutMs),
-				quarantineOnFailure: false).ConfigureAwait(false);
+				quarantineOnFailure: false,
+				expectedIdentity: expectedIdentity).ConfigureAwait(false);
 			if(!initialStop.StopConfirmed) {
 				SetStopFailure(initialStop);
 				goto Cleanup;
 			}
+			McpServiceResult<bool> initialIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
+			if(!initialIdentity.IsSuccess) {
+				SetFailure(initialIdentity.Error!.Code);
+				goto Cleanup;
+			}
+			if(CheckDeadline()) {
+				goto Cleanup;
+			}
 
 			McpServiceResult<CheckpointCapture> initial = CaptureCheckpoint(
-				lease.LeaseId, prepared, 0, completedFrames, observationSlots, assertionResults);
+				lease.LeaseId, expectedIdentity, prepared, 0, completedFrames, observationSlots, assertionResults);
 			if(!initial.IsSuccess) {
 				SetFailure(initial.Error!.Code);
 				goto Cleanup;
 			}
 			AddCheckpoint(initial.Value!.Result);
+			if(CheckDeadline()) {
+				goto Cleanup;
+			}
 			if(ApplyAssertionOutcome(initial.Value)) {
 				goto Cleanup;
 			}
@@ -124,9 +147,13 @@ internal sealed class McpExperimentService
 					SetFailure("timeout");
 					break;
 				}
-				McpServiceResult<bool> input = ApplyInput(lease.LeaseId, prepared.SegmentStates[segment.Index]);
+				McpServiceResult<bool> input = ApplyInput(
+					lease.LeaseId, expectedIdentity, prepared.SegmentStates[segment.Index]);
 				if(!input.IsSuccess) {
 					SetFailure(input.Error!.Code);
+					break;
+				}
+				if(CheckDeadline()) {
 					break;
 				}
 				remaining = Remaining(started, prepared.Experiment.TimeoutMs);
@@ -139,7 +166,7 @@ internal sealed class McpExperimentService
 					lease.LeaseId,
 					prepared.CpuType,
 					segment.Frames,
-					_emulator.EmulatorIdentity.Current,
+					expectedIdentity,
 					remaining,
 					cancellationToken).ConfigureAwait(false);
 				if(step.Reason != McpStopReason.StepCompleted || step.CompletedFrames != segment.Frames) {
@@ -149,14 +176,26 @@ internal sealed class McpExperimentService
 
 				completedFrames += segment.Frames;
 				completedSegments.Add(segment.Index);
+				McpServiceResult<bool> postStepIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
+				if(!postStepIdentity.IsSuccess) {
+					SetFailure(postStepIdentity.Error!.Code);
+					break;
+				}
+				if(CheckDeadline()) {
+					break;
+				}
 				if(segment.CheckpointIndex.HasValue) {
 					McpServiceResult<CheckpointCapture> checkpoint = CaptureCheckpoint(
-						lease.LeaseId, prepared, segment.CheckpointIndex.Value, completedFrames, observationSlots, assertionResults);
+						lease.LeaseId, expectedIdentity, prepared, segment.CheckpointIndex.Value,
+						completedFrames, observationSlots, assertionResults);
 					if(!checkpoint.IsSuccess) {
 						SetFailure(checkpoint.Error!.Code);
 						break;
 					}
 					AddCheckpoint(checkpoint.Value!.Result);
+					if(CheckDeadline()) {
+						break;
+					}
 					if(ApplyAssertionOutcome(checkpoint.Value)) {
 						break;
 					}
@@ -174,22 +213,31 @@ internal sealed class McpExperimentService
 				}
 				int finalIndex = prepared.Experiment.Checkpoints.Count - 1;
 				McpServiceResult<CheckpointCapture> final = CaptureCheckpoint(
-					lease.LeaseId, prepared, finalIndex, completedFrames, observationSlots, assertionResults);
+					lease.LeaseId, expectedIdentity, prepared, finalIndex, completedFrames, observationSlots, assertionResults);
 				if(!final.IsSuccess) {
 					SetFailure(final.Error!.Code);
 					goto Cleanup;
 				}
 				AddCheckpoint(final.Value!.Result);
+				if(CheckDeadline()) {
+					goto Cleanup;
+				}
 				if(ApplyAssertionOutcome(final.Value)) {
 					goto Cleanup;
 				}
 				if(prepared.Experiment.CaptureFinalScreenshot) {
-					McpServiceResult<McpScreenshotMetadata> capture = CaptureScreenshot(lease.LeaseId);
+					if(CheckDeadline()) {
+						goto Cleanup;
+					}
+					McpServiceResult<McpScreenshotMetadata> capture = CaptureScreenshot(lease.LeaseId, expectedIdentity);
 					if(!capture.IsSuccess) {
 						SetFailure(capture.Error!.Code);
 						goto Cleanup;
 					}
 					screenshot = capture.Value;
+					if(CheckDeadline()) {
+						goto Cleanup;
+					}
 				}
 			}
 		} catch(Exception) {
@@ -197,17 +245,45 @@ internal sealed class McpExperimentService
 		}
 
 	Cleanup:
-		McpStopResult cleanupStop = await _emulator.EnsureStoppedAsync(
-			lease.LeaseId,
-			Remaining(started, prepared.Experiment.TimeoutMs),
-			quarantineOnFailure: false).ConfigureAwait(false);
-		stopConfirmed = cleanupStop.StopConfirmed;
+		McpServiceResult<bool> cleanupIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
+		if(!cleanupIdentity.IsSuccess) {
+			SetFailure(cleanupIdentity.Error!.Code);
+		}
+		TimeSpan cleanupBudget = Remaining(started, prepared.Experiment.TimeoutMs);
+		if(cleanupBudget <= TimeSpan.Zero && reason != McpExperimentReason.StateChanged) {
+			SetFailure("timeout");
+		}
+		try {
+			McpStopResult cleanupStop = await _emulator.EnsureStoppedAsync(
+				lease.LeaseId, cleanupBudget, quarantineOnFailure: false).ConfigureAwait(false);
+			stopConfirmed = cleanupStop.StopConfirmed;
+		} catch(Exception) {
+			stopConfirmed = false;
+		}
+		if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero
+			&& reason != McpExperimentReason.StateChanged) {
+			SetFailure("timeout");
+		}
 
-		McpServiceResult<bool> release = _emulator.ExecuteOwned(lease.LeaseId, (api, _) => {
-			api.ClearExclusiveControllerOverrides();
-			return McpServiceResult<bool>.Success(true);
-		});
-		inputReleased = release.IsSuccess;
+		try {
+			bool cleanupIdentityMatched = true;
+			McpServiceResult<bool> release = _emulator.ExecuteOwned(lease.LeaseId, (api, identity) => {
+				cleanupIdentityMatched = identity == expectedIdentity;
+				api.ClearExclusiveControllerOverrides();
+				cleanupIdentityMatched &= _emulator.EmulatorIdentity.Current == expectedIdentity;
+				return McpServiceResult<bool>.Success(true);
+			});
+			inputReleased = release.IsSuccess;
+			if(release.IsSuccess && !cleanupIdentityMatched) {
+				SetFailure("state_changed");
+			}
+		} catch(Exception) {
+			inputReleased = false;
+		}
+		if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero
+			&& reason != McpExperimentReason.StateChanged) {
+			SetFailure("timeout");
+		}
 		if(!stopConfirmed || !inputReleased) {
 			_emulator.ExecutionCoordinator.EnterQuarantineForOwner(lease.LeaseId);
 			quarantined = true;
@@ -215,9 +291,24 @@ internal sealed class McpExperimentService
 			reason = McpExperimentReason.CleanupFailed;
 			interruption = new(McpExperimentReason.CleanupFailed, interruption?.BreakContext);
 		}
-		statePin?.Dispose();
-		await lease.DisposeAsync().ConfigureAwait(false);
-		leaseReleased = true;
+		try {
+			statePin?.Dispose();
+		} catch(Exception) {
+			status = McpExperimentStatus.Failed;
+			reason = McpExperimentReason.CleanupFailed;
+			interruption = new(McpExperimentReason.CleanupFailed, interruption?.BreakContext);
+		}
+		try {
+			await lease.DisposeAsync().ConfigureAwait(false);
+			leaseReleased = true;
+		} catch(Exception) {
+			leaseReleased = false;
+			_emulator.ExecutionCoordinator.EnterQuarantineForOwner(lease.LeaseId);
+			quarantined = true;
+			status = McpExperimentStatus.Failed;
+			reason = McpExperimentReason.CleanupFailed;
+			interruption = new(McpExperimentReason.CleanupFailed, interruption?.BreakContext);
+		}
 
 		McpAssertionSummary summary = new(
 			prepared.Experiment.Assertions.Count,
@@ -268,6 +359,11 @@ internal sealed class McpExperimentService
 		void SetStopFailure(McpStopResult stop)
 		{
 			halted = true;
+			McpServiceResult<bool> stopIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
+			if(!stopIdentity.IsSuccess) {
+				SetFailure(stopIdentity.Error!.Code);
+				return;
+			}
 			string mapped = MapStopReason(stop.Reason);
 			status = stop.Reason is McpStopReason.Breakpoint or McpStopReason.Reset
 				or McpStopReason.RomTransition or McpStopReason.StateChanged
@@ -275,10 +371,25 @@ internal sealed class McpExperimentService
 				: McpExperimentStatus.Failed;
 			reason = mapped;
 			BreakContext? context = null;
-			if(stop.Reason == McpStopReason.Breakpoint && stop.BreakEvent.HasValue) {
-				context = _emulator.GetOwnedBreakContext(lease.LeaseId, stop.BreakEvent.Value).Value;
+			if(stop.Reason == McpStopReason.Breakpoint && stop.BreakEvent.HasValue && stop.EventStateIdentity.HasValue) {
+				McpServiceResult<BreakContext> captured = _emulator.GetOwnedBreakContext(
+					lease.LeaseId, stop.BreakEvent.Value, stop.EventStateIdentity.Value, expectedIdentity);
+				if(!captured.IsSuccess) {
+					SetFailure("state_changed");
+					return;
+				}
+				context = captured.Value;
 			}
 			interruption = new(mapped, context);
+		}
+
+		bool CheckDeadline()
+		{
+			if(Remaining(started, prepared.Experiment.TimeoutMs) > TimeSpan.Zero) {
+				return false;
+			}
+			SetFailure("timeout");
+			return true;
 		}
 	}
 
@@ -348,61 +459,81 @@ internal sealed class McpExperimentService
 			return McpServiceResult<PreparedExperiment>.Success(new(
 				experiment,
 				cpu.Value!,
+				identity,
 				controlledPorts,
 				neutral.Value!.Where(state => controlledPorts.Contains(state.Port)).ToArray(),
 				segmentStates));
 		});
 	}
 
-	private McpServiceResult<bool> LoadOwnedState(
+	private McpServiceResult<McpStateIdentity> LoadOwnedState(
 		long leaseId,
 		McpSaveStateResource state,
+		McpStateIdentity expectedIdentity,
 		CancellationToken cancellationToken)
 	{
 		return _emulator.ExecuteOwnedStateLoad(leaseId, (api, identity) => {
-			if(state.Identity.RomIdentity != identity.RomIdentity) {
-				return McpServiceResult<bool>.Failure("stale_resource", "The save state is no longer compatible with the active ROM.");
+			if(identity != expectedIdentity || state.Identity.RomIdentity != identity.RomIdentity) {
+				return McpServiceResult<McpStateIdentity>.Failure("state_changed", "Emulator state changed before save-state restore.");
 			}
 			if(cancellationToken.IsCancellationRequested) {
-				return McpServiceResult<bool>.Failure("cancelled", "The operation was cancelled.");
+				return McpServiceResult<McpStateIdentity>.Failure("cancelled", "The operation was cancelled.");
 			}
 			long generation = identity.MutableStateGeneration;
 			McpServiceResult<bool> load = api.LoadSaveState(state.Data);
 			if(!load.IsSuccess) {
-				return load;
+				return FailureFrom<McpStateIdentity, bool>(load);
 			}
 			McpStateIdentity current = _emulator.EmulatorIdentity.Current;
 			return current.RomIdentity == identity.RomIdentity
 				&& current.MutableStateGeneration == generation + 1
 				&& current.StateLoadedSequence == identity.StateLoadedSequence + 1
-				? McpServiceResult<bool>.Success(true)
-				: McpServiceResult<bool>.Failure("state_changed", "Emulator state changed unexpectedly during save-state restore.");
+				? McpServiceResult<McpStateIdentity>.Success(current)
+				: McpServiceResult<McpStateIdentity>.Failure("state_changed", "Emulator state changed unexpectedly during save-state restore.");
 		});
 	}
 
-	private McpServiceResult<bool> ApplyInput(long leaseId, IReadOnlyList<McpExclusiveControllerState> states)
+	private McpServiceResult<bool> ApplyInput(
+		long leaseId,
+		McpStateIdentity expectedIdentity,
+		IReadOnlyList<McpExclusiveControllerState> states)
 	{
-		return _emulator.ExecuteOwned(leaseId, (api, _) => {
+		return _emulator.ExecuteOwned(leaseId, (api, identity) => {
+			if(identity != expectedIdentity) {
+				return StateChanged<bool>();
+			}
 			foreach(McpExclusiveControllerState state in states) {
 				if(!api.SetExclusiveControllerOverride(state)) {
 					return McpServiceResult<bool>.Failure("native_failure", "Native exclusive input failed.");
+				}
+				if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
+					return StateChanged<bool>();
 				}
 			}
 			return McpServiceResult<bool>.Success(true);
 		});
 	}
 
+	private McpServiceResult<bool> VerifyExpectedIdentity(long leaseId, McpStateIdentity expectedIdentity) =>
+		_emulator.ExecuteOwned(leaseId, (_, identity) => identity == expectedIdentity
+			? McpServiceResult<bool>.Success(true)
+			: StateChanged<bool>());
+
 	private McpServiceResult<CheckpointCapture> CaptureCheckpoint(
 		long leaseId,
+		McpStateIdentity expectedIdentity,
 		PreparedExperiment prepared,
 		int checkpointIndex,
 		int completedFrames,
 		IList<McpObservationResult?> observationSlots,
 		IReadOnlyList<McpAssertionResult> previousAssertions)
 	{
-		return _emulator.ExecuteOwned(leaseId, (api, _) => {
-			if(!api.IsExecutionStopped()) {
+		return _emulator.ExecuteOwned(leaseId, (api, identity) => {
+			if(identity != expectedIdentity || !api.IsExecutionStopped()) {
 				return McpServiceResult<CheckpointCapture>.Failure("state_changed", "Checkpoint capture requires stopped execution.");
+			}
+			if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
+				return StateChanged<CheckpointCapture>();
 			}
 			McpValidatedCheckpoint checkpoint = prepared.Experiment.Checkpoints[checkpointIndex];
 			List<McpObservationResult> observations = [];
@@ -410,6 +541,9 @@ internal sealed class McpExperimentService
 				McpValidatedObservation observation = prepared.Experiment.Observations[observationIndex];
 				MemoryType type = Enum.Parse<MemoryType>(observation.Space, ignoreCase: false);
 				byte[] data = api.GetMemoryValues(type, observation.Address, observation.Address + (uint)observation.Count - 1);
+				if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
+					return StateChanged<CheckpointCapture>();
+				}
 				if(data.Length != observation.Count) {
 					return McpServiceResult<CheckpointCapture>.Failure("native_failure", "Native memory read returned an unexpected byte count.");
 				}
@@ -419,23 +553,34 @@ internal sealed class McpExperimentService
 			}
 			McpAssertionEvaluation evaluation = McpExperimentAssertions.EvaluateCheckpoint(
 				prepared.Experiment, checkpointIndex, (IReadOnlyList<McpObservationResult?>)observationSlots, previousAssertions);
+			if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
+				return StateChanged<CheckpointCapture>();
+			}
 			return McpServiceResult<CheckpointCapture>.Success(new(
 				new(checkpoint.Name, completedFrames, observations, evaluation.Results),
 				evaluation.StopRequested));
 		});
 	}
 
-	private McpServiceResult<McpScreenshotMetadata> CaptureScreenshot(long leaseId)
+	private McpServiceResult<McpScreenshotMetadata> CaptureScreenshot(
+		long leaseId,
+		McpStateIdentity expectedIdentity)
 	{
 		return _emulator.ExecuteOwned(leaseId, (api, identity) => {
-			if(!api.IsExecutionStopped()) {
+			if(identity != expectedIdentity || !api.IsExecutionStopped()) {
 				return McpServiceResult<McpScreenshotMetadata>.Failure("state_changed", "Screenshot capture requires stopped execution.");
+			}
+			if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
+				return StateChanged<McpScreenshotMetadata>();
 			}
 			McpServiceResult<McpScreenshotCapture> capture = api.CaptureScreenshot();
 			if(!capture.IsSuccess) {
 				return FailureFrom<McpScreenshotMetadata, McpScreenshotCapture>(capture);
 			}
 			McpScreenshotCapture value = capture.Value!;
+			if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
+				return StateChanged<McpScreenshotMetadata>();
+			}
 			McpScreenshotMetadata metadata = value.Metadata;
 			if(metadata.Width <= 0 || metadata.Height <= 0 || value.Png.Length == 0 || metadata.PngBytes != value.Png.Length) {
 				return McpServiceResult<McpScreenshotMetadata>.Failure("native_failure", "Native screenshot data is invalid.");
@@ -481,9 +626,13 @@ internal sealed class McpExperimentService
 	private static McpServiceResult<T> FailureFrom<T, TSource>(McpServiceResult<TSource> source) =>
 		McpServiceResult<T>.Failure(source.Error!.Code, source.Error.Message);
 
+	private static McpServiceResult<T> StateChanged<T>() =>
+		McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the experiment.");
+
 	private sealed record PreparedExperiment(
 		McpValidatedExperiment Experiment,
 		CpuType CpuType,
+		McpStateIdentity PreflightIdentity,
 		IReadOnlySet<int> ControlledPorts,
 		IReadOnlyList<McpExclusiveControllerState> InitialStates,
 		IReadOnlyList<IReadOnlyList<McpExclusiveControllerState>> SegmentStates);
