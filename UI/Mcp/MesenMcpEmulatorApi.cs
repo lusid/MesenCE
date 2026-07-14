@@ -10,22 +10,34 @@ internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 	private readonly Func<InteropBufferResult> _createSaveState;
 	private readonly Func<byte[], InteropApiResult> _loadSaveState;
 	private readonly Func<InteropScreenshotResult> _captureScreenshot;
+	private readonly Func<McpExclusiveControllerState, bool> _setExclusiveControllerOverride;
+	private readonly Action _clearExclusiveControllerOverrides;
 
-	public MesenMcpEmulatorApi() : this(EmuApi.CreateSaveState, EmuApi.LoadSaveState, EmuApi.CaptureScreenshot) {}
+	public MesenMcpEmulatorApi() : this(EmuApi.CreateSaveState, EmuApi.LoadSaveState, EmuApi.CaptureScreenshot, DebugApi.SetExclusiveControllerOverride, DebugApi.ClearExclusiveControllerOverrides) {}
 
 	internal MesenMcpEmulatorApi(
 		Func<InteropBufferResult> createSaveState,
 		Func<byte[], InteropApiResult> loadSaveState)
-		: this(createSaveState, loadSaveState, EmuApi.CaptureScreenshot) {}
+		: this(createSaveState, loadSaveState, EmuApi.CaptureScreenshot, DebugApi.SetExclusiveControllerOverride, DebugApi.ClearExclusiveControllerOverrides) {}
 
 	internal MesenMcpEmulatorApi(
 		Func<InteropBufferResult> createSaveState,
 		Func<byte[], InteropApiResult> loadSaveState,
 		Func<InteropScreenshotResult> captureScreenshot)
+		: this(createSaveState, loadSaveState, captureScreenshot, DebugApi.SetExclusiveControllerOverride, DebugApi.ClearExclusiveControllerOverrides) {}
+
+	internal MesenMcpEmulatorApi(
+		Func<InteropBufferResult> createSaveState,
+		Func<byte[], InteropApiResult> loadSaveState,
+		Func<InteropScreenshotResult> captureScreenshot,
+		Func<McpExclusiveControllerState, bool> setExclusiveControllerOverride,
+		Action clearExclusiveControllerOverrides)
 	{
 		_createSaveState = createSaveState;
 		_loadSaveState = loadSaveState;
 		_captureScreenshot = captureScreenshot;
+		_setExclusiveControllerOverride = setExclusiveControllerOverride;
+		_clearExclusiveControllerOverrides = clearExclusiveControllerOverrides;
 	}
 
 	public bool IsRunning() => EmuApi.IsRunning();
@@ -54,8 +66,8 @@ internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 	public uint GetExecutionTraceSize() => DebugApi.GetExecutionTraceSize();
 	public TraceRow[] GetExecutionTrace(uint startOffset, uint maxRowCount) => DebugApi.GetExecutionTrace(startOffset, maxRowCount);
 	public IReadOnlyList<McpControllerTopology> GetControllerTopology() => DebugApi.GetControllerTopology();
-	public bool SetExclusiveControllerOverride(McpExclusiveControllerState state) => DebugApi.SetExclusiveControllerOverride(state);
-	public void ClearExclusiveControllerOverrides() => DebugApi.ClearExclusiveControllerOverrides();
+	public bool SetExclusiveControllerOverride(McpExclusiveControllerState state) => _setExclusiveControllerOverride(state);
+	public void ClearExclusiveControllerOverrides() => _clearExclusiveControllerOverrides();
 
 	public McpServiceResult<byte[]> CreateSaveState()
 	{

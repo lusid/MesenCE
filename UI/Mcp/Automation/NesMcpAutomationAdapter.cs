@@ -21,19 +21,23 @@ internal sealed class NesMcpAutomationAdapter(IMcpEmulatorApi api) : IMcpAutomat
 	public McpAutomationCapabilities GetCapabilities(IMcpEmulatorApi api, McpStateIdentity identity)
 	{
 		IReadOnlyList<McpControllerTopology> topology = api.GetControllerTopology();
-		bool deterministic = topology.Count > 0 && topology.All(IsSupported);
+		HashSet<int> ambiguousPorts = GetAmbiguousPhysicalPorts(topology);
+		bool deterministic = topology.Count > 0 && topology.All(IsSupported) && ambiguousPorts.Count == 0;
 		List<string> limitations = deterministic
 			? []
 			: topology.Where(device => !IsSupported(device))
-				.Select(device => $"Configured device {device.DeviceType} on port {device.Index} is not supported for deterministic NES automation.")
+				.Select(device => $"Configured device {device.DeviceType} on port {device.PhysicalPort} is not supported for deterministic NES automation.")
 				.ToList();
 		if(topology.Count == 0) {
 			limitations.Add("No configured NES controller device is available for deterministic automation.");
 		}
+		foreach(int port in ambiguousPorts.Order()) {
+			limitations.Add($"Configured physical port {port} is ambiguous because it contains multiple supported devices.");
+		}
 		List<McpControllerCapability> controllers = topology.Select(device => new McpControllerCapability(
-			device.Index,
+			device.PhysicalPort,
 			device.DeviceType.ToString(),
-			IsSupported(device),
+			IsSupported(device) && !ambiguousPorts.Contains(device.PhysicalPort),
 			device.Controls.Select(control => new McpControllerControlCapability(
 				control.Id,
 				control.NativeId,
@@ -62,13 +66,13 @@ internal sealed class NesMcpAutomationAdapter(IMcpEmulatorApi api) : IMcpAutomat
 	public McpServiceResult<IReadOnlyList<McpExclusiveControllerState>> ValidateInput(IReadOnlyList<McpControllerInput> controllers)
 	{
 		IReadOnlyList<McpControllerTopology> topology = api.GetControllerTopology();
-		if(topology.Count == 0 || topology.Any(device => !IsSupported(device))) {
+		if(topology.Count == 0 || topology.Any(device => !IsSupported(device)) || GetAmbiguousPhysicalPorts(topology).Count > 0) {
 			return McpServiceResult<IReadOnlyList<McpExclusiveControllerState>>.Failure(
 				"unsupported_capability",
 				"Every configured NES input device must support complete exclusive input.");
 		}
 
-		Dictionary<int, McpControllerTopology> devices = topology.ToDictionary(device => device.Index);
+		Dictionary<int, McpControllerTopology> devices = topology.ToDictionary(device => device.PhysicalPort);
 		Dictionary<int, IReadOnlyList<string>> requested = new();
 		foreach(McpControllerInput controller in controllers) {
 			if(!devices.ContainsKey(controller.Port)) {
@@ -81,7 +85,7 @@ internal sealed class NesMcpAutomationAdapter(IMcpEmulatorApi api) : IMcpAutomat
 
 		List<McpExclusiveControllerState> states = new(topology.Count);
 		foreach(McpControllerTopology device in topology) {
-			IReadOnlyList<string> buttons = requested.GetValueOrDefault(device.Index, []);
+			IReadOnlyList<string> buttons = requested.GetValueOrDefault(device.PhysicalPort, []);
 			Dictionary<string, McpControllerControl> controls = device.Controls
 				.Where(control => !control.IsNumeric)
 				.ToDictionary(control => control.Id, StringComparer.Ordinal);
@@ -89,14 +93,14 @@ internal sealed class NesMcpAutomationAdapter(IMcpEmulatorApi api) : IMcpAutomat
 			List<McpControllerValue> values = new(buttons.Count);
 			foreach(string button in buttons) {
 				if(!seen.Add(button)) {
-					return InvalidInput($"Button '{button}' is specified more than once on port {device.Index}.");
+					return InvalidInput($"Button '{button}' is specified more than once on port {device.PhysicalPort}.");
 				}
 				if(!controls.TryGetValue(button, out McpControllerControl? control)) {
-					return InvalidInput($"Button '{button}' is not supported on port {device.Index}.");
+					return InvalidInput($"Button '{button}' is not supported on port {device.PhysicalPort}.");
 				}
 				values.Add(new(control.NativeId, 1));
 			}
-			states.Add(new(device.Index, values));
+			states.Add(new(device.Index, device.PhysicalPort, values));
 		}
 
 		return McpServiceResult<IReadOnlyList<McpExclusiveControllerState>>.Success(states);
@@ -109,6 +113,16 @@ internal sealed class NesMcpAutomationAdapter(IMcpEmulatorApi api) : IMcpAutomat
 			&& device.Controls.All(control => !control.IsNumeric && control.NativeId is >= 0 and <= byte.MaxValue)
 			&& device.Controls.Select(control => control.Id).Distinct(StringComparer.Ordinal).Count() == device.Controls.Count
 			&& device.Controls.Select(control => control.NativeId).Distinct().Count() == device.Controls.Count;
+	}
+
+	private static HashSet<int> GetAmbiguousPhysicalPorts(IReadOnlyList<McpControllerTopology> topology)
+	{
+		return topology
+			.Where(IsSupported)
+			.GroupBy(device => device.PhysicalPort)
+			.Where(group => group.Count() > 1)
+			.Select(group => group.Key)
+			.ToHashSet();
 	}
 
 	private static McpServiceResult<IReadOnlyList<McpExclusiveControllerState>> InvalidInput(string message)

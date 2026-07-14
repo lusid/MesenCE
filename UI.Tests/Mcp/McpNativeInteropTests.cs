@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
+using System.Reflection;
 using Mesen.Interop;
 using Mesen.Mcp;
 
@@ -23,6 +24,59 @@ public sealed class McpNativeInteropTests
 		Assert.Equal(4, (int)InteropApiResult.PayloadTooLarge);
 		Assert.Equal(5, (int)InteropApiResult.AllocationFailed);
 		Assert.Equal(6, (int)InteropApiResult.EncodeFailed);
+	}
+
+	[Fact]
+	public void ControllerInteropResultsUseFixed32BitNumericValues()
+	{
+		Assert.Equal(0, (int)InteropControllerApiResult.Failure);
+		Assert.Equal(1, (int)InteropControllerApiResult.Success);
+		Assert.Equal(typeof(int), Enum.GetUnderlyingType(typeof(InteropControllerApiResult)));
+		Assert.Equal(4, Unsafe.SizeOf<InteropControllerApiResult>());
+
+		string[] methods = ["GetControllerInfo", "GetControllerControlInfo", "SetExclusiveControllerOverride"];
+		foreach(string method in methods) {
+			MethodInfo interop = Assert.Single(
+				typeof(DebugApi).GetMethods(BindingFlags.NonPublic | BindingFlags.Static),
+				candidate => candidate.Name == method && candidate.GetCustomAttribute<DllImportAttribute>() != null);
+			Assert.Equal(typeof(InteropControllerApiResult), interop.ReturnType);
+		}
+
+		string wrapper = ReadRepositoryFile("InteropDLL/DebugApiWrapper.cpp");
+		Assert.Contains("DllExport int32_t __stdcall GetControllerInfo", wrapper);
+		Assert.Contains("DllExport int32_t __stdcall GetControllerControlInfo", wrapper);
+		Assert.Contains("DllExport int32_t __stdcall SetExclusiveControllerOverride", wrapper);
+		Assert.Contains("}) ? 1 : 0;", wrapper);
+		Assert.Contains("return result ? 1 : 0;", wrapper);
+
+		string managed = ReadRepositoryFile("UI/Interop/DebugApi.cs");
+		Assert.Contains("SetExclusiveControllerOverride((UInt32)state.NativeIndex", managed);
+		Assert.DoesNotContain("SetExclusiveControllerOverride((UInt32)state.Port", managed);
+	}
+
+	[Fact]
+	public void ControllerCleanup_DelegatesAndPrecedesDebuggerStorageTeardown()
+	{
+		int clearCalls = 0;
+		MesenMcpEmulatorApi api = new(
+			() => default,
+			_ => default,
+			() => default,
+			_ => true,
+			() => clearCalls++);
+
+		api.ClearExclusiveControllerOverrides();
+
+		Assert.Equal(1, clearCalls);
+		string debugger = ReadRepositoryFile("Core/Debugger/Debugger.cpp");
+		int destructor = debugger.IndexOf("Debugger::~Debugger()", StringComparison.Ordinal);
+		int clear = debugger.IndexOf("ClearExclusiveControllerOverrides();", destructor, StringComparison.Ordinal);
+		int release = debugger.IndexOf("Release();", destructor, StringComparison.Ordinal);
+		int clearMethod = debugger.IndexOf("void Debugger::ClearExclusiveControllerOverrides()", StringComparison.Ordinal);
+		int storageReset = debugger.IndexOf("_exclusiveInputOverrides[i] = {};", clearMethod, StringComparison.Ordinal);
+
+		Assert.True(destructor >= 0 && clear > destructor && release > clear);
+		Assert.True(clearMethod >= 0 && storageReset > clearMethod);
 	}
 
 	[Fact]

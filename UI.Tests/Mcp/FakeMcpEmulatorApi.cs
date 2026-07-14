@@ -95,6 +95,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public uint LastReadEndInclusive { get; private set; }
 	public uint LastWriteStart { get; private set; }
 	public byte[]? LastWriteData { get; private set; }
+	public McpExclusiveControllerState? LastExclusiveControllerState { get; private set; }
 
 	public static FakeMcpEmulatorApi RunningNes() => new() {
 		Running = true,
@@ -317,6 +318,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public bool SetExclusiveControllerOverride(McpExclusiveControllerState state)
 	{
 		SetExclusiveControllerOverrideCalls++;
+		LastExclusiveControllerState = state;
 		return SetExclusiveControllerOverrideHandler?.Invoke(state) ?? true;
 	}
 

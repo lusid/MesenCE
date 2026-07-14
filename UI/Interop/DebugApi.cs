@@ -231,9 +231,9 @@ namespace Mesen.Interop
 		[DllImport(DllPath)] public static extern void SetInputOverrides(UInt32 index, DebugControllerState state);
 		[DllImport(DllPath)] private static extern void GetAvailableInputOverrides([In, Out] byte[] availableIndexes);
 		[DllImport(DllPath)] private static extern UInt32 GetControllerCount();
-		[DllImport(DllPath)][return: MarshalAs(UnmanagedType.I1)] private static extern bool GetControllerInfo(UInt32 ordinal, out InteropControllerInfo info);
-		[DllImport(DllPath)][return: MarshalAs(UnmanagedType.I1)] private static extern bool GetControllerControlInfo(UInt32 index, UInt32 controlIndex, out InteropControllerControlInfo info, [In, Out] byte[] name, UInt32 maxNameLength);
-		[DllImport(DllPath)][return: MarshalAs(UnmanagedType.I1)] private static extern bool SetExclusiveControllerOverride(UInt32 index, Int32 enabled, [In] InteropControllerValue[] values, UInt32 valueCount);
+		[DllImport(DllPath)] private static extern InteropControllerApiResult GetControllerInfo(UInt32 ordinal, out InteropControllerInfo info);
+		[DllImport(DllPath)] private static extern InteropControllerApiResult GetControllerControlInfo(UInt32 index, UInt32 controlIndex, out InteropControllerControlInfo info, [In, Out] byte[] name, UInt32 maxNameLength);
+		[DllImport(DllPath)] private static extern InteropControllerApiResult SetExclusiveControllerOverride(UInt32 index, Int32 enabled, [In] InteropControllerValue[] values, UInt32 valueCount);
 		[DllImport(DllPath)] public static extern void ClearExclusiveControllerOverrides();
 
 		public static List<int> GetAvailableInputOverrides()
@@ -262,7 +262,7 @@ namespace Mesen.Interop
 
 			List<McpControllerTopology> topology = new((int)count);
 			for(UInt32 ordinal = 0; ordinal < count; ordinal++) {
-				if(!GetControllerInfo(ordinal, out InteropControllerInfo info)
+				if(GetControllerInfo(ordinal, out InteropControllerInfo info) != InteropControllerApiResult.Success
 					|| info.Index < 0 || info.Index >= maxControllers
 					|| info.ControlCount < 0 || info.ControlCount > maxControls) {
 					return [];
@@ -271,7 +271,7 @@ namespace Mesen.Interop
 				List<McpControllerControl> controls = new(info.ControlCount);
 				for(UInt32 controlIndex = 0; controlIndex < (UInt32)info.ControlCount; controlIndex++) {
 					byte[] name = new byte[maxControlNameBytes];
-					if(!GetControllerControlInfo((UInt32)info.Index, controlIndex, out InteropControllerControlInfo controlInfo, name, (UInt32)name.Length)) {
+					if(GetControllerControlInfo((UInt32)info.Index, controlIndex, out InteropControllerControlInfo controlInfo, name, (UInt32)name.Length) != InteropControllerApiResult.Success) {
 						return [];
 					}
 					if(controlInfo.NameLength < 0 || controlInfo.NameLength >= maxControlNameBytes || name[controlInfo.NameLength] != 0) {
@@ -286,14 +286,14 @@ namespace Mesen.Interop
 
 		internal static bool SetExclusiveControllerOverride(McpExclusiveControllerState state)
 		{
-			if(state.Port < 0 || state.Port >= 8 || state.Values.Count > 256) {
+			if(state.NativeIndex < 0 || state.NativeIndex >= 8 || state.Values.Count > 256) {
 				return false;
 			}
 			InteropControllerValue[] values = state.Values.Select(value => new InteropControllerValue {
 				ControlId = value.ControlId,
 				Value = value.Value
 			}).ToArray();
-			return SetExclusiveControllerOverride((UInt32)state.Port, state.Enabled ? 1 : 0, values, (UInt32)values.Length);
+			return SetExclusiveControllerOverride((UInt32)state.NativeIndex, state.Enabled ? 1 : 0, values, (UInt32)values.Length) == InteropControllerApiResult.Success;
 		}
 
 		[DllImport(DllPath, EntryPoint = "GetRomHeader")] private static extern void GetRomHeaderWrapper([In, Out] byte[] headerData, ref UInt32 size);
@@ -740,6 +740,12 @@ namespace Mesen.Interop
 		WsPort,
 
 		None,
+	}
+
+	internal enum InteropControllerApiResult : Int32
+	{
+		Failure = 0,
+		Success = 1
 	}
 
 	[StructLayout(LayoutKind.Sequential)]

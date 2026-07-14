@@ -41,6 +41,38 @@ public sealed class McpAutomationAdapterTests
 	}
 
 	[Fact]
+	public void PhysicalPortIsPublicWhileNativeIndexTargetsMutation()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.ControllerTopology = [Pad1 with { Index = 0, PhysicalPort = 1 }];
+		NesMcpAutomationAdapter adapter = new(api);
+
+		McpAutomationCapabilities capabilities = adapter.GetCapabilities(api, default);
+		McpExclusiveControllerState state = Assert.Single(adapter.ValidateInput([new(1, ["start"])]).Value!);
+		api.SetExclusiveControllerOverride(state);
+
+		Assert.Equal(1, Assert.Single(capabilities.Controllers).Port);
+		Assert.Equal(1, state.Port);
+		Assert.Equal(0, state.NativeIndex);
+		Assert.Equal(0, api.LastExclusiveControllerState?.NativeIndex);
+	}
+
+	[Fact]
+	public void DuplicateSupportedPhysicalPortsAreAmbiguous()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.ControllerTopology = [Pad1, Pad1 with { Index = 1 }];
+		NesMcpAutomationAdapter adapter = new(api);
+
+		McpAutomationCapabilities capabilities = adapter.GetCapabilities(api, default);
+
+		Assert.False(capabilities.DeterministicFrames);
+		Assert.All(capabilities.Controllers, controller => Assert.False(controller.ExclusiveInput));
+		Assert.Contains(capabilities.Limitations, limitation => limitation.Contains("ambiguous", StringComparison.Ordinal));
+		Assert.Equal("unsupported_capability", adapter.ValidateInput([]).Error?.Code);
+	}
+
+	[Fact]
 	public void Capabilities_RejectUnsupportedConfiguredPeripheral()
 	{
 		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
@@ -94,12 +126,14 @@ public sealed class McpAutomationAdapterTests
 		Assert.Collection(result.Value!,
 			state => {
 				Assert.Equal(0, state.Port);
+				Assert.Equal(0, state.NativeIndex);
 				McpControllerValue value = Assert.Single(state.Values);
 				Assert.Equal(3, value.ControlId);
 				Assert.Equal(1, value.Value);
 			},
 			state => {
 				Assert.Equal(1, state.Port);
+				Assert.Equal(1, state.NativeIndex);
 				Assert.Empty(state.Values);
 			});
 	}
