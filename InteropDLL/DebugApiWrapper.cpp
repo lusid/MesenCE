@@ -69,6 +69,11 @@ extern "C"
 		return _emu->GetDebugger().GetDebugger() != nullptr;
 	}
 
+	DllExport uint64_t __stdcall GetDebuggerRequestBlockState()
+	{
+		return _emu->GetDebuggerRequestBlockState();
+	}
+
 	DllExport bool __stdcall IsExecutionStopped()
 	{
 		return WithDebugger(bool, IsExecutionStopped());

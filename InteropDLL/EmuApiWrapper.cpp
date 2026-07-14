@@ -240,8 +240,9 @@ extern "C"
 	DllExport void __stdcall Release()
 	{
 		if(_emu) {
-			_emu->Stop(true);
-			_emu->Release();
+			if(!_emu->Release()) {
+				return;
+			}
 		}
 
 		_renderer.reset();

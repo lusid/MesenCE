@@ -52,7 +52,7 @@ namespace Mesen.ViewModels
 				case ConfigWindowTab.Nes:
 					//TODOv2 fix this patch
 					Preferences ??= AddDisposable(new PreferencesConfigViewModel());
-					Nes ??= AddDisposable(new NesConfigViewModel(Preferences.Config));
+					Nes ??= AddDisposable(new NesConfigViewModel(Preferences.Config.Preferences));
 					break;
 
 				case ConfigWindowTab.Snes: Snes ??= AddDisposable(new SnesConfigViewModel()); break;
@@ -82,6 +82,7 @@ namespace Mesen.ViewModels
 			ConfigManager.Config.Input = Input?.OriginalConfig ?? ConfigManager.Config.Input;
 			ConfigManager.Config.Video = Video?.OriginalConfig ?? ConfigManager.Config.Video;
 			ConfigManager.Config.Preferences = Preferences?.OriginalConfig ?? ConfigManager.Config.Preferences;
+			ConfigManager.Config.Mcp = Preferences?.OriginalMcpConfig ?? ConfigManager.Config.Mcp;
 			ConfigManager.Config.Emulation = Emulation?.OriginalConfig ?? ConfigManager.Config.Emulation;
 			ConfigManager.Config.Nes = Nes?.OriginalConfig ?? ConfigManager.Config.Nes;
 			ConfigManager.Config.Snes = Snes?.OriginalConfig ?? ConfigManager.Config.Snes;
@@ -101,6 +102,7 @@ namespace Mesen.ViewModels
 				Input?.OriginalConfig.IsIdentical(ConfigManager.Config.Input) == false ||
 				Video?.OriginalConfig.IsIdentical(ConfigManager.Config.Video) == false ||
 				Preferences?.OriginalConfig.IsIdentical(ConfigManager.Config.Preferences) == false ||
+				Preferences?.OriginalMcpConfig.IsIdentical(ConfigManager.Config.Mcp) == false ||
 				Emulation?.OriginalConfig.IsIdentical(ConfigManager.Config.Emulation) == false ||
 				Nes?.OriginalConfig.IsIdentical(ConfigManager.Config.Nes) == false ||
 				Snes?.OriginalConfig.IsIdentical(ConfigManager.Config.Snes) == false ||

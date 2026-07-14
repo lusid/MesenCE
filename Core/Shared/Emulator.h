@@ -61,6 +61,20 @@ private:
 	friend class DebuggerRequest;
 	friend class EmulatorLock;
 
+	class DebuggerRequestBlockGuard
+	{
+	private:
+		Emulator* _emu;
+		bool _active = true;
+
+	public:
+		explicit DebuggerRequestBlockGuard(Emulator* emu);
+		~DebuggerRequestBlockGuard();
+		void Release();
+		DebuggerRequestBlockGuard(const DebuggerRequestBlockGuard&) = delete;
+		DebuggerRequestBlockGuard& operator=(const DebuggerRequestBlockGuard&) = delete;
+	};
+
 	safe_ptr<IConsole> _console;
 
 	//Used by the Process[..] debugger hooks which run exclusively on the emulation thread.
@@ -99,13 +113,17 @@ private:
 	SimpleLock _loadLock;
 
 	SimpleLock _debuggerLock;
+	SimpleLock _debugRequestLock;
 	atomic<bool> _stopFlag;
 	atomic<bool> _paused;
 	atomic<bool> _pauseOnNextFrame;
 	atomic<bool> _threadPaused;
 
-	atomic<int> _debugRequestCount;
-	atomic<int> _blockDebuggerRequestCount;
+	int _debugRequestCount;
+	unordered_map<thread::id, int> _debugRequestCountsByOwner;
+	bool _terminalDebuggerRequestBlock = false;
+	// Low bit is blocked, the next 32 bits are the block count, and upper bits are the boundary epoch.
+	atomic<uint64_t> _debuggerRequestBlockState;
 
 	atomic<bool> _isRunAheadFrame;
 	bool _frameRunning = false;
@@ -139,6 +157,14 @@ private:
 	void RunFrameWithRunAhead();
 
 	void BlockDebuggerRequests();
+	void UnblockDebuggerRequests();
+	bool BlockAllDebuggerRequests();
+	uint32_t ChangeDebuggerRequestBlockCount(int delta);
+	void RegisterDebuggerRequest(thread::id ownerThreadId);
+	void UnregisterDebuggerRequest(thread::id ownerThreadId);
+	int GetOtherThreadDebuggerRequestCount(thread::id ownerThreadId);
+	int GetDebuggerRequestCount(thread::id ownerThreadId);
+	int GetDebuggerRequestCount();
 	void ResetDebugger(bool startDebugger = false);
 
 	double GetFrameDelay();
@@ -157,7 +183,7 @@ public:
 	~Emulator();
 
 	void Initialize(bool enableShortcuts = true);
-	void Release();
+	bool Release();
 
 	void Run();
 	void Stop(bool sendNotification, bool preventRecentGameSave = false, bool saveBattery = true);
@@ -195,7 +221,8 @@ public:
 	void Unlock();
 	bool IsThreadPaused();
 
-	bool IsDebuggerBlocked() { return _blockDebuggerRequestCount > 0; }
+	bool IsDebuggerBlocked() { return (_debuggerRequestBlockState.load() & 1) != 0; }
+	uint64_t GetDebuggerRequestBlockState() { return _debuggerRequestBlockState.load(); }
 	void SuspendDebugger(bool release);
 
 	void Serialize(ostream& out, bool includeSettings, int compressionLevel = 1);

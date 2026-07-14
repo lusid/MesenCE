@@ -12,8 +12,9 @@ namespace Mesen.ViewModels
 {
 	public partial class PreferencesConfigViewModel : DisposableViewModel
 	{
-		[ObservableProperty] public partial PreferencesConfig Config { get; set; }
+		[ObservableProperty] public partial Configuration Config { get; set; }
 		[ObservableProperty] public partial PreferencesConfig OriginalConfig { get; set; }
+		[ObservableProperty] public partial McpConfig OriginalMcpConfig { get; set; }
 
 		public string DataStorageLocation { get; }
 		public bool IsOsx { get; }
@@ -22,8 +23,9 @@ namespace Mesen.ViewModels
 
 		public PreferencesConfigViewModel()
 		{
-			Config = ConfigManager.Config.Preferences;
-			OriginalConfig = Config.Clone();
+			Config = ConfigManager.Config;
+			OriginalConfig = Config.Preferences.Clone();
+			OriginalMcpConfig = Config.Mcp.Clone();
 
 			IsOsx = OperatingSystem.IsMacOS();
 			DataStorageLocation = ConfigManager.HomeFolder;
@@ -145,7 +147,7 @@ namespace Mesen.ViewModels
 			};
 
 			Dictionary<EmulatorShortcut, ShortcutKeyInfo> shortcuts = new Dictionary<EmulatorShortcut, ShortcutKeyInfo>();
-			foreach(ShortcutKeyInfo shortcut in Config.ShortcutKeys) {
+			foreach(ShortcutKeyInfo shortcut in Config.Preferences.ShortcutKeys) {
 				shortcuts[shortcut.Shortcut] = shortcut;
 			}
 
@@ -160,8 +162,8 @@ namespace Mesen.ViewModels
 				return;
 			}
 
-			AddDisposable(ReactiveHelper.RegisterRecursiveObserver(Config, (s, e) => {
-				Config.ApplyConfig();
+			AddDisposable(ReactiveHelper.RegisterRecursiveObserver(Config.Preferences, (s, e) => {
+				Config.Preferences.ApplyConfig();
 				PreferencesConfig.UpdateTheme();
 			}));
 		}

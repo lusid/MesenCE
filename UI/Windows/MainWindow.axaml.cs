@@ -13,6 +13,7 @@ using Mesen.Debugger.Utilities;
 using Mesen.Debugger.Windows;
 using Mesen.Interop;
 using Mesen.Localization;
+using Mesen.Mcp;
 using Mesen.Utilities;
 using Mesen.ViewModels;
 using Mesen.Views;
@@ -41,6 +42,7 @@ namespace Mesen.Windows
 		private ContentControl _audioPlayer;
 		private MainMenuView _mainMenu;
 		private CommandLineHelper? _cmdLine;
+		private readonly MainWindowMcpLifecycle _mcpLifecycle = new();
 
 		private bool _testModeEnabled;
 		private bool _needResume = false;
@@ -181,9 +183,11 @@ namespace Mesen.Windows
 			}
 
 			_timerBackgroundFlag.Stop();
-			EmuApi.Stop();
-			_listener?.Dispose();
-			EmuApi.Release();
+			_mcpLifecycle.StopBeforeCoreRelease(
+				EmuApi.Stop,
+				() => _listener?.Dispose(),
+				EmuApi.Release
+			);
 			ConfigManager.Config.MainWindow.SaveWindowSettings(this);
 			ConfigManager.Config.Save();
 			_isClosing = true;
@@ -251,7 +255,7 @@ namespace Mesen.Windows
 			//This also enables keyboard/gamepad navigation on the selection screen without having to click it first
 			this.FindDescendantOfType<StateGrid>()?.Focus();
 
-			Task.Run(() => {
+			Task.Run(async () => {
 				CommandLineHelper cmdLine = new CommandLineHelper(Program.CommandLineArgs, true);
 				_cmdLine = cmdLine;
 
@@ -276,7 +280,11 @@ namespace Mesen.Windows
 
 				_model.Init(this);
 
-				ConfigManager.Config.ApplyConfig();
+				await _mcpLifecycle.ApplyConfigAndStartAsync(
+					ConfigManager.Config.ApplyConfig,
+					ConfigManager.Config.Mcp.Enabled,
+					ConfigManager.Config.Mcp.Port
+				);
 
 				if(ConfigManager.Config.Preferences.OverrideGameFolder && Directory.Exists(ConfigManager.Config.Preferences.GameFolder)) {
 					EmuApi.AddKnownGameFolder(ConfigManager.Config.Preferences.GameFolder);
@@ -315,6 +323,19 @@ namespace Mesen.Windows
 		private void OnNotification(NotificationEventArgs e)
 		{
 			DebugWindowManager.ProcessNotification(e);
+			if(e.NotificationType is ConsoleNotificationType.BeforeEmulationStop
+				or ConsoleNotificationType.BeforeGameLoad
+				or ConsoleNotificationType.BeforeGameUnload) {
+				_mcpLifecycle.BeginEmulatorTransition();
+			} else if(e.NotificationType is ConsoleNotificationType.GameLoaded
+				or ConsoleNotificationType.GameLoadFailed
+				or ConsoleNotificationType.EmulationStopped) {
+				_mcpLifecycle.EndEmulatorTransition();
+			} else if(e.NotificationType is ConsoleNotificationType.StateLoaded
+				or ConsoleNotificationType.GameReset
+				or ConsoleNotificationType.AfterInitConsole) {
+				_mcpLifecycle.NotifyEmulatorStateChanged();
+			}
 
 			switch(e.NotificationType) {
 				case ConsoleNotificationType.GameLoaded:
@@ -817,6 +838,125 @@ namespace Mesen.Windows
 					EmuApi.Resume();
 					_needResume = false;
 				}
+			}
+		}
+	}
+
+	internal sealed class MainWindowMcpLifecycle
+	{
+		private readonly object _lock = new();
+		private readonly Func<McpServer> _createServer;
+		private readonly Func<McpServer, ushort, Task> _startServer;
+		private readonly Action<McpServer> _disposeServer;
+		private readonly Action<string> _log;
+		private McpServer? _server;
+		private McpServer? _stoppingServer;
+		private bool _stopped;
+
+		internal MainWindowMcpLifecycle()
+			: this(
+				() => new McpServer(new McpEmulatorService(new MesenMcpEmulatorApi())),
+				(server, port) => server.StartAsync(port),
+				server => server.Dispose(),
+				McpServer.Log
+			)
+		{ }
+
+		internal MainWindowMcpLifecycle(
+			Func<McpServer> createServer,
+			Func<McpServer, ushort, Task> startServer,
+			Action<McpServer> disposeServer,
+			Action<string> log)
+		{
+			_createServer = createServer;
+			_startServer = startServer;
+			_disposeServer = disposeServer;
+			_log = log;
+		}
+
+		internal async Task ApplyConfigAndStartAsync(Action applyConfig, bool enabled, ushort port)
+		{
+			applyConfig();
+			await StartAsync(enabled, port).ConfigureAwait(false);
+		}
+
+		internal async Task StartAsync(bool enabled, ushort port)
+		{
+			if(!enabled) {
+				return;
+			}
+
+			McpServer server;
+			lock(_lock) {
+				if(_stopped || _server != null) {
+					return;
+				}
+				server = _createServer();
+				_server = server;
+			}
+
+			try {
+				await _startServer(server, port).ConfigureAwait(false);
+			} catch(Exception ex) {
+				bool disposeServer = false;
+				bool logFailure;
+				lock(_lock) {
+					logFailure = !_stopped;
+					if(ReferenceEquals(_server, server)) {
+						_server = null;
+						disposeServer = true;
+					}
+				}
+				if(disposeServer) {
+					_disposeServer(server);
+				}
+				if(logFailure) {
+					_log($"[MCP] Unable to start server on 127.0.0.1:{port}: {ex.GetBaseException().Message}");
+				}
+			}
+		}
+
+		internal void StopBeforeCoreRelease(Action stopCore, Action disposeListener, Action releaseCore)
+		{
+			McpServer? server;
+			lock(_lock) {
+				_stopped = true;
+				server = _server;
+				_server = null;
+				_stoppingServer = server;
+			}
+
+			if(server != null) {
+				server.Stop(TimeSpan.FromSeconds(2));
+				_disposeServer(server);
+				server.DrainEmulatorOperations();
+			}
+			lock(_lock) {
+				_stoppingServer = null;
+			}
+			stopCore();
+			disposeListener();
+			releaseCore();
+		}
+
+		internal void NotifyEmulatorStateChanged()
+		{
+			lock(_lock) {
+				(_server ?? _stoppingServer)?.NotifyEmulatorStateChanged();
+			}
+		}
+
+		internal void BeginEmulatorTransition()
+		{
+			lock(_lock) {
+				(_server ?? _stoppingServer)?.BeginEmulatorTransition();
+			}
+		}
+
+		internal void EndEmulatorTransition()
+		{
+			lock(_lock) {
+				(_server ?? _stoppingServer)?.EndEmulatorTransition();
 			}
 		}
 	}
