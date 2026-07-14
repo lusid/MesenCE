@@ -613,6 +613,14 @@ internal sealed class McpEmulatorService : IDisposable
 			_executionCoordinator.ConfirmStoppedAndClearQuarantine();
 			return new(McpStopReason.Pause, null, null, true);
 		}
+		if(!setup.IsSuccess && waiter?.Completion.Task.IsCompletedSuccessfully == true) {
+			McpStopResult completed = waiter.Completion.Task.Result;
+			waiter.Dispose();
+			if(completed.StopConfirmed) {
+				_executionCoordinator.ConfirmStoppedAndClearQuarantine();
+			}
+			return completed;
+		}
 		if(!setup.IsSuccess || waiter is null) {
 			waiter?.Dispose();
 			if(quarantineOnFailure) {

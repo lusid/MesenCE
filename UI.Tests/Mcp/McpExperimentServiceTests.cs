@@ -299,6 +299,63 @@ public sealed class McpExperimentServiceTests
 	}
 
 	[Fact]
+	public async Task RunAsync_BreakpointDuringInitialStopInterruptsBeforeInitialCheckpoint()
+	{
+		using ExperimentFixture fixture = new();
+		bool stopped = false;
+		fixture.Api.IsExecutionStoppedHandler = () => stopped;
+		fixture.Api.PauseHandler = () => {
+			stopped = true;
+			SendBreak(fixture.Emulator, new BreakEvent {
+				Source = BreakSource.Breakpoint,
+				SourceCpu = CpuType.Nes,
+				BreakpointId = 7
+			});
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { CaptureFinalScreenshot = true }, CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.Breakpoint, result.Reason);
+		Assert.Equal("breakpoint", result.Interruption?.BreakContext?.Reason);
+		Assert.Empty(result.Checkpoints);
+		Assert.Empty(result.CompletedSegments);
+		Assert.Equal(0, fixture.Api.StepCalls);
+		Assert.Equal(0, fixture.Api.CaptureScreenshotCalls);
+	}
+
+	[Theory]
+	[InlineData(ConsoleNotificationType.GameReset, McpExperimentReason.Reset)]
+	[InlineData(ConsoleNotificationType.BeforeGameLoad, McpExperimentReason.RomTransition)]
+	public async Task RunAsync_LifecycleDuringInitialStopRetainsDedicatedReason(
+		ConsoleNotificationType notification,
+		string expectedReason)
+	{
+		using ExperimentFixture fixture = new();
+		bool stopped = false;
+		fixture.Api.IsExecutionStoppedHandler = () => stopped;
+		fixture.Api.PauseHandler = () => {
+			stopped = true;
+			fixture.Emulator.ProcessNotification(new() { NotificationType = notification });
+			if(notification == ConsoleNotificationType.BeforeGameLoad) {
+				fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameLoaded });
+			}
+		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { CaptureFinalScreenshot = true }, CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(expectedReason, result.Reason);
+		Assert.Null(result.Interruption?.BreakContext);
+		Assert.Empty(result.Checkpoints);
+		Assert.Empty(result.CompletedSegments);
+		Assert.Equal(0, fixture.Api.StepCalls);
+		Assert.Equal(0, fixture.Api.CaptureScreenshotCalls);
+	}
+
+	[Fact]
 	public async Task RunAsync_CancellationDuringInitialCheckpointKeepsOnlyInitialCheckpoint()
 	{
 		using ExperimentFixture fixture = new();
@@ -379,6 +436,24 @@ public sealed class McpExperimentServiceTests
 			cancellation.Cancel();
 			return McpServiceResult<McpScreenshotCapture>.Success(new(new(1, 1, 1, 1, 0, 0), [1]));
 		};
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { CaptureFinalScreenshot = true }, cancellation.Token));
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.Cancelled, result.Reason);
+		Assert.Null(result.Screenshot);
+		Assert.Equal(1, fixture.Api.CaptureScreenshotCalls);
+	}
+
+	[Fact]
+	public async Task RunAsync_CancellationAfterScreenshotAssignmentClearsCapture()
+	{
+		using CancellationTokenSource cancellation = new();
+		using ExperimentFixture fixture = new(afterScreenshotAssigned: cancellation.Cancel);
+		fixture.CompleteEveryStep();
+		fixture.Api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
+			new(new(1, 1, 1, 1, 0, 0), [1]));
 
 		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
 			BasicRequest() with { CaptureFinalScreenshot = true }, cancellation.Token));
@@ -604,7 +679,7 @@ public sealed class McpExperimentServiceTests
 
 	private sealed class ExperimentFixture : IDisposable
 	{
-		internal ExperimentFixture(IMcpMonotonicClock? clock = null)
+		internal ExperimentFixture(IMcpMonotonicClock? clock = null, Action? afterScreenshotAssigned = null)
 		{
 			Api = FakeMcpEmulatorApi.RunningNes();
 			Api.MemorySizes[MemoryType.NesMemory] = 0x100;
@@ -621,7 +696,8 @@ public sealed class McpExperimentServiceTests
 				executionCoordinator: Coordinator);
 			SaveStates = new();
 			Automation = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates);
-			Experiments = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates, clock);
+			Experiments = new(
+				Emulator, new McpAutomationAdapterRegistry(Api), SaveStates, clock, afterScreenshotAssigned);
 		}
 
 		internal FakeMcpEmulatorApi Api { get; }

@@ -14,17 +14,20 @@ internal sealed class McpExperimentService
 	private readonly McpAutomationAdapterRegistry _adapters;
 	private readonly McpSaveStateStore _saveStates;
 	private readonly IMcpMonotonicClock _clock;
+	private readonly Action _afterScreenshotAssigned;
 
 	internal McpExperimentService(
 		McpEmulatorService emulator,
 		McpAutomationAdapterRegistry adapters,
 		McpSaveStateStore saveStates,
-		IMcpMonotonicClock? clock = null)
+		IMcpMonotonicClock? clock = null,
+		Action? afterScreenshotAssigned = null)
 	{
 		_emulator = emulator;
 		_adapters = adapters;
 		_saveStates = saveStates;
 		_clock = clock ?? McpMonotonicClock.Instance;
+		_afterScreenshotAssigned = afterScreenshotAssigned ?? (() => { });
 	}
 
 	internal async Task<McpServiceResult<RunExperimentResult>> RunAsync(
@@ -107,7 +110,7 @@ internal sealed class McpExperimentService
 				quarantineOnFailure: false,
 				expectedIdentity: expectedIdentity,
 				cancellationToken: cancellationToken).ConfigureAwait(false);
-			if(!initialStop.StopConfirmed) {
+			if(!initialStop.StopConfirmed || initialStop.Reason != McpStopReason.Pause) {
 				SetStopFailure(initialStop);
 				goto Cleanup;
 			}
@@ -238,8 +241,9 @@ internal sealed class McpExperimentService
 						goto Cleanup;
 					}
 					screenshot = capture.Value;
+					_afterScreenshotAssigned();
 				}
-				if(CheckCancellation() || CheckDeadline()) {
+				if(CheckFinalInterruption()) {
 					goto Cleanup;
 				}
 			}
@@ -353,6 +357,11 @@ internal sealed class McpExperimentService
 		{
 			halted = true;
 			string mapped = MapFailureReason(errorCode);
+			if(mapped is McpExperimentReason.Cancelled or McpExperimentReason.Timeout
+				or McpExperimentReason.StateChanged or McpExperimentReason.Reset
+				or McpExperimentReason.RomTransition) {
+				screenshot = null;
+			}
 			status = mapped is McpExperimentReason.Reset or McpExperimentReason.RomTransition
 				or McpExperimentReason.StateChanged or McpExperimentReason.Cancelled
 				? McpExperimentStatus.Interrupted
@@ -408,6 +417,21 @@ internal sealed class McpExperimentService
 				return false;
 			}
 			SetFailure("cancelled");
+			return true;
+		}
+
+		bool CheckFinalInterruption()
+		{
+			if(CheckCancellation() || CheckDeadline()) {
+				screenshot = null;
+				return true;
+			}
+			McpServiceResult<bool> finalIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
+			if(finalIdentity.IsSuccess) {
+				return false;
+			}
+			SetFailure(finalIdentity.Error!.Code);
+			screenshot = null;
 			return true;
 		}
 
