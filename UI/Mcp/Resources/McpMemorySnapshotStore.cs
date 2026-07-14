@@ -12,6 +12,8 @@ internal sealed class McpMemorySnapshotStore : McpResourceStore<McpMemorySnapsho
 			McpAutomationLimits.MaxAggregateMemorySnapshotBytes,
 			resource => [resource.Data]) { }
 
+	internal McpServiceResult<bool> CheckCreate(int count) => CheckAddResource(count);
+
 	internal McpServiceResult<McpMemorySnapshotMetadata> Create(
 		string system,
 		string space,

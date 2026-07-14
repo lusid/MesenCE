@@ -139,6 +139,17 @@ internal abstract class McpResourceStore<T> : IDisposable where T : class
 		get { lock(_sync) { return _retainedBytes; } }
 	}
 
+	protected McpServiceResult<bool> CheckAddResource(long size)
+	{
+		lock(_sync) {
+			ThrowIfDisposed();
+			Sweep(_clock.GetTimestamp());
+			return _retainedCount >= _maxCount || size > _maxItemBytes || size > _maxAggregateBytes - _retainedBytes
+				? LimitFailure<bool>()
+				: McpServiceResult<bool>.Success(true);
+		}
+	}
+
 	protected McpServiceResult<McpResourceCreation<T>> AddResource(Func<string, T> create)
 	{
 		lock(_sync) {

@@ -1509,6 +1509,21 @@ internal sealed class McpEmulatorService : IDisposable
 		return Execute(() => operation(_api, _emulatorIdentity.Current));
 	}
 
+	internal McpServiceResult<T> ExecuteStoppedMemorySnapshot<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		return Execute(() => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<T>.Failure("no_game", "No game is currently loaded.");
+			}
+			if(!_api.IsExecutionStopped()) {
+				return McpServiceResult<T>.Failure(
+					"debugger_unavailable", "Execution must be stopped for memory snapshot operations.");
+			}
+			return operation(_api, _emulatorIdentity.Current);
+		});
+	}
+
 	internal McpServiceResult<T> ExecuteOwned<T>(
 		long leaseId,
 		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
