@@ -1233,9 +1233,6 @@ internal sealed class McpEmulatorService : IDisposable
 		_gate.ExecuteTerminalCleanup(CleanupDebuggerResourcesCore);
 	}
 
-	internal bool CleanupDebuggerResources(TimeSpan timeout) =>
-		_gate.TryExecuteTerminalCleanup(timeout, CleanupDebuggerResourcesCore);
-
 	private McpServiceResult<bool> CleanupDebuggerResourcesCore()
 	{
 		lock(_executionLock) {
@@ -1331,8 +1328,16 @@ internal sealed class McpEmulatorService : IDisposable
 		_gate.ExecuteTerminalCleanup(CleanupExclusiveInputCore);
 	}
 
-	internal bool CleanupExclusiveInput(TimeSpan timeout) =>
-		_gate.TryExecuteTerminalCleanup(timeout, CleanupExclusiveInputCore);
+	internal void CleanupNativeResources()
+	{
+		_gate.ExecuteTerminalCleanup(() => {
+			try {
+				return CleanupDebuggerResourcesCore();
+			} finally {
+				CleanupExclusiveInputCore();
+			}
+		});
+	}
 
 	private McpServiceResult<bool> CleanupExclusiveInputCore()
 	{

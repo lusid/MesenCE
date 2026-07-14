@@ -714,8 +714,53 @@ public sealed class McpServerTests
 
 		releaseRead.Set();
 		await read.WaitAsync(TimeSpan.FromSeconds(5));
-		service.CleanupDebuggerResources();
-		service.CleanupExclusiveInput();
+		await server.NativeCleanupTask.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
+	public async Task AutomationStop_WhenAcquiredNativeCleanupBlocks_ReturnsBoundedAndCleanupFinishesExactlyOnce()
+	{
+		using ManualResetEventSlim cleanupEntered = new();
+		using ManualResetEventSlim releaseCleanup = new();
+		using ManualResetEventSlim cleanupExited = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.ClearExclusiveControllerOverridesHandler = () => {
+			cleanupEntered.Set();
+			releaseCleanup.Wait(TimeSpan.FromSeconds(5));
+			cleanupExited.Set();
+			throw new InvalidOperationException("native cleanup details");
+		};
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(api, breakpointCollection: breakpoints);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+
+		long started = Environment.TickCount64;
+		Task stop = Task.Run(() => server.Stop(TimeSpan.FromMilliseconds(200)));
+		Assert.True(cleanupEntered.Wait(TimeSpan.FromSeconds(5)));
+		Assert.False(stop.IsCompleted);
+		await stop.WaitAsync(TimeSpan.FromSeconds(2));
+		long elapsed = Environment.TickCount64 - started;
+
+		Assert.InRange(elapsed, 100, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+		Assert.False(server.NativeCleanupTask.IsCompleted);
+
+		started = Environment.TickCount64;
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+		Assert.InRange(Environment.TickCount64 - started, 0, 500);
+		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+
+		releaseCleanup.Set();
+		await server.NativeCleanupTask.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.True(cleanupExited.IsSet);
+		Assert.True(server.NativeCleanupTask.IsCompletedSuccessfully);
 		Assert.Equal(1, breakpoints.DisposeCalls);
 		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
 	}

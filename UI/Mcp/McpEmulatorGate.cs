@@ -159,23 +159,6 @@ internal sealed class McpEmulatorGate
 		}
 	}
 
-	internal bool TryExecuteTerminalCleanup<T>(TimeSpan timeout, Func<McpServiceResult<T>> operation)
-	{
-		if(timeout <= TimeSpan.Zero || !_emulatorSemaphore.Wait(timeout)) {
-			return false;
-		}
-		try {
-			try {
-				operation();
-			} catch(Exception) {
-				// Terminal native cleanup is best-effort and cannot prevent managed shutdown.
-			}
-			return true;
-		} finally {
-			_emulatorSemaphore.Release();
-		}
-	}
-
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, McpServiceResult<T>> operation,
 		Func<McpServiceResult<bool>>? preflight = null,
