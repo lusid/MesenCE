@@ -50,12 +50,15 @@ internal sealed class McpExecutionWaiter
 		McpStopResult result;
 		lock(_lock) {
 			active = _active;
-			if(active is null || (!active.WaitForAnyStop && active.CpuType != copied.SourceCpu)) {
+			if(active is null) {
 				return;
 			}
 			if(active.StateIdentity != stateIdentity) {
 				result = new(McpStopReason.StateChanged, null, null, true);
 			} else if(!active.WaitForAnyStop && copied.Source == BreakSource.PpuStep) {
+				if(active.CpuType != copied.SourceCpu) {
+					return;
+				}
 				result = new(McpStopReason.StepCompleted, active.FrameCount, null, true);
 			} else {
 				McpStopReason reason = copied.Source == BreakSource.Pause

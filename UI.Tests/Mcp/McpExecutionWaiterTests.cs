@@ -29,7 +29,7 @@ public sealed class McpExecutionWaiterTests
 	}
 
 	[Fact]
-	public async Task StepAndWait_IgnoresOtherCpuAndPpuFrameDone()
+	public async Task StepAndWait_IgnoresOtherCpuPpuStepAndPpuFrameDone()
 	{
 		FakeMcpEmulatorApi api = CreateApi();
 		using McpEmulatorService service = CreateService(api);
@@ -43,6 +43,53 @@ public sealed class McpExecutionWaiterTests
 
 		SendBreak(service, new BreakEvent { Source = BreakSource.PpuStep, SourceCpu = CpuType.Nes });
 		Assert.Equal(McpStopReason.StepCompleted, (await wait).Reason);
+	}
+
+	[Fact]
+	public async Task StepAndWait_CrossCpuNonPpuStepInterruptsAndPreservesCopiedContext()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		using McpEmulatorService service = CreateService(api);
+		await using McpExecutionLease lease = await AcquireAsync(service);
+		Task<McpStopResult> wait = service.StepAndWaitAsync(
+			lease.LeaseId, CpuType.Nes, 8, service.EmulatorIdentity.Current, TimeSpan.FromMilliseconds(50), CancellationToken.None);
+		BreakEvent original = new() {
+			Source = BreakSource.Breakpoint,
+			SourceCpu = CpuType.Spc,
+			BreakpointId = 91,
+			Operation = new MemoryOperationInfo { Address = 0x3456, Value = 0x72, MemType = MemoryType.SpcMemory }
+		};
+
+		SendBreak(service, original);
+
+		McpStopResult result = await wait;
+		Assert.Equal(McpStopReason.Breakpoint, result.Reason);
+		Assert.Null(result.CompletedFrames);
+		Assert.Equal(original.SourceCpu, result.BreakEvent?.SourceCpu);
+		Assert.Equal(original.BreakpointId, result.BreakEvent?.BreakpointId);
+		Assert.Equal(original.Operation.Address, result.BreakEvent?.Operation.Address);
+	}
+
+	[Fact]
+	public async Task StepAndWait_MismatchedIdentityCodeBreakCompletesStateChangedWithoutStaleContext()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		using McpEmulatorService service = CreateService(api);
+		await using McpExecutionLease lease = await AcquireAsync(service);
+		Task<McpStopResult> wait = service.StepAndWaitAsync(
+			lease.LeaseId, CpuType.Nes, 8, service.EmulatorIdentity.Current, TimeSpan.FromMilliseconds(50), CancellationToken.None);
+		service.EmulatorIdentity.NotifyMutableStateChanged();
+
+		SendBreak(service, new BreakEvent {
+			Source = BreakSource.Breakpoint,
+			SourceCpu = CpuType.Spc,
+			BreakpointId = 45
+		});
+
+		McpStopResult result = await wait;
+		Assert.Equal(McpStopReason.StateChanged, result.Reason);
+		Assert.Null(result.CompletedFrames);
+		Assert.Null(result.BreakEvent);
 	}
 
 	[Fact]
