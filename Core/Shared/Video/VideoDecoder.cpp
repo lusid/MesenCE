@@ -109,9 +109,8 @@ void VideoDecoder::DecodeFrame(bool forRewind)
 	}
 
 	videoFilter->SetBaseFrameInfo(_baseFrameSize);
-	FrameInfo frameSize = videoFilter->SendFrame((uint16_t*)_frame.FrameBuffer, _frame.FrameNumber, _frame.VideoPhase, _frame.Data);
-
-	uint32_t* outputBuffer = videoFilter->GetOutputBuffer();
+	uint32_t* outputBuffer = nullptr;
+	FrameInfo frameSize = videoFilter->SendFrameWithHud((uint16_t*)_frame.FrameBuffer, _frame.FrameNumber, _frame.VideoPhase, _frame.Data, _emu->GetDebugHud(), &outputBuffer);
 
 	OverscanDimensions overscan = videoFilter->GetOverscan();
 
@@ -123,8 +122,6 @@ void VideoDecoder::DecodeFrame(bool forRewind)
 			frameSize = _rotateFilter->GetFrameInfo(frameSize);
 		}
 	}
-
-	_emu->GetDebugHud()->Draw(outputBuffer, frameSize, overscan, _frame.FrameNumber, videoFilter->GetScaleFactor());
 
 	if(_scaleFilter && !isAudioPlayer) {
 		outputBuffer = _scaleFilter->ApplyFilter(outputBuffer, frameSize.Width, frameSize.Height);

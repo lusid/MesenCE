@@ -4,6 +4,7 @@
 #include "Shared/SettingTypes.h"
 
 class Emulator;
+class DebugHud;
 
 struct ScreenshotCapture
 {
@@ -17,6 +18,7 @@ class BaseVideoFilter
 {
 private:
 	uint32_t* _outputBuffer = nullptr;
+	uint32_t* _displayBuffer = nullptr;
 	double _yiqToRgbMatrix[6] = {};
 	uint32_t _bufferSize = 0;
 	SimpleLock _frameLock;
@@ -54,6 +56,7 @@ public:
 
 	uint32_t* GetOutputBuffer();
 	FrameInfo SendFrame(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, bool enableOverscan = true);
+	FrameInfo SendFrameWithHud(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, DebugHud* debugHud, uint32_t** displayBuffer, bool enableOverscan = true);
 	void TakeScreenshot(string romName, VideoFilterType filterType);
 	void TakeScreenshot(VideoFilterType filterType, string filename, std::stringstream* stream = nullptr);
 	ScreenshotCapture CaptureScreenshot(VideoFilterType filterType);

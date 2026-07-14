@@ -3,6 +3,7 @@
 #include "Shared/EmuSettings.h"
 #include "Shared/MessageManager.h"
 #include "Shared/Video/BaseVideoFilter.h"
+#include "Shared/Video/DebugHud.h"
 #include "Shared/Video/RotateFilter.h"
 #include "Shared/Video/ScaleFilter.h"
 #include "Shared/Video/ScanlineFilter.h"
@@ -30,6 +31,7 @@ BaseVideoFilter::~BaseVideoFilter()
 {
 	auto lock = _frameLock.AcquireSafe();
 	delete[] _outputBuffer;
+	delete[] _displayBuffer;
 }
 
 void BaseVideoFilter::SetBaseFrameInfo(FrameInfo frameInfo)
@@ -50,10 +52,14 @@ void BaseVideoFilter::UpdateBufferSize()
 {
 	uint32_t newBufferSize = _frameInfo.Width * _frameInfo.Height;
 	if(_bufferSize != newBufferSize) {
+		unique_ptr<uint32_t[]> outputBuffer(new uint32_t[newBufferSize]);
+		unique_ptr<uint32_t[]> displayBuffer(new uint32_t[newBufferSize]);
 		_frameLock.Acquire();
 		delete[] _outputBuffer;
+		delete[] _displayBuffer;
 		_bufferSize = newBufferSize;
-		_outputBuffer = new uint32_t[newBufferSize];
+		_outputBuffer = outputBuffer.release();
+		_displayBuffer = displayBuffer.release();
 		_frameLock.Release();
 	}
 }
@@ -100,6 +106,11 @@ FrameInfo BaseVideoFilter::GetFrameInfo(uint16_t* ppuOutputBuffer, bool enableOv
 
 FrameInfo BaseVideoFilter::SendFrame(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, bool enableOverscan)
 {
+	return SendFrameWithHud(ppuOutputBuffer, frameNumber, videoPhase, frameData, nullptr, nullptr, enableOverscan);
+}
+
+FrameInfo BaseVideoFilter::SendFrameWithHud(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, DebugHud* debugHud, uint32_t** displayBuffer, bool enableOverscan)
+{
 	auto lock = _frameLock.AcquireSafe();
 	_overscan = enableOverscan ? _emu->GetSettings()->GetOverscan() : OverscanDimensions {};
 	_isOddFrame = frameNumber % 2;
@@ -112,6 +123,13 @@ FrameInfo BaseVideoFilter::SendFrame(uint16_t* ppuOutputBuffer, uint32_t frameNu
 	_frameInfo = frameInfo;
 	UpdateBufferSize();
 	ApplyFilter(ppuOutputBuffer);
+	if(debugHud) {
+		debugHud->Draw(_outputBuffer, frameInfo, _overscan, frameNumber, GetScaleFactor());
+	}
+	if(displayBuffer) {
+		memcpy(_displayBuffer, _outputBuffer, _bufferSize * sizeof(uint32_t));
+		*displayBuffer = _displayBuffer;
+	}
 	_ppuOutputBuffer = nullptr;
 	return frameInfo;
 }
@@ -265,8 +283,8 @@ ScreenshotCapture BaseVideoFilter::CaptureScreenshot(VideoFilterType filterType)
 	if(scaleFilter) {
 		uint32_t filterScale = scaleFilter->GetScale();
 		if(filterScale == 0 || frameInfo.Width > MaxScreenshotDimension / filterScale || frameInfo.Height > MaxScreenshotDimension / filterScale) {
-			capture.Width = filterScale == 0 ? 0 : frameInfo.Width * filterScale;
-			capture.Height = filterScale == 0 ? 0 : frameInfo.Height * filterScale;
+			capture.Width = 0;
+			capture.Height = 0;
 			return capture;
 		}
 		FrameInfo scaledFrameInfo = scaleFilter->GetFrameInfo(frameInfo);

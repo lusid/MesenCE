@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using Mesen.Interop;
 using Mesen.Mcp;
 
@@ -6,6 +7,12 @@ namespace UI.Tests.Mcp;
 
 public sealed class McpNativeInteropTests
 {
+	private static string ReadRepositoryFile(string relativePath, [CallerFilePath] string testFile = "")
+	{
+		string repositoryRoot = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(testFile)!, "..", ".."));
+		return File.ReadAllText(Path.Combine(repositoryRoot, relativePath));
+	}
+
 	[Fact]
 	public void SaveStateInteropApiResult_HasFixedNumericValues()
 	{
@@ -207,5 +214,34 @@ public sealed class McpNativeInteropTests
 		Assert.Equal(png, capture.Value?.Png);
 		Assert.Equal("no_frame", noFrameApi.CaptureScreenshot().Error?.Code);
 		Assert.Equal("encoding_failed", encodeFailureApi.CaptureScreenshot().Error?.Code);
+	}
+
+	[Fact]
+	public void ScreenshotNativeCapture_HudDrawAndDisplayCopyAreInsideFrameLock()
+	{
+		string filter = ReadRepositoryFile("Core/Shared/Video/BaseVideoFilter.cpp");
+		string decoder = ReadRepositoryFile("Core/Shared/Video/VideoDecoder.cpp");
+		int methodStart = filter.IndexOf("BaseVideoFilter::SendFrameWithHud", StringComparison.Ordinal);
+		int lockIndex = filter.IndexOf("_frameLock.AcquireSafe()", methodStart, StringComparison.Ordinal);
+		int filterIndex = filter.IndexOf("ApplyFilter(ppuOutputBuffer)", lockIndex, StringComparison.Ordinal);
+		int hudIndex = filter.IndexOf("debugHud->Draw", filterIndex, StringComparison.Ordinal);
+		int copyIndex = filter.IndexOf("memcpy(_displayBuffer", hudIndex, StringComparison.Ordinal);
+
+		Assert.True(methodStart >= 0 && lockIndex > methodStart);
+		Assert.True(filterIndex > lockIndex && hudIndex > filterIndex && copyIndex > hudIndex);
+		Assert.Contains("SendFrameWithHud", decoder);
+		Assert.DoesNotContain("GetDebugHud()->Draw", decoder);
+		Assert.DoesNotContain("videoFilter->GetOutputBuffer()", decoder);
+	}
+
+	[Fact]
+	public void ScreenshotNativeCapture_InvalidScaleDoesNotMultiplyFailureMetadata()
+	{
+		string filter = ReadRepositoryFile("Core/Shared/Video/BaseVideoFilter.cpp");
+
+		Assert.Contains("capture.Width = 0;", filter);
+		Assert.Contains("capture.Height = 0;", filter);
+		Assert.DoesNotContain("capture.Width = filterScale == 0 ? 0 : frameInfo.Width * filterScale", filter);
+		Assert.DoesNotContain("capture.Height = filterScale == 0 ? 0 : frameInfo.Height * filterScale", filter);
 	}
 }
