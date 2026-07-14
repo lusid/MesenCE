@@ -96,6 +96,8 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public uint LastWriteStart { get; private set; }
 	public byte[]? LastWriteData { get; private set; }
 	public McpExclusiveControllerState? LastExclusiveControllerState { get; private set; }
+	public List<McpExclusiveControllerState> ExclusiveControllerStates { get; } = [];
+	public List<string> NativeCallLog { get; } = [];
 
 	public static FakeMcpEmulatorApi RunningNes() => new() {
 		Running = true,
@@ -211,6 +213,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public void Step(CpuType cpuType, int instructionCount, StepType type)
 	{
 		StepCalls++;
+		NativeCallLog.Add($"step:{instructionCount}");
 		StepHandler?.Invoke(cpuType, instructionCount, type);
 	}
 
@@ -299,12 +302,14 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public McpServiceResult<bool> LoadSaveState(byte[] data)
 	{
 		LoadSaveStateCalls++;
+		NativeCallLog.Add("load-state");
 		return LoadSaveStateHandler?.Invoke(data) ?? McpServiceResult<bool>.Success(true);
 	}
 
 	public McpServiceResult<McpScreenshotCapture> CaptureScreenshot()
 	{
 		CaptureScreenshotCalls++;
+		NativeCallLog.Add("screenshot");
 		return CaptureScreenshotHandler?.Invoke()
 			?? McpServiceResult<McpScreenshotCapture>.Failure("no_frame", "No decoded video frame is available.");
 	}
@@ -319,12 +324,15 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	{
 		SetExclusiveControllerOverrideCalls++;
 		LastExclusiveControllerState = state;
+		ExclusiveControllerStates.Add(state);
+		NativeCallLog.Add($"input:{state.Port}:{string.Join(',', state.Values.Select(value => value.ControlId))}");
 		return SetExclusiveControllerOverrideHandler?.Invoke(state) ?? true;
 	}
 
 	public void ClearExclusiveControllerOverrides()
 	{
 		ClearExclusiveControllerOverridesCalls++;
+		NativeCallLog.Add("clear-input");
 		ClearExclusiveControllerOverridesHandler?.Invoke();
 	}
 }

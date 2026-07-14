@@ -187,6 +187,24 @@ internal abstract class McpResourceStore<T> : IDisposable where T : class
 		}
 	}
 
+	protected McpServiceResult<T> InspectResource(string id)
+	{
+		lock(_sync) {
+			ThrowIfDisposed();
+			long now = _clock.GetTimestamp();
+			Sweep(now);
+			if(!_entries.TryGetValue(id, out Entry? entry)) {
+				return NotFound<T>(id);
+			}
+			if(entry.IsStale || entry.Current is null) {
+				return Stale<T>(id);
+			}
+
+			entry.LastUsed = now;
+			return McpServiceResult<T>.Success(entry.Current.Value);
+		}
+	}
+
 	protected McpServiceResult<McpDeleteResourceResult> DeleteResource(string id)
 	{
 		lock(_sync) {

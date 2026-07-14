@@ -23,6 +23,7 @@ internal sealed class McpSaveStateStore : McpResourceStore<McpSaveStateResource>
 	}
 
 	internal McpServiceResult<McpPinnedResource<McpSaveStateResource>> Pin(string id) => PinResource(id);
+	internal McpServiceResult<McpSaveStateResource> Inspect(string id) => InspectResource(id);
 
 	internal McpServiceResult<McpDeleteResourceResult> Delete(string id) => DeleteResource(id);
 

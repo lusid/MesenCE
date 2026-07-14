@@ -20,6 +20,7 @@ internal sealed class McpServer : IDisposable
 	private readonly object _lifecycleLock = new();
 	private readonly McpEmulatorService _service;
 	private readonly McpAutomationService _automationService;
+	private readonly McpExperimentService _experimentService;
 	private readonly McpSaveStateStore _saveStates;
 	private readonly McpMemorySnapshotStore _memorySnapshots;
 	private readonly McpMemorySearchStore _memorySearches;
@@ -50,11 +51,13 @@ internal sealed class McpServer : IDisposable
 		_memorySnapshots = new();
 		_memorySearches = new();
 		_automationService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
+		_experimentService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
 		_toolLog = toolLog ?? Log;
 		_applicationCleanup = applicationCleanup ?? StopAndDisposeApplicationAsync;
 	}
 
 	internal McpAutomationService AutomationService => _automationService;
+	internal McpExperimentService ExperimentService => _experimentService;
 	internal McpEmulatorIdentity EmulatorIdentity => _service.EmulatorIdentity;
 	internal McpSaveStateStore SaveStates => _saveStates;
 	internal McpMemorySnapshotStore MemorySnapshots => _memorySnapshots;

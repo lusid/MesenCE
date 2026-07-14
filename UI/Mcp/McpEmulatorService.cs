@@ -544,6 +544,11 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 
 		if(!setup.IsSuccess) {
+			if(waiter?.Completion.Task.IsCompletedSuccessfully == true) {
+				McpStopResult completed = waiter.Completion.Task.Result;
+				waiter.Dispose();
+				return completed;
+			}
 			waiter?.Dispose();
 			return StopFailure(setup.Error!.Code);
 		}
@@ -569,7 +574,10 @@ internal sealed class McpEmulatorService : IDisposable
 		}
 	}
 
-	internal async Task<McpStopResult> EnsureStoppedAsync(long leaseId, TimeSpan remainingBudget)
+	internal async Task<McpStopResult> EnsureStoppedAsync(
+		long leaseId,
+		TimeSpan remainingBudget,
+		bool quarantineOnFailure = true)
 	{
 		McpExecutionWaiter.Registration? waiter = null;
 		bool alreadyStopped = false;
@@ -596,7 +604,9 @@ internal sealed class McpEmulatorService : IDisposable
 		}
 		if(!setup.IsSuccess || waiter is null) {
 			waiter?.Dispose();
-			_executionCoordinator.EnterQuarantineForOwner(leaseId);
+			if(quarantineOnFailure) {
+				_executionCoordinator.EnterQuarantineForOwner(leaseId);
+			}
 			return StopFailure(setup.Error!.Code);
 		}
 
@@ -619,7 +629,9 @@ internal sealed class McpEmulatorService : IDisposable
 			}
 		}
 
-		_executionCoordinator.EnterQuarantineForOwner(leaseId);
+		if(quarantineOnFailure) {
+			_executionCoordinator.EnterQuarantineForOwner(leaseId);
+		}
 		return _executionCoordinator.ShutdownToken.IsCancellationRequested || IsServiceStopping()
 			? new(McpStopReason.ServerStopping, null, null, false)
 			: new(McpStopReason.Timeout, null, null, false);
@@ -1473,6 +1485,35 @@ internal sealed class McpEmulatorService : IDisposable
 		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
 	{
 		return Execute(() => operation(_api, _emulatorIdentity.Current));
+	}
+
+	internal McpServiceResult<T> ExecuteOwned<T>(
+		long leaseId,
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteOwned(leaseId, () => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(_api, _emulatorIdentity.Current);
+		});
+	}
+
+	internal McpServiceResult<BreakContext> GetOwnedBreakContext(long leaseId, BreakEvent breakEvent)
+	{
+		return ExecuteOwned(leaseId, (api, _) => {
+			if(!api.IsExecutionStopped()) {
+				return McpServiceResult<BreakContext>.Failure("stale_context", "No current stopped break context is available.");
+			}
+			long? stableBreakpointId = _breakpointCollection.TryGetStableId(breakEvent.BreakpointId, out long stableId)
+				? stableId
+				: null;
+			return BuildBreakContext(breakEvent, stableBreakpointId, _gate.Generation, 8, 8, McpDebuggerLimits.MaxCallStackDepth);
+		});
 	}
 
 	internal McpServiceResult<T> ExecuteOwnedStateLoad<T>(
