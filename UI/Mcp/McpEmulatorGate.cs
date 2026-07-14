@@ -4,6 +4,7 @@ using System.Threading;
 namespace Mesen.Mcp;
 
 internal readonly record struct McpOperationTicket(long Generation, ulong DebuggerBlockState);
+internal sealed record McpStateLoadPostflight<T>(T Value, McpOperationTicket Ticket);
 
 internal sealed class McpEmulatorGate
 {
@@ -34,7 +35,9 @@ internal sealed class McpEmulatorGate
 		Func<Action<Action<bool>>, McpServiceResult<T>> operation,
 		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null)
 	{
-		return ExecuteLocked((_, _, registerCompletion) => operation(registerCompletion), postflight: postflight);
+		return ExecuteLocked(
+			(_, _, registerCompletion) => operation(registerCompletion),
+			postflight: postflight is null ? null : (initial, _, result) => postflight(initial, result));
 	}
 
 	internal McpServiceResult<T> ExecuteMutation<T>(McpExecutionMutation mutation, Func<McpServiceResult<T>> operation)
@@ -56,16 +59,21 @@ internal sealed class McpEmulatorGate
 		return ExecuteLocked(_ => operation(), preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId));
 	}
 
-	internal McpServiceResult<T> ExecuteOwnedStateLoad<T>(
+	internal McpServiceResult<McpStateLoadPostflight<T>> ExecuteOwnedStateLoad<T>(
 		long leaseId,
 		Func<McpOperationTicket, McpServiceResult<T>> operation)
 	{
-		return ExecuteLocked(
+		McpOperationTicket endingTicket = default;
+		McpServiceResult<T> result = ExecuteLocked(
 			operation,
 			preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId),
-			postflight: (ticket, result) => Volatile.Read(ref _emulatorGeneration) ==
-				ticket.Generation + (result.IsSuccess ? 1 : 0),
-			allowDebuggerBlockStateChangeOnSuccess: true);
+			postflight: (initial, ending, operationResult) => ending.Generation ==
+				initial.Generation + (operationResult.IsSuccess ? 1 : 0),
+			allowDebuggerBlockStateChangeOnSuccess: true,
+			acceptedPostflight: ticket => endingTicket = ticket);
+		return result.IsSuccess
+			? McpServiceResult<McpStateLoadPostflight<T>>.Success(new(result.Value!, endingTicket))
+			: McpServiceResult<McpStateLoadPostflight<T>>.Failure(result.Error!.Code, result.Error.Message);
 	}
 
 	internal McpServiceResult<T> ExecuteOwnedWithDebuggerLease<T>(
@@ -170,35 +178,39 @@ internal sealed class McpEmulatorGate
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, McpServiceResult<T>> operation,
 		Func<McpServiceResult<bool>>? preflight = null,
-		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
-		bool allowDebuggerBlockStateChangeOnSuccess = false)
+		Func<McpOperationTicket, McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
+		bool allowDebuggerBlockStateChangeOnSuccess = false,
+		Action<McpOperationTicket>? acceptedPostflight = null)
 	{
 		return ExecuteLocked(
 			(ticket, _, _) => operation(ticket), null, preflight, postflight,
-			allowDebuggerBlockStateChangeOnSuccess);
+			allowDebuggerBlockStateChangeOnSuccess, acceptedPostflight);
 	}
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation,
 		Action? acquireDebuggerLease,
 		Func<McpServiceResult<bool>>? preflight = null,
-		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
-		bool allowDebuggerBlockStateChangeOnSuccess = false)
+		Func<McpOperationTicket, McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
+		bool allowDebuggerBlockStateChangeOnSuccess = false,
+		Action<McpOperationTicket>? acceptedPostflight = null)
 	{
 		return ExecuteLocked(
 			(ticket, prepareDebuggerLease, _) => operation(ticket, prepareDebuggerLease),
 			acquireDebuggerLease,
 			preflight,
 			postflight,
-			allowDebuggerBlockStateChangeOnSuccess);
+			allowDebuggerBlockStateChangeOnSuccess,
+			acceptedPostflight);
 	}
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, Action<Action<bool>>, McpServiceResult<T>> operation,
 		Action? acquireDebuggerLease = null,
 		Func<McpServiceResult<bool>>? preflight = null,
-		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
-		bool allowDebuggerBlockStateChangeOnSuccess = false)
+		Func<McpOperationTicket, McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
+		bool allowDebuggerBlockStateChangeOnSuccess = false,
+		Action<McpOperationTicket>? acceptedPostflight = null)
 	{
 		_emulatorSemaphore.Wait();
 		try {
@@ -235,11 +247,13 @@ internal sealed class McpEmulatorGate
 				transactionCompletion?.Invoke(false);
 				return InteropFailure<T>();
 			}
+			McpOperationTicket initialTicket = new(generation, debuggerBlockState);
+			McpOperationTicket endingTicket = new(Volatile.Read(ref _emulatorGeneration), endingDebuggerBlockState);
 			bool postflightValid;
 			try {
 				postflightValid = (postflight is null
-						? generation == Volatile.Read(ref _emulatorGeneration)
-						: postflight(new(generation, debuggerBlockState), result))
+						? initialTicket.Generation == endingTicket.Generation
+						: postflight(initialTicket, endingTicket, result))
 					&& Volatile.Read(ref _transitionActive) == 0
 					&& (debuggerBlockState == endingDebuggerBlockState
 						|| (allowDebuggerBlockStateChangeOnSuccess && result.IsSuccess))
@@ -253,6 +267,9 @@ internal sealed class McpEmulatorGate
 				return StateChanged<T>();
 			}
 			transactionCompletion?.Invoke(result.IsSuccess);
+			if(result.IsSuccess) {
+				acceptedPostflight?.Invoke(endingTicket);
+			}
 			return result;
 
 			void RegisterTransactionCompletion(Action<bool> completion)

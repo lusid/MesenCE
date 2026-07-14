@@ -49,3 +49,5 @@ internal sealed record McpControllerControl(string Id, int NativeId, bool IsNume
 internal sealed record McpControllerTopology(int Index, int PhysicalPort, ControllerType DeviceType, IReadOnlyList<McpControllerControl> Controls);
 internal sealed record McpControllerValue(int ControlId, int Value);
 internal sealed record McpExclusiveControllerState(int NativeIndex, int Port, IReadOnlyList<McpControllerValue> Values, bool Enabled = true);
+internal sealed record McpAutomationStateContext(McpStateIdentity Identity, McpOperationTicket Ticket);
+internal sealed record McpOwnedSaveStateLoad(McpSaveStateLoadResult Result, McpAutomationStateContext Context);

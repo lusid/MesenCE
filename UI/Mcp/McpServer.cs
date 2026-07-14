@@ -53,7 +53,8 @@ internal sealed class McpServer : IDisposable
 		_memorySnapshots = new();
 		_memorySearches = new();
 		_automationService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
-		_experimentService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
+		_experimentService = new(
+			service, new McpAutomationAdapterRegistry(service.Api), _saveStates, _automationService);
 		_memorySnapshotService = new(service, _memorySnapshots);
 		_memorySearchService = new(service, _memorySearches);
 		_toolLog = toolLog ?? Log;

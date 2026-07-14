@@ -241,6 +241,37 @@ public sealed class McpEmulatorGateTests
 	}
 
 	[Fact]
+	public async Task ExecuteOwnedStateLoad_ReturnsExactAcceptedEndingTicketAndRejectsLaterChange()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(api, coordinator);
+		McpServiceResult<McpExecutionLease> acquisition =
+			await coordinator.TryAcquireAsync(CancellationToken.None);
+		Assert.True(acquisition.IsSuccess, acquisition.Error?.Code);
+		await using McpExecutionLease lease = acquisition.Value!;
+
+		McpServiceResult<McpStateLoadPostflight<int>> load = gate.ExecuteOwnedStateLoad(
+			lease.LeaseId,
+			_ => {
+				api.SetDebuggerRequestBlocked(true);
+				gate.NotifyEmulatorStateChanged();
+				api.SetDebuggerRequestBlocked(false);
+				return McpServiceResult<int>.Success(7);
+			});
+
+		Assert.True(load.IsSuccess, load.Error?.Code);
+		Assert.Equal(7, load.Value!.Value);
+		Assert.Equal(gate.CaptureTicket().Value, load.Value.Ticket);
+		Assert.True(gate.ExecuteOwnedForTicket(
+			lease.LeaseId, load.Value.Ticket, () => McpServiceResult<bool>.Success(true)).IsSuccess);
+
+		gate.NotifyEmulatorStateChanged();
+		Assert.Equal("state_changed", gate.ExecuteOwnedForTicket(
+			lease.LeaseId, load.Value.Ticket, () => McpServiceResult<bool>.Success(true)).Error?.Code);
+	}
+
+	[Fact]
 	public void Execute_WhenOperationThrows_ReturnsSanitizedInteropFailure()
 	{
 		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes());

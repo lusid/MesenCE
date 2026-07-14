@@ -66,37 +66,55 @@ internal sealed class McpAutomationService
 			return ForwardFailure<McpSaveStateLoadResult, McpPinnedResource<McpSaveStateResource>>(pinResult);
 		}
 		using McpPinnedResource<McpSaveStateResource> pin = pinResult.Value!;
-		return _emulator.ExecuteOwnedStateLoad(executionLease.LeaseId, (api, identity) => {
+		McpServiceResult<McpOwnedSaveStateLoad> load = LoadOwnedSaveState(
+			executionLease.LeaseId, id, pin.Value, cancellationToken);
+		return load.IsSuccess
+			? McpServiceResult<McpSaveStateLoadResult>.Success(load.Value!.Result)
+			: ForwardFailure<McpSaveStateLoadResult, McpOwnedSaveStateLoad>(load);
+	}
+
+	internal McpServiceResult<McpOwnedSaveStateLoad> LoadOwnedSaveState(
+		long leaseId,
+		string id,
+		McpSaveStateResource state,
+		CancellationToken cancellationToken)
+	{
+		McpServiceResult<McpStateLoadPostflight<OwnedLoadIdentity>> load =
+			_emulator.ExecuteOwnedStateLoad(leaseId, (api, identity) => {
 			if(!api.IsRunning()) {
-				return NoGame<McpSaveStateLoadResult>();
+				return NoGame<OwnedLoadIdentity>();
 			}
-			if(pin.Value.Identity.RomIdentity != identity.RomIdentity) {
-				return McpServiceResult<McpSaveStateLoadResult>.Failure(
+			if(state.Identity.RomIdentity != identity.RomIdentity) {
+				return McpServiceResult<OwnedLoadIdentity>.Failure(
 					"stale_resource", $"Resource '{id}' is no longer compatible with the active ROM or memory topology.");
 			}
 			if(cancellationToken.IsCancellationRequested) {
-				return McpServiceResult<McpSaveStateLoadResult>.Failure("cancelled", "The operation was cancelled.");
+				return McpServiceResult<OwnedLoadIdentity>.Failure("cancelled", "The operation was cancelled.");
 			}
 
-			long previousGeneration = identity.MutableStateGeneration;
-			McpServiceResult<bool> load = api.LoadSaveState(pin.Value.Data);
-			if(!load.IsSuccess) {
-				return ForwardFailure<McpSaveStateLoadResult, bool>(load);
+			McpServiceResult<bool> nativeLoad = api.LoadSaveState(state.Data);
+			if(!nativeLoad.IsSuccess) {
+				return ForwardFailure<OwnedLoadIdentity, bool>(nativeLoad);
 			}
 			McpStateIdentity current = _emulator.EmulatorIdentity.Current;
 			if(current.RomIdentity != identity.RomIdentity ||
-				current.MutableStateGeneration != previousGeneration + 1 ||
+				current.MutableStateGeneration != identity.MutableStateGeneration + 1 ||
 				current.StateLoadedSequence != identity.StateLoadedSequence + 1) {
-				return McpServiceResult<McpSaveStateLoadResult>.Failure(
+				return McpServiceResult<OwnedLoadIdentity>.Failure(
 					"state_changed", "Emulator state changed unexpectedly during the operation.");
 			}
-			return McpServiceResult<McpSaveStateLoadResult>.Success(new(
-				id,
-				current.RomIdentity,
-				previousGeneration,
-				current.MutableStateGeneration,
-				api.IsPaused() ? "paused" : "running"));
+			return McpServiceResult<OwnedLoadIdentity>.Success(new(
+				identity, current, api.IsPaused() ? "paused" : "running"));
 		});
+		if(!load.IsSuccess) {
+			return ForwardFailure<McpOwnedSaveStateLoad, McpStateLoadPostflight<OwnedLoadIdentity>>(load);
+		}
+		McpStateLoadPostflight<OwnedLoadIdentity> postflight = load.Value!;
+		OwnedLoadIdentity value = postflight.Value;
+		return McpServiceResult<McpOwnedSaveStateLoad>.Success(new(
+			new(id, value.Current.RomIdentity, value.Previous.MutableStateGeneration,
+				value.Current.MutableStateGeneration, value.State),
+			new(value.Current, postflight.Ticket)));
 	}
 
 	internal McpServiceResult<McpDeleteResourceResult> DeleteSaveState(string id) =>
@@ -140,4 +158,9 @@ internal sealed class McpAutomationService
 
 	private static McpServiceResult<T> ForwardFailure<T, TSource>(McpServiceResult<TSource> source) =>
 		McpServiceResult<T>.Failure(source.Error!.Code, source.Error.Message);
+
+	private sealed record OwnedLoadIdentity(
+		McpStateIdentity Previous,
+		McpStateIdentity Current,
+		string State);
 }
