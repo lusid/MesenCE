@@ -174,6 +174,7 @@ void BaseControlManager::UpdateInputState()
 		//log += "|" + device->GetTextState();
 	}
 
+	// Debugger-owned exclusive overrides run only after host and provider input is complete.
 	_emu->ProcessEvent(EventType::InputPolled, _cpuType);
 
 	if(!_emu->IsRunAheadFrame()) {

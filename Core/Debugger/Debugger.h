@@ -16,6 +16,7 @@ class SnesMemoryManager;
 class InternalRegisters;
 class SnesDmaController;
 class EmuSettings;
+class BaseControlDevice;
 
 class ExpressionEvaluator;
 class MemoryDumper;
@@ -40,6 +41,27 @@ class ISerializable;
 
 struct TraceRow;
 struct BaseState;
+
+struct InteropControllerInfo
+{
+	int32_t Index;
+	int32_t Port;
+	int32_t DeviceType;
+	int32_t ControlCount;
+};
+
+struct InteropControllerControlInfo
+{
+	int32_t ControlId;
+	int32_t IsNumeric;
+	int32_t NameLength;
+};
+
+struct InteropControllerValue
+{
+	int32_t ControlId;
+	int32_t Value;
+};
 
 enum class EventType;
 enum class MemoryOperationType;
@@ -84,6 +106,14 @@ private:
 	atomic<uint32_t> _suspendRequestCount;
 
 	DebugControllerState _inputOverrides[8] = {};
+	struct ExclusiveControllerOverride
+	{
+		bool Enabled = false;
+		weak_ptr<BaseControlDevice> Device;
+		vector<InteropControllerValue> Values;
+	};
+	SimpleLock _exclusiveInputLock;
+	ExclusiveControllerOverride _exclusiveInputOverrides[8];
 
 	bool _waitForBreakResume = false;
 
@@ -174,6 +204,11 @@ public:
 
 	void SetInputOverrides(uint32_t index, DebugControllerState state);
 	void GetAvailableInputOverrides(uint8_t* availableIndexes);
+	uint32_t GetControllerCount();
+	bool GetControllerInfo(uint32_t ordinal, InteropControllerInfo& info);
+	bool GetControllerControlInfo(uint32_t index, uint32_t controlIndex, InteropControllerControlInfo& info, string& name);
+	bool SetExclusiveControllerOverride(uint32_t index, int32_t enabled, InteropControllerValue* values, uint32_t valueCount);
+	void ClearExclusiveControllerOverrides();
 
 	void Log(string message);
 	string GetLog();

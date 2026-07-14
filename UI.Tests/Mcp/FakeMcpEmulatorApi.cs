@@ -24,6 +24,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public CodeLineData[] DisassemblyOutput { get; init; } = [new(CpuType.Nes) { Address = 0x8000 }];
 	public StackFrameInfo[] Callstack { get; init; } = [new()];
 	public TraceRow[] ExecutionTrace { get; init; } = [];
+	public IReadOnlyList<McpControllerTopology> ControllerTopology { get; set; } = [];
 	public int ThrowOnDebuggerRequestBlockStateCall { get; set; }
 
 	public Func<bool>? IsRunningHandler { get; set; }
@@ -51,6 +52,12 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public Action? ClearExecutionTraceHandler { get; set; }
 	public Func<uint>? GetExecutionTraceSizeHandler { get; set; }
 	public Func<uint, uint, TraceRow[]>? GetExecutionTraceHandler { get; set; }
+	public Func<McpServiceResult<byte[]>>? CreateSaveStateHandler { get; set; }
+	public Func<byte[], McpServiceResult<bool>>? LoadSaveStateHandler { get; set; }
+	public Func<McpServiceResult<McpScreenshotCapture>>? CaptureScreenshotHandler { get; set; }
+	public Func<IReadOnlyList<McpControllerTopology>>? GetControllerTopologyHandler { get; set; }
+	public Func<McpExclusiveControllerState, bool>? SetExclusiveControllerOverrideHandler { get; set; }
+	public Action? ClearExclusiveControllerOverridesHandler { get; set; }
 
 	public Action? OnRead { get; set; }
 	public int IsRunningCalls { get; private set; }
@@ -78,13 +85,23 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public int ClearExecutionTraceCalls { get; private set; }
 	public int GetExecutionTraceSizeCalls { get; private set; }
 	public int GetExecutionTraceCalls { get; private set; }
+	public int CreateSaveStateCalls { get; private set; }
+	public int LoadSaveStateCalls { get; private set; }
+	public int CaptureScreenshotCalls { get; private set; }
+	public int GetControllerTopologyCalls { get; private set; }
+	public int SetExclusiveControllerOverrideCalls { get; private set; }
+	public int ClearExclusiveControllerOverridesCalls { get; private set; }
 	public uint LastReadStart { get; private set; }
 	public uint LastReadEndInclusive { get; private set; }
 	public uint LastWriteStart { get; private set; }
 	public byte[]? LastWriteData { get; private set; }
+	public McpExclusiveControllerState? LastExclusiveControllerState { get; private set; }
+	public List<McpExclusiveControllerState> ExclusiveControllerStates { get; } = [];
+	public List<string> NativeCallLog { get; } = [];
 
-	public static FakeMcpEmulatorApi RunningNes() => new() {
+	public static FakeMcpEmulatorApi RunningNes(bool paused = false) => new() {
 		Running = true,
+		Paused = paused,
 		RomInfo = new RomInfo {
 			ConsoleType = ConsoleType.Nes,
 			RomPath = "game.nes",
@@ -197,6 +214,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public void Step(CpuType cpuType, int instructionCount, StepType type)
 	{
 		StepCalls++;
+		NativeCallLog.Add($"step:{instructionCount}");
 		StepHandler?.Invoke(cpuType, instructionCount, type);
 	}
 
@@ -274,5 +292,48 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	{
 		GetExecutionTraceCalls++;
 		return GetExecutionTraceHandler?.Invoke(startOffset, maxRowCount) ?? ExecutionTrace;
+	}
+
+	public McpServiceResult<byte[]> CreateSaveState()
+	{
+		CreateSaveStateCalls++;
+		return CreateSaveStateHandler?.Invoke() ?? McpServiceResult<byte[]>.Success([]);
+	}
+
+	public McpServiceResult<bool> LoadSaveState(byte[] data)
+	{
+		LoadSaveStateCalls++;
+		NativeCallLog.Add("load-state");
+		return LoadSaveStateHandler?.Invoke(data) ?? McpServiceResult<bool>.Success(true);
+	}
+
+	public McpServiceResult<McpScreenshotCapture> CaptureScreenshot()
+	{
+		CaptureScreenshotCalls++;
+		NativeCallLog.Add("screenshot");
+		return CaptureScreenshotHandler?.Invoke()
+			?? McpServiceResult<McpScreenshotCapture>.Failure("no_frame", "No decoded video frame is available.");
+	}
+
+	public IReadOnlyList<McpControllerTopology> GetControllerTopology()
+	{
+		GetControllerTopologyCalls++;
+		return GetControllerTopologyHandler?.Invoke() ?? ControllerTopology;
+	}
+
+	public bool SetExclusiveControllerOverride(McpExclusiveControllerState state)
+	{
+		SetExclusiveControllerOverrideCalls++;
+		LastExclusiveControllerState = state;
+		ExclusiveControllerStates.Add(state);
+		NativeCallLog.Add($"input:{state.Port}:{string.Join(',', state.Values.Select(value => value.ControlId))}");
+		return SetExclusiveControllerOverrideHandler?.Invoke(state) ?? true;
+	}
+
+	public void ClearExclusiveControllerOverrides()
+	{
+		ClearExclusiveControllerOverridesCalls++;
+		NativeCallLog.Add("clear-input");
+		ClearExclusiveControllerOverridesHandler?.Invoke();
 	}
 }

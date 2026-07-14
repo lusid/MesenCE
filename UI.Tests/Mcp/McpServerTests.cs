@@ -1,5 +1,7 @@
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using Mesen.Config;
 using Mesen.Debugger;
 using Mesen.Debugger.Utilities;
 using Mesen.Interop;
@@ -12,6 +14,37 @@ namespace UI.Tests.Mcp;
 
 public sealed class McpServerTests
 {
+	[Fact]
+	public void AutomationLifecycle_OwnsInvalidatesAndDisposesResourcesAndInputOnce()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		McpServer server = new(api);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		McpSaveStateMetadata state = server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).Value!;
+		McpMemorySnapshotMetadata snapshot = server.MemorySnapshots.Create(
+			"Nes", nameof(MemoryType.NesWorkRam), 0, [1], identity, DateTimeOffset.UnixEpoch).Value!;
+		string search = server.MemorySearches.Create(new(
+			"Nes", nameof(MemoryType.NesWorkRam), 0, 1, 1, false, "little", 1, identity,
+			new([1], [1], [0], 0, 0))).Value!;
+
+		server.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
+		Assert.True(server.MemorySnapshots.Pin(snapshot.Id).IsSuccess);
+		Assert.True(server.MemorySearches.Pin(search).IsSuccess);
+		server.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.GameLoaded });
+		Assert.Equal("stale_resource", server.SaveStates.Pin(state.Id).Error?.Code);
+		Assert.Equal("stale_resource", server.MemorySnapshots.Pin(snapshot.Id).Error?.Code);
+		Assert.Equal("stale_resource", server.MemorySearches.Pin(search).Error?.Code);
+
+		server.Stop(TimeSpan.FromSeconds(1));
+		server.CompleteCoreRelease();
+		server.Dispose();
+
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Throws<ObjectDisposedException>(() => server.MemorySnapshots.Pin("missing"));
+		Assert.Throws<ObjectDisposedException>(() => server.MemorySearches.Pin("missing"));
+	}
+
 	[Fact]
 	public async Task MainWindowNotification_ForwardsCodeBreakSynchronously()
 	{
@@ -71,7 +104,7 @@ public sealed class McpServerTests
 		);
 
 		Assert.Equal([
-			"disabled-config", "config", "start", "dispose", "core-stop", "listener-dispose", "core-release"
+			"disabled-config", "config", "start", "listener-dispose", "core-stop", "core-release", "dispose"
 		], events);
 	}
 
@@ -114,48 +147,36 @@ public sealed class McpServerTests
 		await start;
 		lifecycle.StopBeforeCoreRelease(() => { }, () => { }, () => { });
 
-		Assert.Equal(["dispose", "core-stop", "core-release"], events);
+		Assert.Equal(["core-stop", "core-release", "dispose"], events);
 	}
 
 	[Fact]
-	public async Task MainWindowLifecycle_DrainsActiveAndRejectsQueuedInteropBeforeCoreRelease()
+	public async Task MainWindowLifecycle_DetachesServerBeforeListenerAndCoreRelease()
 	{
-		using ManualResetEventSlim readEntered = new();
-		using ManualResetEventSlim releaseRead = new();
-		using ManualResetEventSlim readExited = new();
 		FakeMcpEmulatorApi api = CreateRunningApi();
-		api.OnRead = () => {
-			readEntered.Set();
-			releaseRead.Wait(TimeSpan.FromSeconds(5));
-			readExited.Set();
-		};
 		McpEmulatorService service = new(api);
 		using McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
 		MainWindowMcpLifecycle lifecycle = new(() => server, (_, _) => Task.CompletedTask, _ => { }, _ => { });
 		await lifecycle.StartAsync(true, 7342);
 
-		Task<McpServiceResult<MemoryRead>> active = Task.Run(() => service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1));
-		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
-		Task<McpServiceResult<EmulatorStatus>> queued = Task.Run(service.GetStatus);
-		await Task.Delay(100);
-		bool releasedBeforeDrain = false;
-		Task shutdown = Task.Run(() => lifecycle.StopBeforeCoreRelease(
-			() => { },
-			() => { },
-			() => releasedBeforeDrain = !readExited.IsSet
-		));
-		await Task.Delay(100);
-		Assert.False(shutdown.IsCompleted);
+		List<string> events = [];
+		lifecycle.StopBeforeCoreRelease(
+			() => {
+				events.Add("core-stop");
+				Assert.Equal("server_stopping", service.GetStatus().Error?.Code);
+				Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+			},
+			() => events.Add("listener-dispose"),
+			() => events.Add("core-release"));
 
-		releaseRead.Set();
-		await shutdown.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.False(releasedBeforeDrain);
-		Assert.True((await active).IsSuccess);
-		Assert.Equal("server_stopping", (await queued).Error!.Code);
+		Assert.Equal(["listener-dispose", "core-stop", "core-release"], events);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 	}
 
 	[Fact]
-	public async Task Discovery_ExposesExactlyNineteenToolsWithBoundedSchemasOnLoopbackMcpRoute()
+	public async Task Discovery_ExposesExactlyThirtyThreeToolsWithBoundedSchemasOnLoopbackMcpRoute()
 	{
 		using McpServer server = new(new McpEmulatorService(new FakeMcpEmulatorApi()));
 		await server.StartAsync(0);
@@ -169,11 +190,14 @@ public sealed class McpServerTests
 
 		Assert.Equal(
 			[
-				"configure_execution_trace", "continue_until_break", "disassemble", "get_break_context",
+				"capture_screenshot", "compare_memory_snapshots", "configure_execution_trace", "continue_until_break",
+				"create_memory_snapshot", "create_save_state", "delete_memory_search", "delete_memory_snapshot",
+				"delete_save_state", "disassemble", "get_automation_capabilities", "get_break_context",
 				"get_call_stack", "get_cpu_registers", "get_emulator_status", "get_execution_trace",
-				"list_breakpoints", "list_memory_spaces", "map_address", "pause", "read_memory",
-				"remove_all_breakpoints", "remove_breakpoint", "resume", "set_breakpoint", "step",
-				"write_memory"
+				"get_memory_search_results", "list_breakpoints", "list_memory_spaces", "load_save_state",
+				"map_address", "pause", "read_memory", "refine_memory_search", "remove_all_breakpoints",
+				"remove_breakpoint", "resume", "run_experiment", "set_breakpoint", "start_memory_search",
+				"step", "undo_memory_search", "write_memory"
 			],
 			[.. tools.Select(tool => tool.Name).Order()]
 		);
@@ -226,11 +250,78 @@ public sealed class McpServerTests
 			RequestProperties(tools, "get_execution_trace").GetProperty("maxRows").GetProperty("maximum").GetInt32()
 		);
 
+		AssertSchemaBound(tools, "create_memory_snapshot", "count", "minimum", 1);
+		AssertSchemaBound(tools, "create_memory_snapshot", "count", "maximum", McpAutomationLimits.MaxMemorySnapshotBytes);
+		AssertPagingSchema(tools, "compare_memory_snapshots");
+		AssertSchemaBound(tools, "compare_memory_snapshots", "sampleBytes", "minimum", 0);
+		AssertSchemaBound(tools, "compare_memory_snapshots", "sampleBytes", "maximum", McpAutomationLimits.MaxRunSampleBytes);
+		AssertSchemaBound(tools, "start_memory_search", "count", "minimum", 1);
+		AssertSchemaBound(tools, "start_memory_search", "count", "maximum", McpAutomationLimits.MaxSearchRangeBytes);
+		AssertSchemaBound(tools, "start_memory_search", "stride", "minimum", 1);
+		AssertSchemaBound(tools, "start_memory_search", "stride", "maximum", 4);
+		AssertSchemaEnum(tools, "start_memory_search", "width", 1, 2, 4);
+		AssertSchemaEnum(tools, "start_memory_search", "byteOrder", "little", "big");
+		AssertSchemaEnum(tools, "refine_memory_search", "comparison",
+			"exact", "not_equal", "increased", "decreased", "changed", "unchanged", "increased_by", "decreased_by");
+		AssertSchemaBound(tools, "refine_memory_search", "delta", "minimum", 1);
+		AssertPagingSchema(tools, "get_memory_search_results");
+		AssertResourceIdSchema(RequestProperties(tools, "load_save_state").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "delete_save_state").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "compare_memory_snapshots").GetProperty("firstId"));
+		AssertResourceIdSchema(RequestProperties(tools, "compare_memory_snapshots").GetProperty("secondId"));
+		AssertResourceIdSchema(RequestProperties(tools, "delete_memory_snapshot").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "refine_memory_search").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "get_memory_search_results").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "undo_memory_search").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "delete_memory_search").GetProperty("id"));
+
+		JsonElement experiment = RequestProperties(tools, "run_experiment");
+		AssertResourceIdSchema(experiment.GetProperty("saveStateId"), nullable: true);
+		Assert.Equal(["Nes"], experiment.GetProperty("cpu").GetProperty("enum").EnumerateArray().Select(value => value.GetString()));
+		Assert.Equal(McpAutomationLimits.MinExperimentTimeoutMs, experiment.GetProperty("timeoutMs").GetProperty("minimum").GetInt32());
+		Assert.Equal(McpAutomationLimits.MaxExperimentTimeoutMs, experiment.GetProperty("timeoutMs").GetProperty("maximum").GetInt32());
+		JsonElement segments = experiment.GetProperty("segments");
+		Assert.Equal(1, segments.GetProperty("minItems").GetInt32());
+		Assert.Equal(McpAutomationLimits.MaxSegments, segments.GetProperty("maxItems").GetInt32());
+		Assert.Equal(1, segments.GetProperty("items").GetProperty("properties").GetProperty("frames").GetProperty("minimum").GetInt32());
+		Assert.Equal(McpAutomationLimits.MaxExperimentFrames, segments.GetProperty("items").GetProperty("properties").GetProperty("frames").GetProperty("maximum").GetInt32());
+		JsonElement controllers = segments.GetProperty("items").GetProperty("properties").GetProperty("controllers");
+		Assert.Equal(McpAutomationLimits.MaxControllersPerSegment, controllers.GetProperty("maxItems").GetInt32());
+		JsonElement controller = controllers.GetProperty("items").GetProperty("properties");
+		Assert.Equal(McpAutomationLimits.MinPhysicalControllerPort, controller.GetProperty("port").GetProperty("minimum").GetInt32());
+		Assert.Equal(McpAutomationLimits.MaxPhysicalControllerPort, controller.GetProperty("port").GetProperty("maximum").GetInt32());
+		Assert.Equal(byte.MaxValue + 1, controller.GetProperty("buttons").GetProperty("maxItems").GetInt32());
+		JsonElement observations = experiment.GetProperty("observations");
+		Assert.Equal(McpAutomationLimits.MaxObservations, observations.GetProperty("maxItems").GetInt32());
+		Assert.Equal(1, observations.GetProperty("items").GetProperty("properties").GetProperty("count").GetProperty("minimum").GetInt32());
+		Assert.Equal(McpAutomationLimits.MaxObservedBytes, observations.GetProperty("items").GetProperty("properties").GetProperty("count").GetProperty("maximum").GetInt32());
+		JsonElement decode = observations.GetProperty("items").GetProperty("properties").GetProperty("decode");
+		Assert.Equal([1, 2, 4], decode.GetProperty("properties").GetProperty("width").GetProperty("enum").EnumerateArray().Select(value => value.GetInt32()));
+		Assert.Equal(["little", "big"], decode.GetProperty("properties").GetProperty("byteOrder").GetProperty("enum").EnumerateArray().Select(value => value.GetString()));
+		JsonElement assertions = experiment.GetProperty("assertions");
+		Assert.Equal(McpAutomationLimits.MaxAssertions, assertions.GetProperty("maxItems").GetInt32());
+		JsonElement expectedBytes = assertions.GetProperty("items").GetProperty("properties").GetProperty("expectedBytes");
+		Assert.Equal(McpAutomationLimits.MaxObservedBytes, expectedBytes.GetProperty("maxItems").GetInt32());
+		Assert.Equal(0, expectedBytes.GetProperty("items").GetProperty("minimum").GetInt32());
+		Assert.Equal(byte.MaxValue, expectedBytes.GetProperty("items").GetProperty("maximum").GetInt32());
+		Assert.Equal(
+			["equal", "not_equal", "range", "masked_equal", "relative_equal", "relative_not_equal", "increased", "decreased", "changed", "unchanged"],
+			assertions.GetProperty("items").GetProperty("properties").GetProperty("operator").GetProperty("enum")
+				.EnumerateArray().Select(value => value.GetString())
+		);
+
 		HashSet<string> readOnlyTools = [
-			"disassemble", "get_break_context", "get_call_stack", "get_cpu_registers", "get_emulator_status",
-			"get_execution_trace", "list_breakpoints", "list_memory_spaces", "map_address", "read_memory"
+			"capture_screenshot", "compare_memory_snapshots", "disassemble", "get_automation_capabilities",
+			"get_break_context", "get_call_stack", "get_cpu_registers", "get_emulator_status", "get_execution_trace",
+			"get_memory_search_results", "list_breakpoints", "list_memory_spaces", "map_address", "read_memory"
 		];
-		Assert.All(tools, tool => Assert.Equal(readOnlyTools.Contains(tool.Name), tool.ProtocolTool.Annotations!.ReadOnlyHint));
+		Assert.All(tools, tool => {
+			bool readOnly = readOnlyTools.Contains(tool.Name);
+			Assert.Equal(readOnly, tool.ProtocolTool.Annotations!.ReadOnlyHint);
+			Assert.Equal(!readOnly, tool.ProtocolTool.Annotations.DestructiveHint);
+			Assert.Equal(readOnly, tool.ProtocolTool.Annotations.IdempotentHint);
+			Assert.False(tool.ProtocolTool.Annotations.OpenWorldHint);
+		});
 	}
 
 	[Fact]
@@ -283,6 +374,7 @@ public sealed class McpServerTests
 
 		Assert.False(status.IsError);
 		Assert.True(status.StructuredContent!.Value.GetProperty("gameLoaded").GetBoolean());
+		Assert.Equal("2.0", status.StructuredContent.Value.GetProperty("mcpVersion").GetString());
 		Assert.False(spaces.IsError);
 		Assert.Equal(nameof(MemoryType.NesWorkRam), spaces.StructuredContent!.Value[0].GetProperty("id").GetString());
 		Assert.False(read.IsError);
@@ -299,6 +391,111 @@ public sealed class McpServerTests
 		Assert.False(error.TryGetProperty("bytesWritten", out _));
 		Assert.Equal(1, api.GetMemoryValuesCalls);
 		Assert.Equal(1, api.SetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public async Task ScreenshotProtocol_ReturnsMetadataTextStructuredContentAndRawImageOnly()
+	{
+		byte[] png = [0x89, 0x50, 0x4E, 0x47];
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
+			new(new(2, 1, 7, png.Length, 0, 0), png));
+		using McpServer server = new(new McpEmulatorService(api));
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult result = await client.CallToolAsync("capture_screenshot");
+
+		Assert.False(result.IsError);
+		Assert.Equal(2, result.Content.Count);
+		Assert.IsType<TextContentBlock>(result.Content[0]);
+		ImageContentBlock image = Assert.IsType<ImageContentBlock>(result.Content[1]);
+		Assert.Equal("image/png", image.MimeType);
+		Assert.Equal(png, image.DecodedData.ToArray());
+		JsonElement metadata = result.StructuredContent!.Value;
+		Assert.Equal(2, metadata.GetProperty("width").GetInt32());
+		Assert.Equal(png.Length, metadata.GetProperty("pngBytes").GetInt32());
+		Assert.DoesNotContain(Convert.ToBase64String(png), metadata.GetRawText());
+	}
+
+	[Fact]
+	public async Task AutomationProtocol_ReturnsStructuredPreflightErrorsAndSuccessfulRuntimePartials()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.ControllerTopology = [new(0, 0, ControllerType.NesController, [new("A", 0, false)])];
+		using McpServer server = new(new McpEmulatorService(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { })));
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult preflight = await client.CallToolAsync("run_experiment", Request(new {
+			cpu = "nes",
+			saveStateId = (string?)null,
+			segments = new[] { new { frames = 1, controllers = Array.Empty<object>(), checkpoint = (string?)null } },
+			timeoutMs = 1000,
+			observations = Array.Empty<object>(),
+			assertions = Array.Empty<object>(),
+			captureFinalScreenshot = false,
+			failFast = false
+		}));
+		CallToolResult partial = await client.CallToolAsync("run_experiment", Request(new {
+			cpu = "Nes",
+			saveStateId = (string?)null,
+			segments = new[] { new { frames = 1, controllers = Array.Empty<object>(), checkpoint = (string?)null } },
+			timeoutMs = McpAutomationLimits.MinExperimentTimeoutMs,
+			observations = Array.Empty<object>(),
+			assertions = Array.Empty<object>(),
+			captureFinalScreenshot = false,
+			failFast = false
+		}));
+
+		AssertErrorCode(preflight, "invalid_request");
+		Assert.False(partial.IsError);
+		Assert.Equal(McpExperimentStatus.Failed, partial.StructuredContent!.Value.GetProperty("status").GetString());
+		Assert.Equal(McpExperimentReason.Timeout, partial.StructuredContent.Value.GetProperty("reason").GetString());
+		Assert.Single(partial.Content);
+		Assert.IsType<TextContentBlock>(partial.Content[0]);
+	}
+
+	[Fact]
+	public async Task RunExperimentProtocol_AppendsOnlyItsOwnedSuccessfulFinalPng()
+	{
+		byte[] png = [0x89, 0x50, 0x4E, 0x47, 0x0D];
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.ControllerTopology = [new(0, 0, ControllerType.NesController, [new("A", 0, false)])];
+		api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
+			new(new(2, 1, 9, png.Length, 0, 0), png));
+		using McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new ProtocolBreakpointCollection());
+		using McpServer server = new(service);
+		api.StepHandler = (_, _, _) => SendBreak(service, new BreakEvent {
+			Source = BreakSource.PpuStep,
+			SourceCpu = CpuType.Nes
+		});
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult result = await client.CallToolAsync("run_experiment", Request(new {
+			cpu = "Nes",
+			saveStateId = (string?)null,
+			segments = new[] { new { frames = 1, controllers = Array.Empty<object>(), checkpoint = (string?)null } },
+			timeoutMs = 1000,
+			observations = Array.Empty<object>(),
+			assertions = Array.Empty<object>(),
+			captureFinalScreenshot = true,
+			failFast = false
+		}));
+
+		Assert.False(result.IsError);
+		Assert.Equal(McpExperimentStatus.Completed, result.StructuredContent!.Value.GetProperty("status").GetString());
+		Assert.Equal(2, result.Content.Count);
+		ImageContentBlock image = Assert.IsType<ImageContentBlock>(result.Content[1]);
+		Assert.Equal("image/png", image.MimeType);
+		Assert.Equal(png, image.DecodedData.ToArray());
+		Assert.DoesNotContain(Convert.ToBase64String(png), result.StructuredContent.Value.GetRawText());
 	}
 
 	[Fact]
@@ -553,7 +750,7 @@ public sealed class McpServerTests
 		using McpServer server = new(new McpEmulatorService(CreateRunningApi()));
 		await server.StartAsync(0);
 		await using(McpClient firstClient = await CreateClientAsync(server.Endpoint)) {
-			Assert.Equal(19, (await firstClient.ListToolsAsync()).Count);
+			Assert.Equal(33, (await firstClient.ListToolsAsync()).Count);
 		}
 
 		await using McpClient secondClient = await CreateClientAsync(server.Endpoint);
@@ -579,6 +776,66 @@ public sealed class McpServerTests
 		Assert.InRange(Environment.TickCount64 - started, 0, 2500);
 		using HttpClient httpClient = new();
 		await Assert.ThrowsAsync<HttpRequestException>(() => httpClient.GetAsync(endpoint));
+	}
+
+	[Fact]
+	public async Task AutomationToolLogs_OmitRequestsStateBytesAndPngData()
+	{
+		List<string> logs = [];
+		byte[] state = [0xDE, 0xAD, 0xBE, 0xEF];
+		byte[] png = [0x89, 0x50, 0x4E, 0x47];
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.ControllerTopology = [new(0, 0, ControllerType.NesController, [new("private-button", 0, false)])];
+		api.CreateSaveStateHandler = () => McpServiceResult<byte[]>.Success(state);
+		api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
+			new(new(1, 1, 1, png.Length, 0, 0), png));
+		using McpServer server = new(new McpEmulatorService(api), logs.Add);
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		await client.CallToolAsync("create_save_state");
+		await client.CallToolAsync("capture_screenshot");
+		await client.CallToolAsync("run_experiment", Request(new {
+			cpu = "Nes",
+			saveStateId = (string?)null,
+			segments = new[] { new {
+				frames = 1,
+				controllers = new[] { new { port = 0, buttons = new[] { "private-button" } } },
+				checkpoint = (string?)null
+			} },
+			timeoutMs = 1000,
+			observations = new[] { new {
+				id = "private-observation",
+				checkpoint = "final",
+				space = "private-space",
+				address = 0U,
+				count = 1,
+				decode = (object?)null
+			} },
+			assertions = new[] { new {
+				id = "private-assertion",
+				checkpoint = "final",
+				observationId = "private-observation",
+				@operator = "equal",
+				expectedBytes = new[] { 173 },
+				expectedValue = (long?)null,
+				minimumValue = (long?)null,
+				maximumValue = (long?)null,
+				mask = (ulong?)null,
+				referenceObservationId = (string?)null
+			} },
+			captureFinalScreenshot = false,
+			failFast = false
+		}));
+
+		Assert.Equal(3, logs.Count);
+		Assert.All(logs, log => Assert.Matches(
+			@"^\[MCP\] Tool [a-z_]+ (succeeded|failed with [a-z_]+) in \d+ ms\.$", log));
+		string combined = string.Join('\n', logs);
+		Assert.DoesNotContain("private", combined);
+		Assert.DoesNotContain("173", combined);
+		Assert.DoesNotContain(Convert.ToBase64String(state), combined);
+		Assert.DoesNotContain(Convert.ToBase64String(png), combined);
 	}
 
 	[Fact]
@@ -623,9 +880,11 @@ public sealed class McpServerTests
 		Assert.True(hostCleanupEntered.IsSet);
 		Assert.InRange(elapsed, 0, 1000);
 		Assert.Equal(1, hostCleanupCalls);
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
-		Assert.Equal(1, debuggerReleaseCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
@@ -634,18 +893,20 @@ public sealed class McpServerTests
 
 		releaseHostCleanup.SetResult();
 		await hostCleanupCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+		server.CompleteCoreRelease();
 
 		Assert.Equal(nativeCallsAfterStop, NativeCallCount(api));
 		server.Stop(TimeSpan.Zero);
 		server.Dispose();
 		Assert.Equal(1, hostCleanupCalls);
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
-		Assert.Equal(1, debuggerReleaseCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
 	}
 
 	[Fact]
-	public async Task Stop_WithBlockedToolCall_WaitsForNativeDrainAndDoesNotResurrectHost()
+	public async Task AutomationStop_WithBlockedNativeCall_IsBoundedAndNeverStartsNativeCleanup()
 	{
 		using ManualResetEventSlim readEntered = new();
 		using ManualResetEventSlim releaseRead = new();
@@ -654,32 +915,170 @@ public sealed class McpServerTests
 			readEntered.Set();
 			releaseRead.Wait(TimeSpan.FromSeconds(5));
 		};
-		using McpServer server = new(new McpEmulatorService(api));
-		await server.StartAsync(0);
-		Uri endpoint = server.Endpoint;
-		await using McpClient client = await CreateClientAsync(endpoint);
-		Task<CallToolResult> read = client.CallToolAsync("read_memory", Request(new {
-			space = nameof(MemoryType.NesWorkRam),
-			address = 0U,
-			count = 2
-		})).AsTask();
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(api, breakpointCollection: breakpoints);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Task<McpServiceResult<MemoryRead>> read = Task.Run(() =>
+			service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1));
 		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
 
-		Task stop = Task.Run(() => server.Stop(TimeSpan.FromSeconds(30)));
-		await Task.Delay(TimeSpan.FromMilliseconds(2200));
-		Assert.False(stop.IsCompleted);
-		releaseRead.Set();
-		await stop.WaitAsync(TimeSpan.FromSeconds(5));
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+		long elapsed = Environment.TickCount64 - started;
 
+		Assert.InRange(elapsed, 0, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
 		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
-		Exception requestFailure = await Assert.ThrowsAnyAsync<Exception>(async () => await read.WaitAsync(TimeSpan.FromSeconds(5)));
-		Assert.IsNotType<TimeoutException>(requestFailure);
-		server.Stop(TimeSpan.FromSeconds(2));
-		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
-		using HttpClient httpClient = new();
-		await Assert.ThrowsAsync<HttpRequestException>(() => httpClient.GetAsync(endpoint));
+
+		started = Environment.TickCount64;
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+		Assert.InRange(Environment.TickCount64 - started, 0, 500);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+
+		releaseRead.Set();
+		await read.WaitAsync(TimeSpan.FromSeconds(5));
+		server.CompleteCoreRelease();
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
+	public void AutomationStop_DetachesManagedOwnershipWithoutNativeDebuggerCalls()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		TrackingBreakpointCollection breakpoints = new();
+		int debuggerInitializeCalls = 0;
+		int debuggerReleaseCalls = 0;
+		TraceLoggerCoordinator traceCoordinator = new();
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => debuggerInitializeCalls++, () => debuggerReleaseCalls++),
+			breakpointCollection: breakpoints,
+			traceCoordinator: traceCoordinator);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Assert.True(service.SetBreakpoint(nameof(CpuType.Nes), nameof(MemoryType.NesWorkRam), "write", 0, null, null).IsSuccess);
+		Assert.True(service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null).IsSuccess);
+		object otherTraceOwner = new();
+		Assert.False(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
+		int setTraceCalls = api.SetTraceOptionsCalls;
+
+		server.Stop(TimeSpan.FromSeconds(1));
+
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal("server_stopping", service.GetStatus().Error?.Code);
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(1, debuggerInitializeCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(setTraceCalls, api.SetTraceOptionsCalls);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+		Assert.False(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
+
+		server.CompleteCoreRelease();
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.True(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
+
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
+	public async Task AutomationStop_DoesNotWaitForTracePublicationLockBeforeCoreRelease()
+	{
+		using ManualResetEventSlim publicationEntered = new();
+		using ManualResetEventSlim releasePublication = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.SetTraceOptionsHandler = (_, _) => {
+			publicationEntered.Set();
+			releasePublication.Wait(TimeSpan.FromSeconds(5));
+		};
+		TraceLoggerCoordinator traceCoordinator = new();
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: breakpoints,
+			traceCoordinator: traceCoordinator);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Task<McpServiceResult<TraceConfiguration>> publication = Task.Run(() =>
+			service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null));
+		Assert.True(publicationEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+
+		Assert.InRange(Environment.TickCount64 - started, 0, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+
+		releasePublication.Set();
+		Assert.Equal("server_stopping", (await publication.WaitAsync(TimeSpan.FromSeconds(5))).Error?.Code);
+		server.CompleteCoreRelease();
+		server.CompleteCoreRelease();
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
+	public async Task AutomationStop_DoesNotWaitForBreakpointPublicationLockBeforeCoreRelease()
+	{
+		using ManualResetEventSlim publicationEntered = new();
+		using ManualResetEventSlim releasePublication = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		TrackingBreakpointCollection breakpoints = new() {
+			ReplaceHandler = () => {
+				publicationEntered.Set();
+				releasePublication.Wait(TimeSpan.FromSeconds(5));
+			}
+		};
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: breakpoints);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Task<McpServiceResult<McpBreakpoint>> publication = Task.Run(() =>
+			service.SetBreakpoint(nameof(CpuType.Nes), nameof(MemoryType.NesWorkRam), "write", 0, null, null));
+		Assert.True(publicationEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+
+		Assert.InRange(Environment.TickCount64 - started, 0, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+
+		releasePublication.Set();
+		Assert.Equal("server_stopping", (await publication.WaitAsync(TimeSpan.FromSeconds(5))).Error?.Code);
+		server.CompleteCoreRelease();
+		server.Dispose();
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 	}
 
 	private static async Task<McpClient> CreateClientAsync(Uri endpoint)
@@ -726,6 +1125,74 @@ public sealed class McpServerTests
 			.GetProperty("properties")
 			.GetProperty("request")
 			.GetProperty("properties");
+	}
+
+	private static void SendBreak(McpEmulatorService service, BreakEvent breakEvent)
+	{
+		IntPtr pointer = Marshal.AllocHGlobal(Marshal.SizeOf<BreakEvent>());
+		try {
+			Marshal.StructureToPtr(breakEvent, pointer, false);
+			service.ProcessNotification(new() {
+				NotificationType = ConsoleNotificationType.CodeBreak,
+				Parameter = pointer
+			});
+		} finally {
+			Marshal.FreeHGlobal(pointer);
+		}
+	}
+
+	private static void AssertPagingSchema(IEnumerable<McpClientTool> tools, string toolName)
+	{
+		AssertSchemaBound(tools, toolName, "offset", "minimum", 0);
+		AssertSchemaBound(tools, toolName, "limit", "minimum", 1);
+		AssertSchemaBound(tools, toolName, "limit", "maximum", McpAutomationLimits.MaxResultPage);
+	}
+
+	private static void AssertSchemaBound(
+		IEnumerable<McpClientTool> tools, string toolName, string property, string bound, int expected)
+	{
+		Assert.Equal(expected, RequestProperties(tools, toolName).GetProperty(property).GetProperty(bound).GetInt32());
+	}
+
+	private static void AssertSchemaEnum(
+		IEnumerable<McpClientTool> tools, string toolName, string property, params string[] expected)
+	{
+		Assert.Equal(
+			expected,
+			RequestProperties(tools, toolName).GetProperty(property).GetProperty("enum")
+				.EnumerateArray().Select(value => value.GetString())
+		);
+	}
+
+	private static void AssertResourceIdSchema(JsonElement schema, bool nullable = false)
+	{
+		JsonElement stringSchema = schema;
+		if(schema.TryGetProperty("anyOf", out JsonElement anyOf)) {
+			JsonElement[] branches = anyOf.EnumerateArray().ToArray();
+			stringSchema = branches.Single(branch => branch.GetProperty("type").GetString() == "string");
+			Assert.Equal(nullable, branches.Any(branch => branch.GetProperty("type").GetString() == "null"));
+		} else if(schema.GetProperty("type").ValueKind == JsonValueKind.Array) {
+			string?[] types = schema.GetProperty("type").EnumerateArray().Select(value => value.GetString()).ToArray();
+			Assert.Contains("string", types);
+			Assert.Equal(nullable, types.Contains("null"));
+		} else {
+			Assert.Equal("string", schema.GetProperty("type").GetString());
+			Assert.False(nullable);
+		}
+
+		Assert.Equal(32, stringSchema.GetProperty("minLength").GetInt32());
+		Assert.Equal(32, stringSchema.GetProperty("maxLength").GetInt32());
+		Assert.Equal("^[0-9a-f]{32}$", stringSchema.GetProperty("pattern").GetString());
+	}
+
+	private static void AssertSchemaEnum(
+		IEnumerable<McpClientTool> tools, string toolName, string property, params int[] expected)
+	{
+		Assert.Equal(
+			expected,
+			RequestProperties(tools, toolName).GetProperty(property).GetProperty("enum")
+				.EnumerateArray().Select(value => value.GetInt32())
+		);
 	}
 
 	private static void AssertInvalidByteValue(CallToolResult result)
@@ -781,9 +1248,12 @@ public sealed class McpServerTests
 	{
 		public int EmptyReplaceCalls { get; private set; }
 		public int DisposeCalls { get; private set; }
+		public int DetachCalls { get; private set; }
+		public Action? ReplaceHandler { get; init; }
 
 		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints)
 		{
+			ReplaceHandler?.Invoke();
 			if(breakpoints.Count == 0) {
 				EmptyReplaceCalls++;
 			}
@@ -798,6 +1268,11 @@ public sealed class McpServerTests
 		public void Dispose()
 		{
 			DisposeCalls++;
+		}
+
+		public void Detach()
+		{
+			DetachCalls++;
 		}
 	}
 

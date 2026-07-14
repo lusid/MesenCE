@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,13 +19,29 @@ internal sealed class McpServer : IDisposable
 	private const long MaximumRequestBodySize = 512 * 1024;
 	private readonly object _lifecycleLock = new();
 	private readonly McpEmulatorService _service;
+	private readonly McpAutomationService _automationService;
+	private readonly McpExperimentService _experimentService;
+	private readonly McpMemorySnapshotService _memorySnapshotService;
+	private readonly McpMemorySearchService _memorySearchService;
+	private readonly McpSaveStateStore _saveStates;
+	private readonly McpMemorySnapshotStore _memorySnapshots;
+	private readonly McpMemorySearchStore _memorySearches;
 	private readonly Action<string> _toolLog;
 	private readonly Func<WebApplication, CancellationToken, Task> _applicationCleanup;
 	private LifecycleGeneration? _generation;
 	private Task? _detachedShutdownTask;
 	private long _nextGenerationId;
 	private bool _stopping;
+	private bool _resourcesDisposed;
+	private bool _coreReleaseCompleted;
 	private bool _disposed;
+
+	internal McpServer(
+		IMcpEmulatorApi api,
+		Action<string>? toolLog = null,
+		Func<WebApplication, CancellationToken, Task>? applicationCleanup = null)
+		: this(new McpEmulatorService(api), toolLog, applicationCleanup)
+	{ }
 
 	internal McpServer(
 		McpEmulatorService service,
@@ -32,10 +49,24 @@ internal sealed class McpServer : IDisposable
 		Func<WebApplication, CancellationToken, Task>? applicationCleanup = null)
 	{
 		_service = service;
+		_saveStates = new();
+		_memorySnapshots = new();
+		_memorySearches = new();
+		_automationService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
+		_experimentService = new(
+			service, new McpAutomationAdapterRegistry(service.Api), _saveStates, _automationService);
+		_memorySnapshotService = new(service, _memorySnapshots);
+		_memorySearchService = new(service, _memorySearches);
 		_toolLog = toolLog ?? Log;
 		_applicationCleanup = applicationCleanup ?? StopAndDisposeApplicationAsync;
 	}
 
+	internal McpAutomationService AutomationService => _automationService;
+	internal McpExperimentService ExperimentService => _experimentService;
+	internal McpEmulatorIdentity EmulatorIdentity => _service.EmulatorIdentity;
+	internal McpSaveStateStore SaveStates => _saveStates;
+	internal McpMemorySnapshotStore MemorySnapshots => _memorySnapshots;
+	internal McpMemorySearchStore MemorySearches => _memorySearches;
 	internal Uri Endpoint
 	{
 		get
@@ -69,13 +100,17 @@ internal sealed class McpServer : IDisposable
 
 	internal void Stop(TimeSpan timeout)
 	{
-		lock(_lifecycleLock) {
-			_stopping = true;
-		}
-		_service.BeginServiceShutdown();
 		TimeSpan boundedTimeout = timeout <= TimeSpan.Zero
 			? TimeSpan.Zero
 			: timeout < MaximumStopTimeout ? timeout : MaximumStopTimeout;
+		long stopStarted = Stopwatch.GetTimestamp();
+		lock(_lifecycleLock) {
+			if(_stopping) {
+				return;
+			}
+			_stopping = true;
+		}
+		_service.AbandonBeforeCoreRelease();
 		LifecycleGeneration? generation;
 		Task? shutdownTask;
 		lock(_lifecycleLock) {
@@ -100,8 +135,10 @@ internal sealed class McpServer : IDisposable
 			TryCancel(generation.RequestCancellation);
 			TryStopApplication(generation.Application);
 		}
+
+		DisposeResourceStores();
 		try {
-			if(shutdownTask is not null && !shutdownTask.Wait(boundedTimeout)) {
+			if(shutdownTask is not null && !shutdownTask.Wait(RemainingStopBudget(stopStarted, boundedTimeout))) {
 				Log("[MCP] HTTP host cleanup is continuing after the shutdown grace period.");
 			}
 		} catch(AggregateException ex) {
@@ -110,8 +147,6 @@ internal sealed class McpServer : IDisposable
 			Log($"[MCP] Stop did not complete cleanly: {ex.GetBaseException().Message}");
 		}
 
-		_service.CleanupDebuggerResources();
-		_service.Dispose();
 		lock(_lifecycleLock) {
 			if(_detachedShutdownTask?.IsCompleted == true) {
 				_detachedShutdownTask = null;
@@ -119,14 +154,34 @@ internal sealed class McpServer : IDisposable
 		}
 	}
 
-	internal void ProcessNotification(NotificationEventArgs e)
+	internal void CompleteCoreRelease()
 	{
-		_service.ProcessNotification(e);
+		lock(_lifecycleLock) {
+			if(_coreReleaseCompleted) {
+				return;
+			}
+			_coreReleaseCompleted = true;
+		}
+		_service.DetachManagedResourcesAfterCoreRelease();
+		_service.Dispose();
 	}
 
-	internal void DrainEmulatorOperations()
+	internal void ProcessNotification(NotificationEventArgs e)
 	{
-		_service.DrainOperations();
+		lock(_lifecycleLock) {
+			if(_stopping) {
+				return;
+			}
+			_service.ProcessNotification(e);
+			if(e.NotificationType is ConsoleNotificationType.GameLoaded
+				or ConsoleNotificationType.GameLoadFailed
+				or ConsoleNotificationType.EmulationStopped) {
+				long romIdentity = _service.EmulatorIdentity.Current.RomIdentity;
+				_saveStates.InvalidateRom(romIdentity);
+				_memorySnapshots.InvalidateRom(romIdentity);
+				_memorySearches.InvalidateRom(romIdentity);
+			}
+		}
 	}
 
 	public void Dispose()
@@ -140,6 +195,25 @@ internal sealed class McpServer : IDisposable
 		Stop(MaximumStopTimeout);
 	}
 
+	private void DisposeResourceStores()
+	{
+		lock(_lifecycleLock) {
+			if(_resourcesDisposed) {
+				return;
+			}
+			_resourcesDisposed = true;
+			_saveStates.Dispose();
+			_memorySnapshots.Dispose();
+			_memorySearches.Dispose();
+		}
+	}
+
+	private static TimeSpan RemainingStopBudget(long started, TimeSpan budget)
+	{
+		TimeSpan remaining = budget - Stopwatch.GetElapsedTime(started);
+		return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+	}
+
 	private async Task StartCoreAsync(LifecycleGeneration generation, ushort port)
 	{
 		await Task.Yield();
@@ -151,7 +225,13 @@ internal sealed class McpServer : IDisposable
 			builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = MaximumRequestBodySize);
 			builder.Services.AddMcpServer()
 				.WithHttpTransport()
-				.WithTools(McpTools.Create(_service, _toolLog));
+				.WithTools(McpTools.Create(
+					_service,
+					_automationService,
+					_experimentService,
+					_memorySnapshotService,
+					_memorySearchService,
+					_toolLog));
 
 			application = builder.Build();
 			application.Use(async (context, next) => {

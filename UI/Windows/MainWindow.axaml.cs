@@ -843,7 +843,7 @@ namespace Mesen.Windows
 
 		internal MainWindowMcpLifecycle()
 			: this(
-				() => new McpServer(new McpEmulatorService(new MesenMcpEmulatorApi())),
+				() => new McpServer(new MesenMcpEmulatorApi()),
 				(server, port) => server.StartAsync(port),
 				server => server.Dispose(),
 				McpServer.Log
@@ -916,15 +916,17 @@ namespace Mesen.Windows
 
 			if(server != null) {
 				server.Stop(TimeSpan.FromSeconds(2));
+			}
+			disposeListener();
+			stopCore();
+			releaseCore();
+			if(server != null) {
+				server.CompleteCoreRelease();
 				_disposeServer(server);
-				server.DrainEmulatorOperations();
 			}
 			lock(_lock) {
 				_stoppingServer = null;
 			}
-			stopCore();
-			disposeListener();
-			releaseCore();
 		}
 
 		internal void ProcessNotification(NotificationEventArgs e)

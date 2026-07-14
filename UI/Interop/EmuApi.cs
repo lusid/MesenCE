@@ -17,6 +17,10 @@ namespace Mesen.Interop
 	{
 		public const string DllName = "MesenCore.dll";
 		private const string DllPath = EmuApi.DllName;
+		private const int MaxInteropSaveStateBytes = 16 * 1024 * 1024;
+		private const uint MaxInteropPngBytes = 8 * 1024 * 1024;
+		private const uint MaxScreenshotDimension = 4096;
+		private const ulong MaxScreenshotPixels = 16_777_216;
 
 		[DllImport(DllPath)][return: MarshalAs(UnmanagedType.I1)] public static extern bool TestDll();
 		[DllImport(DllPath)] public static extern void InitDll();
@@ -108,6 +112,87 @@ namespace Mesen.Interop
 		[DllImport(DllPath)] public static extern void LoadState(UInt32 stateIndex);
 		[DllImport(DllPath)] public static extern void SaveStateFile([MarshalAs(UnmanagedType.LPUTF8Str)] string filepath);
 		[DllImport(DllPath)] public static extern void LoadStateFile([MarshalAs(UnmanagedType.LPUTF8Str)] string filepath);
+		[DllImport(DllPath)] private static extern InteropApiResult CreateSaveStateBuffer(out InteropOwnedBuffer buffer);
+		[DllImport(DllPath)] private static extern InteropApiResult LoadSaveStateBuffer(IntPtr data, UInt32 length);
+		[DllImport(DllPath)] private static extern void ReleaseInteropBuffer(IntPtr data);
+		[DllImport(DllPath)] private static extern InteropApiResult CaptureScreenshotPng(out InteropOwnedBuffer buffer, out InteropScreenshotInfo info);
+
+		internal delegate InteropApiResult CreateSaveStateBufferHandler(out InteropOwnedBuffer buffer);
+		internal delegate InteropApiResult CaptureScreenshotPngHandler(out InteropOwnedBuffer buffer, out InteropScreenshotInfo info);
+
+		public static InteropBufferResult CreateSaveState() => CreateSaveState(CreateSaveStateBuffer, ReleaseInteropBuffer);
+
+		internal static InteropBufferResult CreateSaveState(
+			CreateSaveStateBufferHandler createBuffer,
+			Action<IntPtr> releaseBuffer)
+		{
+			InteropApiResult result = createBuffer(out InteropOwnedBuffer buffer);
+			if(result != InteropApiResult.Success) {
+				return new(result, []);
+			}
+
+			try {
+				if(buffer.Data == IntPtr.Zero || buffer.Length == 0 || buffer.Length > MaxInteropSaveStateBytes) {
+					return new(InteropApiResult.InvalidData, []);
+				}
+				byte[] data = new byte[checked((int)buffer.Length)];
+				Marshal.Copy(buffer.Data, data, 0, data.Length);
+				return new(result, data);
+			} finally {
+				releaseBuffer(buffer.Data);
+			}
+		}
+
+		public static InteropScreenshotResult CaptureScreenshot() => CaptureScreenshot(CaptureScreenshotPng, ReleaseInteropBuffer);
+
+		internal static InteropApiResult ValidateScreenshotLimits(InteropScreenshotInfo info)
+		{
+			if(info.Width == 0 || info.Height == 0 || info.Width > MaxScreenshotDimension || info.Height > MaxScreenshotDimension
+				|| (ulong)info.Width * info.Height > MaxScreenshotPixels) {
+				return InteropApiResult.InvalidData;
+			}
+			if(info.PngLength == 0) {
+				return InteropApiResult.InvalidData;
+			}
+			return info.PngLength > MaxInteropPngBytes ? InteropApiResult.PayloadTooLarge : InteropApiResult.Success;
+		}
+
+		internal static InteropScreenshotResult CaptureScreenshot(
+			CaptureScreenshotPngHandler captureScreenshot,
+			Action<IntPtr> releaseBuffer)
+		{
+			InteropApiResult result = captureScreenshot(out InteropOwnedBuffer buffer, out InteropScreenshotInfo info);
+			try {
+				if(result != InteropApiResult.Success) {
+					return new(result, info, []);
+				}
+				InteropApiResult limitResult = ValidateScreenshotLimits(info);
+				if(limitResult != InteropApiResult.Success) {
+					return new(limitResult, info, []);
+				}
+				if(buffer.Data == IntPtr.Zero || buffer.Length == 0 || buffer.Length != info.PngLength) {
+					return new(InteropApiResult.InvalidData, info, []);
+				}
+
+				byte[] png = new byte[checked((int)buffer.Length)];
+				Marshal.Copy(buffer.Data, png, 0, png.Length);
+				return new(InteropApiResult.Success, info, png);
+			} finally {
+				if(buffer.Data != IntPtr.Zero) {
+					releaseBuffer(buffer.Data);
+				}
+			}
+		}
+
+		public static unsafe InteropApiResult LoadSaveState(byte[] data)
+		{
+			if(data == null) {
+				return InteropApiResult.InvalidArgument;
+			}
+			fixed(byte* pointer = data) {
+				return LoadSaveStateBuffer((IntPtr)pointer, (UInt32)data.Length);
+			}
+		}
 
 		[DllImport(DllPath, EntryPoint = "GetSaveStatePreview")] private static extern Int32 GetSaveStatePreviewWrapper([MarshalAs(UnmanagedType.LPUTF8Str)] string saveStatePath, [Out] byte[] imgData);
 		public static Bitmap? GetSaveStatePreview(string saveStatePath)
@@ -132,6 +217,38 @@ namespace Mesen.Interop
 		[DllImport(DllPath)] public static extern void InputBarcode(UInt64 barcode, UInt32 digitCount);
 		[DllImport(DllPath)] public static extern void ProcessTapeRecorderAction(TapeRecorderAction action, [MarshalAs(UnmanagedType.LPUTF8Str)] string filename = "");
 	}
+
+	public enum InteropApiResult : Int32
+	{
+		Success = 0,
+		NoGameLoaded = 1,
+		InvalidArgument = 2,
+		InvalidData = 3,
+		PayloadTooLarge = 4,
+		AllocationFailed = 5,
+		EncodeFailed = 6,
+		NoFrame = 7
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	public struct InteropOwnedBuffer
+	{
+		public IntPtr Data;
+		public UInt32 Length;
+	}
+
+	public readonly record struct InteropBufferResult(InteropApiResult Result, byte[] Data);
+
+	[StructLayout(LayoutKind.Sequential)]
+	public struct InteropScreenshotInfo
+	{
+		public UInt32 Width;
+		public UInt32 Height;
+		public UInt32 FrameNumber;
+		public UInt32 PngLength;
+	}
+
+	public readonly record struct InteropScreenshotResult(InteropApiResult Result, InteropScreenshotInfo Info, byte[] Png);
 
 	public struct TimingInfo
 	{

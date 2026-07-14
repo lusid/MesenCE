@@ -1,10 +1,45 @@
 using Mesen.Debugger;
 using Mesen.Interop;
+using System;
+using System.Collections.Generic;
 
 namespace Mesen.Mcp;
 
 internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 {
+	private readonly Func<InteropBufferResult> _createSaveState;
+	private readonly Func<byte[], InteropApiResult> _loadSaveState;
+	private readonly Func<InteropScreenshotResult> _captureScreenshot;
+	private readonly Func<McpExclusiveControllerState, bool> _setExclusiveControllerOverride;
+	private readonly Action _clearExclusiveControllerOverrides;
+
+	public MesenMcpEmulatorApi() : this(EmuApi.CreateSaveState, EmuApi.LoadSaveState, EmuApi.CaptureScreenshot, DebugApi.SetExclusiveControllerOverride, DebugApi.ClearExclusiveControllerOverrides) {}
+
+	internal MesenMcpEmulatorApi(
+		Func<InteropBufferResult> createSaveState,
+		Func<byte[], InteropApiResult> loadSaveState)
+		: this(createSaveState, loadSaveState, EmuApi.CaptureScreenshot, DebugApi.SetExclusiveControllerOverride, DebugApi.ClearExclusiveControllerOverrides) {}
+
+	internal MesenMcpEmulatorApi(
+		Func<InteropBufferResult> createSaveState,
+		Func<byte[], InteropApiResult> loadSaveState,
+		Func<InteropScreenshotResult> captureScreenshot)
+		: this(createSaveState, loadSaveState, captureScreenshot, DebugApi.SetExclusiveControllerOverride, DebugApi.ClearExclusiveControllerOverrides) {}
+
+	internal MesenMcpEmulatorApi(
+		Func<InteropBufferResult> createSaveState,
+		Func<byte[], InteropApiResult> loadSaveState,
+		Func<InteropScreenshotResult> captureScreenshot,
+		Func<McpExclusiveControllerState, bool> setExclusiveControllerOverride,
+		Action clearExclusiveControllerOverrides)
+	{
+		_createSaveState = createSaveState;
+		_loadSaveState = loadSaveState;
+		_captureScreenshot = captureScreenshot;
+		_setExclusiveControllerOverride = setExclusiveControllerOverride;
+		_clearExclusiveControllerOverrides = clearExclusiveControllerOverrides;
+	}
+
 	public bool IsRunning() => EmuApi.IsRunning();
 	public ulong GetDebuggerRequestBlockState() => DebugApi.GetDebuggerRequestBlockState();
 	public bool IsPaused() => EmuApi.IsPaused();
@@ -30,4 +65,52 @@ internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 	public void ClearExecutionTrace() => DebugApi.ClearExecutionTrace();
 	public uint GetExecutionTraceSize() => DebugApi.GetExecutionTraceSize();
 	public TraceRow[] GetExecutionTrace(uint startOffset, uint maxRowCount) => DebugApi.GetExecutionTrace(startOffset, maxRowCount);
+	public IReadOnlyList<McpControllerTopology> GetControllerTopology() => DebugApi.GetControllerTopology();
+	public bool SetExclusiveControllerOverride(McpExclusiveControllerState state) => _setExclusiveControllerOverride(state);
+	public void ClearExclusiveControllerOverrides() => _clearExclusiveControllerOverrides();
+
+	public McpServiceResult<byte[]> CreateSaveState()
+	{
+		InteropBufferResult result = _createSaveState();
+		return result.Result switch {
+			InteropApiResult.Success => McpServiceResult<byte[]>.Success(result.Data),
+			InteropApiResult.NoGameLoaded => McpServiceResult<byte[]>.Failure("no_game", "No game is currently loaded."),
+			InteropApiResult.PayloadTooLarge => McpServiceResult<byte[]>.Failure("payload_too_large", "The save state exceeds the native size limit."),
+			_ => McpServiceResult<byte[]>.Failure("interop_failure", "Native emulator interop failed.")
+		};
+	}
+
+	public McpServiceResult<bool> LoadSaveState(byte[] data)
+	{
+		return _loadSaveState(data) switch {
+			InteropApiResult.Success => McpServiceResult<bool>.Success(true),
+			InteropApiResult.NoGameLoaded => McpServiceResult<bool>.Failure("no_game", "No game is currently loaded."),
+			InteropApiResult.PayloadTooLarge => McpServiceResult<bool>.Failure("payload_too_large", "The save state exceeds the native size limit."),
+			_ => McpServiceResult<bool>.Failure("interop_failure", "Native emulator interop failed.")
+		};
+	}
+
+	public McpServiceResult<McpScreenshotCapture> CaptureScreenshot()
+	{
+		InteropScreenshotResult result = _captureScreenshot();
+		if(result.Result == InteropApiResult.Success) {
+			InteropApiResult validationResult = EmuApi.ValidateScreenshotLimits(result.Info);
+			if(validationResult == InteropApiResult.PayloadTooLarge) {
+				return McpServiceResult<McpScreenshotCapture>.Failure("payload_too_large", "The screenshot exceeds the native size limit.");
+			}
+			if(validationResult != InteropApiResult.Success || result.Png.Length != result.Info.PngLength) {
+				return McpServiceResult<McpScreenshotCapture>.Failure("interop_failure", "Native emulator interop failed.");
+			}
+			return McpServiceResult<McpScreenshotCapture>.Success(new(
+				new McpScreenshotMetadata((int)result.Info.Width, (int)result.Info.Height, result.Info.FrameNumber, result.Png.Length, 0, 0),
+				result.Png));
+		}
+		return result.Result switch {
+			InteropApiResult.NoGameLoaded => McpServiceResult<McpScreenshotCapture>.Failure("no_game", "No game is currently loaded."),
+			InteropApiResult.NoFrame => McpServiceResult<McpScreenshotCapture>.Failure("no_frame", "No decoded video frame is available."),
+			InteropApiResult.PayloadTooLarge => McpServiceResult<McpScreenshotCapture>.Failure("payload_too_large", "The screenshot exceeds the native size limit."),
+			InteropApiResult.EncodeFailed => McpServiceResult<McpScreenshotCapture>.Failure("encoding_failed", "The native screenshot encoder failed."),
+			_ => McpServiceResult<McpScreenshotCapture>.Failure("interop_failure", "Native emulator interop failed.")
+		};
+	}
 }

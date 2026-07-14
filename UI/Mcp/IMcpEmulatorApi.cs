@@ -1,5 +1,6 @@
 using Mesen.Debugger;
 using Mesen.Interop;
+using System.Collections.Generic;
 
 namespace Mesen.Mcp;
 
@@ -30,4 +31,10 @@ internal interface IMcpEmulatorApi
 	void ClearExecutionTrace();
 	uint GetExecutionTraceSize();
 	TraceRow[] GetExecutionTrace(uint startOffset, uint maxRowCount);
+	McpServiceResult<byte[]> CreateSaveState();
+	McpServiceResult<bool> LoadSaveState(byte[] data);
+	McpServiceResult<McpScreenshotCapture> CaptureScreenshot();
+	IReadOnlyList<McpControllerTopology> GetControllerTopology();
+	bool SetExclusiveControllerOverride(McpExclusiveControllerState state);
+	void ClearExclusiveControllerOverrides();
 }

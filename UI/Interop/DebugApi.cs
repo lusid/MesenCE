@@ -1,6 +1,7 @@
 ﻿using Avalonia;
 using Mesen.Config;
 using Mesen.Debugger;
+using Mesen.Mcp;
 using Mesen.Utilities;
 using System;
 using System.Collections.Generic;
@@ -229,6 +230,11 @@ namespace Mesen.Interop
 
 		[DllImport(DllPath)] public static extern void SetInputOverrides(UInt32 index, DebugControllerState state);
 		[DllImport(DllPath)] private static extern void GetAvailableInputOverrides([In, Out] byte[] availableIndexes);
+		[DllImport(DllPath)] private static extern UInt32 GetControllerCount();
+		[DllImport(DllPath)] private static extern InteropControllerApiResult GetControllerInfo(UInt32 ordinal, out InteropControllerInfo info);
+		[DllImport(DllPath)] private static extern InteropControllerApiResult GetControllerControlInfo(UInt32 index, UInt32 controlIndex, out InteropControllerControlInfo info, [In, Out] byte[] name, UInt32 maxNameLength);
+		[DllImport(DllPath)] private static extern InteropControllerApiResult SetExclusiveControllerOverride(UInt32 index, Int32 enabled, [In] InteropControllerValue[] values, UInt32 valueCount);
+		[DllImport(DllPath)] public static extern void ClearExclusiveControllerOverrides();
 
 		public static List<int> GetAvailableInputOverrides()
 		{
@@ -242,6 +248,52 @@ namespace Mesen.Interop
 				}
 			}
 			return indexes;
+		}
+
+		internal static IReadOnlyList<McpControllerTopology> GetControllerTopology()
+		{
+			const int maxControllers = 8;
+			const int maxControls = 256;
+			const int maxControlNameBytes = 256;
+			UInt32 count = GetControllerCount();
+			if(count > maxControllers) {
+				return [];
+			}
+
+			List<McpControllerTopology> topology = new((int)count);
+			for(UInt32 ordinal = 0; ordinal < count; ordinal++) {
+				if(GetControllerInfo(ordinal, out InteropControllerInfo info) != InteropControllerApiResult.Success
+					|| info.Index < 0 || info.Index >= maxControllers
+					|| info.ControlCount < 0 || info.ControlCount > maxControls) {
+					return [];
+				}
+
+				List<McpControllerControl> controls = new(info.ControlCount);
+				for(UInt32 controlIndex = 0; controlIndex < (UInt32)info.ControlCount; controlIndex++) {
+					byte[] name = new byte[maxControlNameBytes];
+					if(GetControllerControlInfo((UInt32)info.Index, controlIndex, out InteropControllerControlInfo controlInfo, name, (UInt32)name.Length) != InteropControllerApiResult.Success) {
+						return [];
+					}
+					if(controlInfo.NameLength < 0 || controlInfo.NameLength >= maxControlNameBytes || name[controlInfo.NameLength] != 0) {
+						return [];
+					}
+					controls.Add(new(Utf8Utilities.GetStringFromArray(name), controlInfo.ControlId, controlInfo.IsNumeric != 0));
+				}
+				topology.Add(new(info.Index, info.Port, info.DeviceType, controls));
+			}
+			return topology;
+		}
+
+		internal static bool SetExclusiveControllerOverride(McpExclusiveControllerState state)
+		{
+			if(state.NativeIndex < 0 || state.NativeIndex >= 8 || state.Values.Count > 256) {
+				return false;
+			}
+			InteropControllerValue[] values = state.Values.Select(value => new InteropControllerValue {
+				ControlId = value.ControlId,
+				Value = value.Value
+			}).ToArray();
+			return SetExclusiveControllerOverride((UInt32)state.NativeIndex, state.Enabled ? 1 : 0, values, (UInt32)values.Length) == InteropControllerApiResult.Success;
 		}
 
 		[DllImport(DllPath, EntryPoint = "GetRomHeader")] private static extern void GetRomHeaderWrapper([In, Out] byte[] headerData, ref UInt32 size);
@@ -688,6 +740,36 @@ namespace Mesen.Interop
 		WsPort,
 
 		None,
+	}
+
+	internal enum InteropControllerApiResult : Int32
+	{
+		Failure = 0,
+		Success = 1
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	internal struct InteropControllerInfo
+	{
+		internal Int32 Index;
+		internal Int32 Port;
+		internal ControllerType DeviceType;
+		internal Int32 ControlCount;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	internal struct InteropControllerControlInfo
+	{
+		internal Int32 ControlId;
+		internal Int32 IsNumeric;
+		internal Int32 NameLength;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	internal struct InteropControllerValue
+	{
+		internal Int32 ControlId;
+		internal Int32 Value;
 	}
 
 	[StructLayout(LayoutKind.Sequential)]

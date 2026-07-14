@@ -6,6 +6,79 @@ namespace UI.Tests.Mcp;
 public sealed class McpEmulatorGateTests
 {
 	[Fact]
+	public async Task Execute_ReadOnlyCallRemainsAvailableWhileExecutionLeaseIsOwned()
+	{
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes(), coordinator);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+
+		McpServiceResult<int> result = gate.Execute(() => McpServiceResult<int>.Success(1));
+
+		Assert.Equal(1, result.Value);
+	}
+
+	[Fact]
+	public async Task ExecuteMutation_RejectsCompetitorAndAllowsOwner()
+	{
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes(), coordinator);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+		bool competitorCalled = false;
+
+		McpServiceResult<int> competitor = gate.ExecuteMutation(McpExecutionMutation.Step, () => {
+			competitorCalled = true;
+			return McpServiceResult<int>.Success(1);
+		});
+		McpServiceResult<int> owner = gate.ExecuteOwned(lease.LeaseId, () => McpServiceResult<int>.Success(2));
+
+		Assert.Equal("operation_in_progress", competitor.Error?.Code);
+		Assert.False(competitorCalled);
+		Assert.Equal(2, owner.Value);
+	}
+
+	[Fact]
+	public async Task ExecuteOwned_WhenOwnerIsQuarantined_RejectsBeforeDelegate()
+	{
+		McpExecutionCoordinator coordinator = new();
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api, coordinator);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+		coordinator.EnterQuarantine();
+		bool called = false;
+
+		McpServiceResult<int> result = gate.ExecuteOwned(lease.LeaseId, () => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("execution_state_unknown", result.Error?.Code);
+		Assert.False(called);
+		Assert.Equal(0, api.DebuggerRequestBlockStateCalls);
+	}
+
+	[Fact]
+	public async Task ExecuteMutation_BlocksLeaseAcquisitionUntilMutationCompletes()
+	{
+		using ManualResetEventSlim mutationEntered = new();
+		using ManualResetEventSlim releaseMutation = new();
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes(), coordinator);
+		Task<McpServiceResult<int>> mutation = Task.Run(() => gate.ExecuteMutation(McpExecutionMutation.Resume, () => {
+			mutationEntered.Set();
+			releaseMutation.Wait(TimeSpan.FromSeconds(5));
+			return McpServiceResult<int>.Success(1);
+		}));
+		Assert.True(mutationEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		McpServiceResult<McpExecutionLease> blocked = await coordinator.TryAcquireAsync(CancellationToken.None);
+		Assert.Equal("operation_in_progress", blocked.Error?.Code);
+
+		releaseMutation.Set();
+		Assert.True((await mutation.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+	}
+
+	[Fact]
 	public async Task Execute_SerializesOperations()
 	{
 		using ManualResetEventSlim firstEntered = new();
@@ -165,6 +238,37 @@ public sealed class McpEmulatorGateTests
 
 		Assert.Equal("state_changed", result.Error!.Code);
 		Assert.False(mutated);
+	}
+
+	[Fact]
+	public async Task ExecuteOwnedStateLoad_ReturnsExactAcceptedEndingTicketAndRejectsLaterChange()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(api, coordinator);
+		McpServiceResult<McpExecutionLease> acquisition =
+			await coordinator.TryAcquireAsync(CancellationToken.None);
+		Assert.True(acquisition.IsSuccess, acquisition.Error?.Code);
+		await using McpExecutionLease lease = acquisition.Value!;
+
+		McpServiceResult<McpOperationPostflight<int>> load = gate.ExecuteOwnedStateLoad(
+			lease.LeaseId, null,
+			_ => {
+				api.SetDebuggerRequestBlocked(true);
+				gate.NotifyEmulatorStateChanged();
+				api.SetDebuggerRequestBlocked(false);
+				return McpServiceResult<int>.Success(7);
+			});
+
+		Assert.True(load.IsSuccess, load.Error?.Code);
+		Assert.Equal(7, load.Value!.Value);
+		Assert.Equal(gate.CaptureTicket().Value, load.Value.Ticket);
+		Assert.True(gate.ExecuteOwnedForTicket(
+			lease.LeaseId, load.Value.Ticket, () => McpServiceResult<bool>.Success(true)).IsSuccess);
+
+		gate.NotifyEmulatorStateChanged();
+		Assert.Equal("state_changed", gate.ExecuteOwnedForTicket(
+			lease.LeaseId, load.Value.Ticket, () => McpServiceResult<bool>.Success(true)).Error?.Code);
 	}
 
 	[Fact]

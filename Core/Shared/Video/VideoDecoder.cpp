@@ -29,6 +29,7 @@ VideoDecoder::~VideoDecoder()
 
 void VideoDecoder::Init()
 {
+	auto lock = _videoFilterLock.AcquireSafe();
 	UpdateVideoFilter();
 	_videoFilter->SetBaseFrameInfo(_baseFrameSize);
 }
@@ -71,7 +72,7 @@ void VideoDecoder::UpdateVideoFilter()
 		_videoFilterType = newFilter;
 		_consoleType = consoleType;
 
-		_videoFilter.reset(_emu->GetVideoFilter());
+		_videoFilter = shared_ptr<BaseVideoFilter>(_emu->GetVideoFilter());
 		_scaleFilter = ScaleFilter::GetScaleFilter(_emu, _videoFilterType);
 		_forceFilterUpdate = false;
 	}
@@ -90,7 +91,12 @@ void VideoDecoder::UpdateVideoFilter()
 
 void VideoDecoder::DecodeFrame(bool forRewind)
 {
-	UpdateVideoFilter();
+	shared_ptr<BaseVideoFilter> videoFilter;
+	{
+		auto lock = _videoFilterLock.AcquireSafe();
+		UpdateVideoFilter();
+		videoFilter = _videoFilter;
+	}
 
 	bool isAudioPlayer = _emu->GetAudioPlayerHud() != nullptr;
 	if(isAudioPlayer) {
@@ -102,12 +108,11 @@ void VideoDecoder::DecodeFrame(bool forRewind)
 		_baseFrameSize.Height = _frame.Height;
 	}
 
-	_videoFilter->SetBaseFrameInfo(_baseFrameSize);
-	FrameInfo frameSize = _videoFilter->SendFrame((uint16_t*)_frame.FrameBuffer, _frame.FrameNumber, _frame.VideoPhase, _frame.Data);
+	videoFilter->SetBaseFrameInfo(_baseFrameSize);
+	FrameInfo frameSize = videoFilter->SendFrameForDisplay((uint16_t*)_frame.FrameBuffer, _frame.FrameNumber, _frame.VideoPhase, _frame.Data, _displayBuffer);
+	uint32_t* outputBuffer = _displayBuffer.data();
 
-	uint32_t* outputBuffer = _videoFilter->GetOutputBuffer();
-
-	OverscanDimensions overscan = _videoFilter->GetOverscan();
+	OverscanDimensions overscan = videoFilter->GetOverscan();
 
 	if(_rotateFilter && !isAudioPlayer) {
 		outputBuffer = _rotateFilter->ApplyFilter(outputBuffer, frameSize.Width, frameSize.Height);
@@ -118,7 +123,7 @@ void VideoDecoder::DecodeFrame(bool forRewind)
 		}
 	}
 
-	_emu->GetDebugHud()->Draw(outputBuffer, frameSize, overscan, _frame.FrameNumber, _videoFilter->GetScaleFactor());
+	_emu->GetDebugHud()->Draw(outputBuffer, frameSize, overscan, _frame.FrameNumber, videoFilter->GetScaleFactor());
 
 	if(_scaleFilter && !isAudioPlayer) {
 		outputBuffer = _scaleFilter->ApplyFilter(outputBuffer, frameSize.Width, frameSize.Height);
@@ -204,9 +209,12 @@ void VideoDecoder::StartThread()
 {
 	auto lock = _stopStartLock.AcquireSafe();
 	if(!_decodeThread) {
-		_videoFilter.reset();
-		UpdateVideoFilter();
-		_videoFilter->SetBaseFrameInfo(_baseFrameSize);
+		{
+			auto filterLock = _videoFilterLock.AcquireSafe();
+			_videoFilter.reset();
+			UpdateVideoFilter();
+			_videoFilter->SetBaseFrameInfo(_baseFrameSize);
+		}
 		_stopFlag = false;
 		_frameChanged = false;
 		_frameCount = 0;
@@ -240,14 +248,40 @@ bool VideoDecoder::IsRunning()
 
 void VideoDecoder::TakeScreenshot(string romName)
 {
-	if(_videoFilter) {
-		_videoFilter->TakeScreenshot(romName.empty() ? _emu->GetRomInfo().RomFile.GetFileName() : romName, _videoFilterType);
+	shared_ptr<BaseVideoFilter> videoFilter;
+	VideoFilterType filterType;
+	{
+		auto lock = _videoFilterLock.AcquireSafe();
+		videoFilter = _videoFilter;
+		filterType = _videoFilterType;
+	}
+	if(videoFilter) {
+		videoFilter->TakeScreenshot(romName.empty() ? _emu->GetRomInfo().RomFile.GetFileName() : romName, filterType);
 	}
 }
 
 void VideoDecoder::TakeScreenshot(std::stringstream& stream)
 {
-	if(_videoFilter) {
-		_videoFilter->TakeScreenshot(_videoFilterType, "", &stream);
+	shared_ptr<BaseVideoFilter> videoFilter;
+	VideoFilterType filterType;
+	{
+		auto lock = _videoFilterLock.AcquireSafe();
+		videoFilter = _videoFilter;
+		filterType = _videoFilterType;
 	}
+	if(videoFilter) {
+		videoFilter->TakeScreenshot(filterType, "", &stream);
+	}
+}
+
+ScreenshotCapture VideoDecoder::CaptureScreenshot()
+{
+	shared_ptr<BaseVideoFilter> videoFilter;
+	VideoFilterType filterType;
+	{
+		auto lock = _videoFilterLock.AcquireSafe();
+		videoFilter = _videoFilter;
+		filterType = _videoFilterType;
+	}
+	return videoFilter ? videoFilter->CaptureScreenshot(filterType) : ScreenshotCapture {};
 }

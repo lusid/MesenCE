@@ -16,11 +16,13 @@ namespace Mesen.Mcp;
 internal sealed class McpEmulatorService : IDisposable
 {
 	public const int MaxTransferSize = 65536;
-	private const string McpVersion = "1.0";
+	private const string McpVersion = "2.0";
 	private static readonly string MesenVersion = typeof(McpEmulatorService).Assembly.GetName().Version?.ToString(3) ?? "unknown";
 
 	private readonly IMcpEmulatorApi _api;
 	private readonly McpEmulatorGate _gate;
+	private readonly McpEmulatorIdentity _emulatorIdentity;
+	private readonly McpExecutionCoordinator _executionCoordinator;
 	private readonly IDebuggerLifetimeCoordinator _debuggerLifetime;
 	private readonly ITraceLoggerCoordinator _traceCoordinator;
 	private readonly object _traceOwner = new();
@@ -28,6 +30,7 @@ internal sealed class McpEmulatorService : IDisposable
 	private readonly Dictionary<long, Breakpoint> _mcpBreakpoints = [];
 	private readonly object _executionLock = new();
 	private readonly Dictionary<CpuType, TaskCompletionSource<CapturedBreakEvent>> _breakWaiters = [];
+	private readonly McpExecutionWaiter _executionWaiter = new();
 	private BreakEvent? _latestBreakEvent;
 	private long? _latestBreakStableBreakpointId;
 	private long _latestBreakGeneration = -1;
@@ -39,25 +42,38 @@ internal sealed class McpEmulatorService : IDisposable
 	private int _breakpointReconciliationVersion;
 	private bool _breakpointReconciliationPending;
 	private long _nextBreakpointId;
-	private IDisposable? _debuggerLease;
-	private bool _serviceShutdownStarted;
+	private IDebuggerLifetimeLease? _debuggerLease;
+	private int _serviceShutdownStarted;
+	private bool _managedDetachmentCompleted;
 	private bool _debuggerCleanupCompleted;
 	private bool _breakpointCollectionDisposed;
-	private bool _disposed;
+	private bool _exclusiveInputCleanupCompleted;
+	private int _disposeRequested;
 
 	internal McpEmulatorService(
 		IMcpEmulatorApi api,
 		McpEmulatorGate? gate = null,
 		IDebuggerLifetimeCoordinator? debuggerLifetime = null,
 		IMcpBreakpointCollection? breakpointCollection = null,
-		ITraceLoggerCoordinator? traceCoordinator = null)
+		ITraceLoggerCoordinator? traceCoordinator = null,
+		McpEmulatorIdentity? emulatorIdentity = null,
+		McpExecutionCoordinator? executionCoordinator = null)
 	{
 		_api = api;
-		_gate = gate ?? new McpEmulatorGate(api);
+		_executionCoordinator = executionCoordinator ?? gate?.ExecutionCoordinator ?? new();
+		if(gate != null && executionCoordinator != null && !ReferenceEquals(gate.ExecutionCoordinator, executionCoordinator)) {
+			throw new ArgumentException("The gate and service must share one execution coordinator.", nameof(executionCoordinator));
+		}
+		_gate = gate ?? new McpEmulatorGate(api, _executionCoordinator);
+		_emulatorIdentity = emulatorIdentity ?? new();
 		_debuggerLifetime = debuggerLifetime ?? DebuggerLifetimeCoordinator.Shared;
 		_breakpointCollection = breakpointCollection ?? new McpBreakpointCollection();
 		_traceCoordinator = traceCoordinator ?? TraceLoggerCoordinator.Shared;
 	}
+
+	internal IMcpEmulatorApi Api => _api;
+	internal McpEmulatorIdentity EmulatorIdentity => _emulatorIdentity;
+	internal McpExecutionCoordinator ExecutionCoordinator => _executionCoordinator;
 
 	public McpServiceResult<EmulatorStatus> GetStatus()
 	{
@@ -66,13 +82,14 @@ internal sealed class McpEmulatorService : IDisposable
 				return McpServiceResult<EmulatorStatus>.Success(new(false, null, null, "stopped", MesenVersion, McpVersion));
 			}
 
-			bool paused = _api.IsPaused();
+			bool quarantined = _executionCoordinator.IsQuarantined;
+			bool paused = !quarantined && _api.IsPaused();
 			RomInfo romInfo = _api.GetRomInfo();
 			return McpServiceResult<EmulatorStatus>.Success(new(
 				true,
 				romInfo.ConsoleType.ToString(),
 				romInfo.GetRomName(),
-				paused ? "paused" : "running",
+				quarantined ? EmulatorStatus.Unknown : paused ? "paused" : "running",
 				MesenVersion,
 				McpVersion
 			));
@@ -247,7 +264,12 @@ internal sealed class McpEmulatorService : IDisposable
 			List<BreakpointManager.ExternalBreakpoint> replacements = GetExternalBreakpoints();
 			replacements.Add(new(id, breakpoint));
 			_breakpointCollection.Replace(replacements);
-			_mcpBreakpoints.Add(id, breakpoint);
+			lock(_executionLock) {
+				if(IsServiceStopping()) {
+					return ServiceStopping<McpBreakpoint>();
+				}
+				_mcpBreakpoints.Add(id, breakpoint);
+			}
 
 			return McpServiceResult<McpBreakpoint>.Success(ToMcpBreakpoint(id, breakpoint));
 		});
@@ -451,27 +473,207 @@ internal sealed class McpEmulatorService : IDisposable
 			case ConsoleNotificationType.CodeBreak:
 				if(copiedBreak.HasValue) {
 					RecordCodeBreak(copiedBreak.Value);
+					_executionWaiter.NotifyCodeBreak(copiedBreak.Value, _emulatorIdentity.Current);
 				}
+				_executionCoordinator.NotifyLifecycleRecovery();
+				break;
+			case ConsoleNotificationType.GamePaused:
+				_executionWaiter.NotifyStop(McpStopReason.Pause);
+				_executionCoordinator.NotifyLifecycleRecovery();
 				break;
 			case ConsoleNotificationType.GameResumed:
 			case ConsoleNotificationType.DebuggerResumed:
 				InvalidateLatestBreak();
 				break;
 			case ConsoleNotificationType.StateLoaded:
+				_executionWaiter.NotifyStop(McpStopReason.StateChanged);
+				_emulatorIdentity.NotifyStateLoaded();
+				_executionCoordinator.NotifyLifecycleRecovery();
+				InvalidateGenerationResources(_gate.NotifyEmulatorStateChanged);
+				break;
 			case ConsoleNotificationType.GameReset:
+				_executionWaiter.NotifyStop(McpStopReason.Reset);
+				_emulatorIdentity.NotifyMutableStateChanged();
+				_executionCoordinator.NotifyLifecycleRecovery();
 				InvalidateGenerationResources(_gate.NotifyEmulatorStateChanged);
 				break;
 			case ConsoleNotificationType.BeforeGameLoad:
 			case ConsoleNotificationType.BeforeGameUnload:
 			case ConsoleNotificationType.BeforeEmulationStop:
+				_executionWaiter.NotifyStop(McpStopReason.RomTransition);
 				InvalidateGenerationResources(_gate.BeginEmulatorTransition);
 				break;
 			case ConsoleNotificationType.GameLoaded:
 			case ConsoleNotificationType.GameLoadFailed:
 			case ConsoleNotificationType.EmulationStopped:
+				_executionWaiter.NotifyStop(McpStopReason.RomTransition);
+				_emulatorIdentity.NotifyRomChanged();
+				_executionCoordinator.NotifyLifecycleRecovery();
 				InvalidateGenerationResources(_gate.EndEmulatorTransition);
 				break;
 		}
+	}
+
+	internal async Task<McpStopResult> StepAndWaitAsync(
+		long leaseId,
+		CpuType cpuType,
+		int frameCount,
+		McpStateIdentity stateIdentity,
+		TimeSpan timeout,
+		CancellationToken cancellationToken,
+		McpOperationTicket? expectedTicket = null)
+	{
+		McpExecutionWaiter.Registration? waiter = null;
+		McpServiceResult<bool> setup = ExecuteOwnedWithDebuggerLease(leaseId, (ticket, prepareDebuggerLease) => {
+			if(_emulatorIdentity.Current != stateIdentity || ticket.Generation != _gate.Generation
+				|| (expectedTicket.HasValue && ticket != expectedTicket.Value)) {
+				return McpServiceResult<bool>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
+			if(cancellationToken.IsCancellationRequested) {
+				return McpServiceResult<bool>.Failure("cancelled", "The operation was cancelled.");
+			}
+			waiter = _executionWaiter.TryRegisterFrame(leaseId, cpuType, frameCount, stateIdentity);
+			if(waiter is null) {
+				return McpServiceResult<bool>.Failure("operation_in_progress", "Another execution waiter is active.");
+			}
+			McpServiceResult<bool> debuggerLease = prepareDebuggerLease();
+			if(!debuggerLease.IsSuccess) {
+				return debuggerLease;
+			}
+			InvalidateLatestBreak();
+			_api.Step(cpuType, frameCount, StepType.PpuFrame);
+			return McpServiceResult<bool>.Success(true);
+		});
+
+		if(!setup.IsSuccess) {
+			if(waiter?.Completion.Task.IsCompletedSuccessfully == true) {
+				McpStopResult completed = waiter.Completion.Task.Result;
+				waiter.Dispose();
+				return completed;
+			}
+			waiter?.Dispose();
+			return StopFailure(setup.Error!.Code);
+		}
+
+		McpExecutionWaiter.Registration activeWaiter = waiter!;
+		using(activeWaiter) {
+			using CancellationTokenSource timeoutCancellation = new(timeout <= TimeSpan.Zero ? TimeSpan.Zero : timeout);
+			using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+				cancellationToken,
+				timeoutCancellation.Token,
+				_executionCoordinator.ShutdownToken);
+			try {
+				return await activeWaiter.Completion.Task.WaitAsync(linkedCancellation.Token).ConfigureAwait(false);
+			} catch(OperationCanceledException) {
+				if(_executionCoordinator.ShutdownToken.IsCancellationRequested || IsServiceStopping()) {
+					return new(McpStopReason.ServerStopping, null, null, false);
+				}
+				if(cancellationToken.IsCancellationRequested) {
+					return new(McpStopReason.Cancelled, null, null, false);
+				}
+				return new(McpStopReason.Timeout, null, null, false);
+			}
+		}
+	}
+
+	internal async Task<McpStopResult> EnsureStoppedAsync(
+		long leaseId,
+		TimeSpan remainingBudget,
+		bool quarantineOnFailure = true,
+		McpStateIdentity? expectedIdentity = null,
+		CancellationToken cancellationToken = default,
+		McpOperationTicket? expectedTicket = null)
+	{
+		McpExecutionWaiter.Registration? waiter = null;
+		bool alreadyStopped = false;
+		Func<McpServiceResult<bool>> setupOperation = () => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<bool>();
+			}
+			ReconcilePendingResources();
+			if(cancellationToken.IsCancellationRequested) {
+				return McpServiceResult<bool>.Failure("cancelled", "The operation was cancelled.");
+			}
+			if(expectedIdentity.HasValue && _emulatorIdentity.Current != expectedIdentity.Value) {
+				return McpServiceResult<bool>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
+			if(_api.IsExecutionStopped()) {
+				alreadyStopped = true;
+				return McpServiceResult<bool>.Success(true);
+			}
+			if(expectedIdentity.HasValue && _emulatorIdentity.Current != expectedIdentity.Value) {
+				return McpServiceResult<bool>.Failure("state_changed", "Emulator state changed during the operation.");
+			}
+			waiter = _executionWaiter.TryRegisterStop(leaseId, _emulatorIdentity.Current);
+			if(waiter is null) {
+				return McpServiceResult<bool>.Failure("operation_in_progress", "Another execution waiter is active.");
+			}
+			_api.Pause();
+			return McpServiceResult<bool>.Success(true);
+		};
+		McpServiceResult<bool> setup = expectedTicket.HasValue
+			? _gate.ExecuteOwnedForTicket(leaseId, expectedTicket.Value, setupOperation)
+			: _gate.ExecuteOwned(leaseId, setupOperation);
+
+		if(alreadyStopped) {
+			_executionCoordinator.ConfirmStoppedAndClearQuarantine();
+			return new(McpStopReason.Pause, null, null, true);
+		}
+		if(!setup.IsSuccess && waiter?.Completion.Task.IsCompletedSuccessfully == true) {
+			McpStopResult completed = waiter.Completion.Task.Result;
+			waiter.Dispose();
+			if(completed.StopConfirmed) {
+				_executionCoordinator.ConfirmStoppedAndClearQuarantine();
+			}
+			return completed;
+		}
+		if(!setup.IsSuccess || waiter is null) {
+			waiter?.Dispose();
+			if(quarantineOnFailure) {
+				_executionCoordinator.EnterQuarantineForOwner(leaseId);
+			}
+			return StopFailure(setup.Error!.Code);
+		}
+
+		using(waiter) {
+			TimeSpan timeout = remainingBudget <= TimeSpan.Zero
+				? TimeSpan.Zero
+				: TimeSpan.FromMilliseconds(Math.Min(remainingBudget.TotalMilliseconds, 5000));
+			using CancellationTokenSource timeoutCancellation = new(timeout);
+			using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+				cancellationToken,
+				timeoutCancellation.Token,
+				_executionCoordinator.ShutdownToken);
+			try {
+				McpStopResult result = await waiter.Completion.Task.WaitAsync(linkedCancellation.Token).ConfigureAwait(false);
+				if(result.StopConfirmed) {
+					_executionCoordinator.ConfirmStoppedAndClearQuarantine();
+					return result;
+				}
+			} catch(OperationCanceledException) {
+				// Quarantine below before the execution lease can be released by the caller.
+			}
+		}
+
+		if(quarantineOnFailure) {
+			_executionCoordinator.EnterQuarantineForOwner(leaseId);
+		}
+		return _executionCoordinator.ShutdownToken.IsCancellationRequested || IsServiceStopping()
+			? new(McpStopReason.ServerStopping, null, null, false)
+			: cancellationToken.IsCancellationRequested
+				? new(McpStopReason.Cancelled, null, null, false)
+			: new(McpStopReason.Timeout, null, null, false);
+	}
+
+	private static McpStopResult StopFailure(string errorCode)
+	{
+		McpStopReason reason = errorCode switch {
+			"cancelled" => McpStopReason.Cancelled,
+			"server_stopping" => McpStopReason.ServerStopping,
+			"state_changed" => McpStopReason.StateChanged,
+			_ => McpStopReason.NativeFailure
+		};
+		return new(reason, null, null, false);
 	}
 
 	internal McpServiceResult<TraceConfiguration> ConfigureExecutionTrace(
@@ -562,15 +764,21 @@ internal sealed class McpEmulatorService : IDisposable
 				return TraceOwnershipConflict<TraceConfiguration>();
 			}
 			TraceConfiguration configured = new(cpu, true, indentCode, useLabels, condition, format, ticket.Generation);
+			bool stopping;
 			lock(_executionLock) {
-				if(_gate.Generation == ticket.Generation) {
+				stopping = IsServiceStopping();
+				if(!stopping && _gate.Generation == ticket.Generation) {
 					_traceConfiguration = configured;
 					_traceCpu = cpuType;
-				} else {
+				} else if(!stopping) {
 					_traceReconciliationCpu = cpuType;
 					_traceReconciliationVersion++;
 					_traceReconciliationPending = true;
 				}
+			}
+			if(stopping) {
+				_traceCoordinator.Release(_traceOwner);
+				return ServiceStopping<TraceConfiguration>();
 			}
 			return McpServiceResult<TraceConfiguration>.Success(configured);
 		});
@@ -621,18 +829,21 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal McpServiceResult<ExecutionState> Pause()
 	{
-		return ExecuteWithTicket(ticket => {
+		return ExecuteMutationWithTicket(McpExecutionMutation.Pause, ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
 			_api.Pause();
+			if(_api.IsExecutionStopped()) {
+				_executionCoordinator.ConfirmStoppedAndClearQuarantine();
+			}
 			return McpServiceResult<ExecutionState>.Success(new("paused", ticket.Generation));
 		});
 	}
 
 	internal McpServiceResult<ExecutionState> Resume()
 	{
-		return ExecuteWithTicket(ticket => {
+		return ExecuteMutationWithTicket(McpExecutionMutation.Resume, ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -659,7 +870,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<ExecutionState>.Failure("invalid_step_type", "The selected step type is not supported.");
 		}
 
-		return ExecuteWithDebuggerLease((ticket, prepareDebuggerLease) => {
+		return ExecuteMutationWithDebuggerLease(McpExecutionMutation.Step, (ticket, prepareDebuggerLease) => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -692,86 +903,97 @@ internal sealed class McpEmulatorService : IDisposable
 		int timeoutMs,
 		CancellationToken cancellationToken)
 	{
+		McpServiceResult<McpExecutionLease> acquisition = await _executionCoordinator
+			.TryAcquireAsync(cancellationToken)
+			.ConfigureAwait(false);
+		if(!acquisition.IsSuccess) {
+			return McpServiceResult<ContinueResult>.Failure(acquisition.Error!.Code, acquisition.Error.Message);
+		}
+		await using McpExecutionLease executionLease = acquisition.Value!;
+
 		McpOperationTicket ticket = default;
 		CpuType cpuType = default;
 		TaskCompletionSource<CapturedBreakEvent>? waiter = null;
-		McpServiceResult<ExecutionState> setup = ExecuteWithDebuggerLease((currentTicket, prepareDebuggerLease) => {
-			if(timeoutMs is < McpDebuggerLimits.MinContinueTimeoutMs or > McpDebuggerLimits.MaxContinueTimeoutMs) {
-				return McpServiceResult<ExecutionState>.Failure("invalid_timeout", "Continue timeout is outside the supported range.");
-			}
-			if(!TryParseExactEnum(cpu, out cpuType)) {
-				return McpServiceResult<ExecutionState>.Failure("unknown_cpu", "The selected CPU is not available.");
-			}
-			if(!_api.IsRunning()) {
-				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
-			}
-			if(!_api.GetRomInfo().CpuTypes.Contains(cpuType)) {
-				return McpServiceResult<ExecutionState>.Failure("unknown_cpu", "The selected CPU is not available.");
-			}
-			if(cancellationToken.IsCancellationRequested) {
-				return McpServiceResult<ExecutionState>.Failure("cancelled", "The continue operation was cancelled.");
-			}
-
-			lock(_executionLock) {
-				if(_gate.ShutdownToken.IsCancellationRequested) {
-					return McpServiceResult<ExecutionState>.Failure("server_stopping", "The MCP server is shutting down.");
-				}
-				if(_gate.Generation != currentTicket.Generation) {
-					return McpServiceResult<ExecutionState>.Failure("state_changed", "Emulator state changed during the operation.");
-				}
-				if(_breakWaiters.ContainsKey(cpuType)) {
-					return McpServiceResult<ExecutionState>.Failure("operation_in_progress", "A continue operation is already active for this CPU.");
-				}
-				waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
-				_breakWaiters.Add(cpuType, waiter);
-				_latestBreakEvent = null;
-				_latestBreakStableBreakpointId = null;
-				_latestBreakGeneration = -1;
-			}
-
-			McpServiceResult<bool> lease = prepareDebuggerLease();
-			if(!lease.IsSuccess) {
-				return FailureFrom<ExecutionState>(lease);
-			}
-			ticket = currentTicket;
-			if(_api.IsExecutionStopped()) {
-				_api.ResumeDebugger();
-			} else {
-				_api.Resume();
-			}
-			return McpServiceResult<ExecutionState>.Success(new("running", ticket.Generation));
-		});
-
-		if(!setup.IsSuccess) {
-			RemoveWaiter(cpuType, waiter);
-			return McpServiceResult<ContinueResult>.Failure(setup.Error!.Code, setup.Error.Message);
-		}
-
-		using CancellationTokenSource timeoutCancellation = new(timeoutMs);
-		using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-			cancellationToken,
-			timeoutCancellation.Token,
-			_gate.ShutdownToken
-		);
 		try {
-			CapturedBreakEvent captured = await waiter!.Task.WaitAsync(linkedCancellation.Token).ConfigureAwait(false);
-			return ExecuteForTicket(ticket, () => {
-				if(!_api.IsExecutionStopped()) {
-					return McpServiceResult<ContinueResult>.Failure("stale_context", "Execution resumed before break context could be captured.");
+			McpServiceResult<ExecutionState> setup = ExecuteOwnedWithDebuggerLease(
+				executionLease.LeaseId,
+				(currentTicket, prepareDebuggerLease) => {
+					if(timeoutMs is < McpDebuggerLimits.MinContinueTimeoutMs or > McpDebuggerLimits.MaxContinueTimeoutMs) {
+						return McpServiceResult<ExecutionState>.Failure("invalid_timeout", "Continue timeout is outside the supported range.");
+					}
+					if(!TryParseExactEnum(cpu, out cpuType)) {
+						return McpServiceResult<ExecutionState>.Failure("unknown_cpu", "The selected CPU is not available.");
+					}
+					if(!_api.IsRunning()) {
+						return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
+					}
+					if(!_api.GetRomInfo().CpuTypes.Contains(cpuType)) {
+						return McpServiceResult<ExecutionState>.Failure("unknown_cpu", "The selected CPU is not available.");
+					}
+					if(cancellationToken.IsCancellationRequested) {
+						return McpServiceResult<ExecutionState>.Failure("cancelled", "The continue operation was cancelled.");
 				}
-				return CreateContinueResult(captured, ticket.Generation);
-			});
-		} catch(OperationCanceledException) {
-			if(IsServiceStopping()) {
-				return McpServiceResult<ContinueResult>.Failure("server_stopping", "The MCP server is shutting down.");
+
+					lock(_executionLock) {
+						if(_gate.ShutdownToken.IsCancellationRequested) {
+							return McpServiceResult<ExecutionState>.Failure("server_stopping", "The MCP server is shutting down.");
+						}
+						if(_gate.Generation != currentTicket.Generation) {
+							return McpServiceResult<ExecutionState>.Failure("state_changed", "Emulator state changed during the operation.");
+						}
+						if(_breakWaiters.Count > 0) {
+							return McpServiceResult<ExecutionState>.Failure("operation_in_progress", "A continue operation is already active.");
+						}
+						waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
+						_breakWaiters.Add(cpuType, waiter);
+						_latestBreakEvent = null;
+						_latestBreakStableBreakpointId = null;
+						_latestBreakGeneration = -1;
+					}
+
+					McpServiceResult<bool> lease = prepareDebuggerLease();
+					if(!lease.IsSuccess) {
+						return FailureFrom<ExecutionState>(lease);
+					}
+					ticket = currentTicket;
+					if(_api.IsExecutionStopped()) {
+						_api.ResumeDebugger();
+					} else {
+						_api.Resume();
+					}
+					return McpServiceResult<ExecutionState>.Success(new("running", ticket.Generation));
+				});
+
+			if(!setup.IsSuccess) {
+				return McpServiceResult<ContinueResult>.Failure(setup.Error!.Code, setup.Error.Message);
 			}
-			if(_gate.Generation != ticket.Generation) {
-				return McpServiceResult<ContinueResult>.Failure("state_changed", "Emulator state changed during the operation.");
+
+			using CancellationTokenSource timeoutCancellation = new(timeoutMs);
+			using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+				cancellationToken,
+				timeoutCancellation.Token,
+				_gate.ShutdownToken
+			);
+			try {
+				CapturedBreakEvent captured = await waiter!.Task.WaitAsync(linkedCancellation.Token).ConfigureAwait(false);
+				return ExecuteOwnedForTicket(executionLease.LeaseId, ticket, () => {
+					if(!_api.IsExecutionStopped()) {
+						return McpServiceResult<ContinueResult>.Failure("stale_context", "Execution resumed before break context could be captured.");
+					}
+					return CreateContinueResult(captured, ticket.Generation);
+				});
+			} catch(OperationCanceledException) {
+				if(IsServiceStopping()) {
+					return McpServiceResult<ContinueResult>.Failure("server_stopping", "The MCP server is shutting down.");
+				}
+				if(_gate.Generation != ticket.Generation) {
+					return McpServiceResult<ContinueResult>.Failure("state_changed", "Emulator state changed during the operation.");
+				}
+				if(cancellationToken.IsCancellationRequested) {
+					return McpServiceResult<ContinueResult>.Failure("cancelled", "The continue operation was cancelled.");
+				}
+				return McpServiceResult<ContinueResult>.Failure("timeout", "The continue operation timed out.");
 			}
-			if(cancellationToken.IsCancellationRequested) {
-				return McpServiceResult<ContinueResult>.Failure("cancelled", "The continue operation was cancelled.");
-			}
-			return McpServiceResult<ContinueResult>.Failure("timeout", "The continue operation timed out.");
 		} finally {
 			RemoveWaiter(cpuType, waiter);
 		}
@@ -1001,7 +1223,7 @@ internal sealed class McpEmulatorService : IDisposable
 		CapturedBreakEvent captured = new(copied, stableBreakpointId);
 		TaskCompletionSource<CapturedBreakEvent>? waiter;
 		lock(_executionLock) {
-			if(_serviceShutdownStarted) {
+			if(IsServiceStopping()) {
 				return;
 			}
 			_latestBreakEvent = copied;
@@ -1065,7 +1287,12 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private void EnsureDebuggerLease()
 	{
-		_debuggerLease ??= _debuggerLifetime.Acquire();
+		lock(_executionLock) {
+			if(IsServiceStopping()) {
+				throw new OperationCanceledException("The MCP service is shutting down.");
+			}
+			_debuggerLease ??= _debuggerLifetime.Acquire();
+		}
 	}
 
 	private static McpServiceResult<T> FailureFrom<T>(McpServiceResult<bool> result)
@@ -1167,84 +1394,309 @@ internal sealed class McpEmulatorService : IDisposable
 		return new(name, value, bits, value.ToString($"X{digits}"));
 	}
 
-	internal void BeginServiceShutdown()
+	internal void AbandonBeforeCoreRelease()
 	{
+		if(Interlocked.Exchange(ref _serviceShutdownStarted, 1) != 0) {
+			return;
+		}
+		_executionCoordinator.BeginShutdown();
+		_gate.BeginShutdown();
+		_executionWaiter.NotifyStop(McpStopReason.ServerStopping, stopConfirmed: false);
+	}
+
+	internal void BeginServiceShutdown() => AbandonBeforeCoreRelease();
+
+	internal void CleanupDebuggerResources()
+	{
+		_gate.ExecuteTerminalCleanup(CleanupDebuggerResourcesCore);
+	}
+
+	private McpServiceResult<bool> CleanupDebuggerResourcesCore()
+	{
+		lock(_executionLock) {
+			if(_debuggerCleanupCompleted) {
+				return McpServiceResult<bool>.Success(true);
+			}
+		}
+
+		try {
+			ReconcilePendingTrace();
+			CpuType? traceCpu;
+			lock(_executionLock) {
+				traceCpu = _traceCpu;
+			}
+			if(traceCpu.HasValue && _traceCoordinator.IsOwner(_traceOwner)) {
+				_traceCoordinator.TryReleaseAndExecute(_traceOwner, () => {
+					_api.SetTraceOptions(traceCpu.Value, DisabledTraceOptions());
+					_api.ClearExecutionTrace();
+				});
+				lock(_executionLock) {
+					_traceConfiguration = null;
+					_traceCpu = null;
+				}
+			}
+			if(_debuggerLease is not null || _mcpBreakpoints.Count > 0) {
+				_breakpointCollection.Replace([]);
+			}
+			_mcpBreakpoints.Clear();
+		} catch(Exception) {
+			// Continue through session disposal and lease release after partial native cleanup.
+		} finally {
+			_traceCoordinator.Release(_traceOwner);
+			try {
+				if(!_breakpointCollectionDisposed) {
+					_breakpointCollection.Dispose();
+					_breakpointCollectionDisposed = true;
+				}
+			} finally {
+				try {
+					_debuggerLease?.Dispose();
+				} finally {
+					_debuggerLease = null;
+					_mcpBreakpoints.Clear();
+					lock(_executionLock) {
+						_traceConfiguration = null;
+						_traceCpu = null;
+						_debuggerCleanupCompleted = true;
+					}
+				}
+			}
+		}
+		return McpServiceResult<bool>.Success(true);
+	}
+
+	internal void DetachManagedResourcesAfterCoreRelease()
+	{
+		AbandonBeforeCoreRelease();
+		IDebuggerLifetimeLease? debuggerLease;
 		TaskCompletionSource<CapturedBreakEvent>[] waiters;
 		lock(_executionLock) {
-			if(_serviceShutdownStarted) {
+			if(_managedDetachmentCompleted) {
 				return;
 			}
-			_serviceShutdownStarted = true;
+			_managedDetachmentCompleted = true;
+			_debuggerCleanupCompleted = true;
+			_exclusiveInputCleanupCompleted = true;
+			_traceConfiguration = null;
+			_traceCpu = null;
+			_traceReconciliationCpu = null;
+			_traceReconciliationPending = false;
+			_breakpointReconciliationPending = false;
+			_mcpBreakpoints.Clear();
 			waiters = [.. _breakWaiters.Values];
 			_breakWaiters.Clear();
 			_latestBreakEvent = null;
 			_latestBreakStableBreakpointId = null;
 			_latestBreakGeneration = -1;
+			debuggerLease = _debuggerLease;
+			_debuggerLease = null;
+		}
+
+		_traceCoordinator.Release(_traceOwner);
+		try {
+			try {
+				_breakpointCollection.Detach();
+			} catch(Exception) {
+				// Native teardown owns the final breakpoint cleanup during application shutdown.
+			} finally {
+				_breakpointCollectionDisposed = true;
+			}
+		} finally {
+			debuggerLease?.Detach();
 		}
 		foreach(TaskCompletionSource<CapturedBreakEvent> waiter in waiters) {
 			waiter.TrySetCanceled();
 		}
 	}
 
-	internal void CleanupDebuggerResources()
+	internal McpServiceResult<T> ExecuteAutomation<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
 	{
-		_gate.ExecuteTerminalCleanup(() => {
-			lock(_executionLock) {
-				if(_debuggerCleanupCompleted) {
-					return McpServiceResult<bool>.Success(true);
-				}
-			}
+		return Execute(() => operation(_api, _emulatorIdentity.Current));
+	}
 
-			try {
-				ReconcilePendingTrace();
-				CpuType? traceCpu;
-				lock(_executionLock) {
-					traceCpu = _traceCpu;
-				}
-				if(traceCpu.HasValue && _traceCoordinator.IsOwner(_traceOwner)) {
-					_traceCoordinator.TryReleaseAndExecute(_traceOwner, () => {
-						_api.SetTraceOptions(traceCpu.Value, DisabledTraceOptions());
-						_api.ClearExecutionTrace();
-					});
-					lock(_executionLock) {
-						_traceConfiguration = null;
-						_traceCpu = null;
-					}
-				}
-				if(_debuggerLease is not null || _mcpBreakpoints.Count > 0) {
-					_breakpointCollection.Replace([]);
-				}
-				_mcpBreakpoints.Clear();
-			} catch(Exception) {
-				// Continue through session disposal and lease release after partial native cleanup.
-			} finally {
-				_traceCoordinator.Release(_traceOwner);
-				try {
-					if(!_breakpointCollectionDisposed) {
-						_breakpointCollection.Dispose();
-						_breakpointCollectionDisposed = true;
-					}
-				} finally {
-					try {
-						_debuggerLease?.Dispose();
-					} finally {
-						_debuggerLease = null;
-						_mcpBreakpoints.Clear();
-						lock(_executionLock) {
-							_traceConfiguration = null;
-							_traceCpu = null;
-							_debuggerCleanupCompleted = true;
-						}
-					}
-				}
+	internal McpServiceResult<T> ExecuteAutomationWithDebuggerLease<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		return ExecuteWithDebuggerLease((_, prepareDebuggerLease) => {
+			McpServiceResult<bool> prepared = prepareDebuggerLease();
+			if(!prepared.IsSuccess) {
+				return McpServiceResult<T>.Failure(prepared.Error!.Code, prepared.Error.Message);
 			}
-			return McpServiceResult<bool>.Success(true);
+			McpStateIdentity identity = _emulatorIdentity.Current;
+			McpServiceResult<T> result = operation(_api, identity);
+			return _emulatorIdentity.Current == identity
+				? result
+				: McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
 		});
 	}
 
-	internal void DrainOperations()
+	internal McpServiceResult<McpAutomationPreparation<T>> ExecuteAutomationPreparation<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
 	{
-		_gate.DrainOperations();
+		McpStateIdentity identity = default;
+		McpServiceResult<McpOperationPostflight<T>> preparation = ExecuteWithDebuggerLeasePostflight(
+			(_, prepareDebuggerLease) => {
+				McpServiceResult<bool> prepared = prepareDebuggerLease();
+				if(!prepared.IsSuccess) {
+					return McpServiceResult<T>.Failure(prepared.Error!.Code, prepared.Error.Message);
+				}
+				identity = _emulatorIdentity.Current;
+				McpServiceResult<T> result = operation(_api, identity);
+				return _emulatorIdentity.Current == identity
+					? result
+					: McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
+			});
+		return preparation.IsSuccess
+			? McpServiceResult<McpAutomationPreparation<T>>.Success(new(
+				preparation.Value!.Value, new(identity, preparation.Value.Ticket)))
+			: McpServiceResult<McpAutomationPreparation<T>>.Failure(
+				preparation.Error!.Code, preparation.Error.Message);
+	}
+
+	internal McpServiceResult<T> ExecuteAutomationTransaction<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, Action<Action<bool>>, McpServiceResult<T>> operation)
+	{
+		McpStateIdentity identity = default;
+		return ExecuteTransactional(
+			registerCompletion => {
+				identity = _emulatorIdentity.Current;
+				return operation(_api, identity, registerCompletion);
+			},
+			ticket => _gate.Generation == ticket.Generation && _emulatorIdentity.Current == identity);
+	}
+
+	internal McpServiceResult<T> ExecuteStoppedMemorySnapshot<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		return Execute(() => {
+			if(!_api.IsRunning()) {
+				return McpServiceResult<T>.Failure("no_game", "No game is currently loaded.");
+			}
+			if(!_api.IsExecutionStopped()) {
+				return McpServiceResult<T>.Failure(
+					"debugger_unavailable", "Execution must be stopped for memory capture operations.");
+			}
+			return operation(_api, _emulatorIdentity.Current);
+		});
+	}
+
+	internal McpServiceResult<T> ExecuteStoppedMemoryTransaction<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, Action<Action<bool>>, McpServiceResult<T>> operation)
+	{
+		McpStateIdentity identity = default;
+		bool captureStarted = false;
+		return ExecuteTransactional(
+			registerCompletion => {
+				if(!_api.IsRunning()) {
+					return McpServiceResult<T>.Failure("no_game", "No game is currently loaded.");
+				}
+				if(!_api.IsExecutionStopped()) {
+					return McpServiceResult<T>.Failure(
+						"debugger_unavailable", "Execution must be stopped for memory capture operations.");
+				}
+				identity = _emulatorIdentity.Current;
+				captureStarted = true;
+				return operation(_api, identity, registerCompletion);
+			},
+			ticket => !captureStarted || (_gate.Generation == ticket.Generation
+				&& _emulatorIdentity.Current == identity
+				&& _api.IsExecutionStopped()));
+	}
+
+	internal McpServiceResult<T> ExecuteOwned<T>(
+		long leaseId,
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteOwned(leaseId, () => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(_api, _emulatorIdentity.Current);
+		});
+	}
+
+	internal McpServiceResult<T> ExecuteOwnedForTicket<T>(
+		long leaseId,
+		McpOperationTicket ticket,
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteOwnedForTicket(leaseId, ticket, () => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(_api, _emulatorIdentity.Current);
+		});
+	}
+
+	internal McpServiceResult<BreakContext> GetOwnedBreakContext(
+		long leaseId,
+		BreakEvent breakEvent,
+		McpStateIdentity eventStateIdentity,
+		McpStateIdentity expectedStateIdentity)
+	{
+		return ExecuteOwned(leaseId, (api, currentIdentity) => {
+			if(eventStateIdentity != expectedStateIdentity
+				|| currentIdentity != expectedStateIdentity
+				|| !api.IsExecutionStopped()) {
+				return McpServiceResult<BreakContext>.Failure("state_changed", "Emulator state changed before break context could be captured.");
+			}
+			long? stableBreakpointId = _breakpointCollection.TryGetStableId(breakEvent.BreakpointId, out long stableId)
+				? stableId
+				: null;
+			McpServiceResult<BreakContext> context = BuildBreakContext(
+				breakEvent, stableBreakpointId, _gate.Generation, 8, 8, McpDebuggerLimits.MaxCallStackDepth);
+			return context.IsSuccess && _emulatorIdentity.Current == expectedStateIdentity
+				? context
+				: McpServiceResult<BreakContext>.Failure("state_changed", "Emulator state changed before break context could be captured.");
+		});
+	}
+
+	internal McpServiceResult<McpOperationPostflight<T>> ExecuteOwnedStateLoad<T>(
+		long leaseId,
+		McpOperationTicket? expectedTicket,
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<McpOperationPostflight<T>>();
+		}
+		return _gate.ExecuteOwnedStateLoad(leaseId, expectedTicket, _ => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			McpServiceResult<T> result = operation(_api, _emulatorIdentity.Current);
+			ReconcilePendingResources();
+			if(result.IsSuccess) {
+				EnsureDebuggerLease();
+			}
+			return result;
+		});
+	}
+
+	internal void CleanupExclusiveInput()
+	{
+		_gate.ExecuteTerminalCleanup(CleanupExclusiveInputCore);
+	}
+
+	private McpServiceResult<bool> CleanupExclusiveInputCore()
+	{
+		lock(_executionLock) {
+			if(_exclusiveInputCleanupCompleted) {
+				return McpServiceResult<bool>.Success(true);
+			}
+			_exclusiveInputCleanupCompleted = true;
+		}
+		_api.ClearExclusiveControllerOverrides();
+		return McpServiceResult<bool>.Success(true);
 	}
 
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
@@ -1261,12 +1713,46 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 	}
 
+	private McpServiceResult<T> ExecuteTransactional<T>(
+		Func<Action<Action<bool>>, McpServiceResult<T>> operation,
+		Func<McpOperationTicket, bool> postflight)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteTransactional(
+			registerCompletion => {
+				if(IsServiceStopping()) {
+					return ServiceStopping<T>();
+				}
+				ReconcilePendingResources();
+				return operation(registerCompletion);
+			},
+			(ticket, _) => postflight(ticket));
+	}
+
 	private McpServiceResult<T> ExecuteWithTicket<T>(Func<McpOperationTicket, McpServiceResult<T>> operation)
 	{
 		if(IsServiceStopping()) {
 			return ServiceStopping<T>();
 		}
 		return _gate.ExecuteWithTicket(ticket => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(ticket);
+		});
+	}
+
+	private McpServiceResult<T> ExecuteMutationWithTicket<T>(
+		McpExecutionMutation mutation,
+		Func<McpOperationTicket, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteMutationWithTicket(mutation, ticket => {
 			if(IsServiceStopping()) {
 				return ServiceStopping<T>();
 			}
@@ -1290,9 +1776,71 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 	}
 
+	private McpServiceResult<McpOperationPostflight<T>> ExecuteWithDebuggerLeasePostflight<T>(
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<McpOperationPostflight<T>>();
+		}
+		return _gate.ExecuteWithDebuggerLeasePostflight(
+			EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
+				if(IsServiceStopping()) {
+					return ServiceStopping<T>();
+				}
+				ReconcilePendingResources();
+				return operation(ticket, prepareDebuggerLease);
+			});
+	}
+
+	private McpServiceResult<T> ExecuteMutationWithDebuggerLease<T>(
+		McpExecutionMutation mutation,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteMutationWithDebuggerLease(mutation, EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(ticket, prepareDebuggerLease);
+		});
+	}
+
+	private McpServiceResult<T> ExecuteOwnedWithDebuggerLease<T>(
+		long leaseId,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteOwnedWithDebuggerLease(leaseId, EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(ticket, prepareDebuggerLease);
+		});
+	}
+
 	private McpServiceResult<T> ExecuteForTicket<T>(McpOperationTicket ticket, Func<McpServiceResult<T>> operation)
 	{
 		return _gate.ExecuteForTicket(ticket, () => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation();
+		});
+	}
+
+	private McpServiceResult<T> ExecuteOwnedForTicket<T>(
+		long leaseId,
+		McpOperationTicket ticket,
+		Func<McpServiceResult<T>> operation)
+	{
+		return _gate.ExecuteOwnedForTicket(leaseId, ticket, () => {
 			if(IsServiceStopping()) {
 				return ServiceStopping<T>();
 			}
@@ -1309,9 +1857,7 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private bool IsServiceStopping()
 	{
-		lock(_executionLock) {
-			return _serviceShutdownStarted;
-		}
+		return Volatile.Read(ref _serviceShutdownStarted) != 0;
 	}
 
 	private static McpServiceResult<T> ServiceStopping<T>() =>
@@ -1331,15 +1877,10 @@ internal sealed class McpEmulatorService : IDisposable
 
 	public void Dispose()
 	{
-		lock(_executionLock) {
-			if(_disposed) {
-				return;
-			}
-			_disposed = true;
+		if(Interlocked.Exchange(ref _disposeRequested, 1) != 0) {
+			return;
 		}
-		BeginServiceShutdown();
-		CleanupDebuggerResources();
-		_gate.BeginShutdown();
-		_gate.DrainOperations();
+		AbandonBeforeCoreRelease();
+		DetachManagedResourcesAfterCoreRelease();
 	}
 }

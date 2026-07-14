@@ -10,6 +10,15 @@
 #include "Utilities/FolderUtilities.h"
 
 const static double PI = 3.14159265358979323846;
+const static uint32_t MaxScreenshotDimension = 4096;
+const static uint32_t MaxScreenshotPixels = 16777216;
+
+static bool ValidateScreenshotDimensions(FrameInfo frameInfo)
+{
+	return frameInfo.Width > 0 && frameInfo.Height > 0
+		&& frameInfo.Width <= MaxScreenshotDimension && frameInfo.Height <= MaxScreenshotDimension
+		&& frameInfo.Width <= MaxScreenshotPixels / frameInfo.Height;
+}
 
 BaseVideoFilter::BaseVideoFilter(Emulator* emu)
 {
@@ -41,10 +50,11 @@ void BaseVideoFilter::UpdateBufferSize()
 {
 	uint32_t newBufferSize = _frameInfo.Width * _frameInfo.Height;
 	if(_bufferSize != newBufferSize) {
+		unique_ptr<uint32_t[]> outputBuffer(new uint32_t[newBufferSize]);
 		_frameLock.Acquire();
 		delete[] _outputBuffer;
 		_bufferSize = newBufferSize;
-		_outputBuffer = new uint32_t[newBufferSize];
+		_outputBuffer = outputBuffer.release();
 		_frameLock.Release();
 	}
 }
@@ -91,9 +101,20 @@ FrameInfo BaseVideoFilter::GetFrameInfo(uint16_t* ppuOutputBuffer, bool enableOv
 
 FrameInfo BaseVideoFilter::SendFrame(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, bool enableOverscan)
 {
+	return SendFrameInternal(ppuOutputBuffer, frameNumber, videoPhase, frameData, nullptr, enableOverscan);
+}
+
+FrameInfo BaseVideoFilter::SendFrameForDisplay(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, vector<uint32_t>& displayBuffer, bool enableOverscan)
+{
+	return SendFrameInternal(ppuOutputBuffer, frameNumber, videoPhase, frameData, &displayBuffer, enableOverscan);
+}
+
+FrameInfo BaseVideoFilter::SendFrameInternal(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, vector<uint32_t>* displayBuffer, bool enableOverscan)
+{
 	auto lock = _frameLock.AcquireSafe();
 	_overscan = enableOverscan ? _emu->GetSettings()->GetOverscan() : OverscanDimensions {};
 	_isOddFrame = frameNumber % 2;
+	_frameNumber = frameNumber;
 	_videoPhase = videoPhase;
 	_frameData = frameData;
 	_ppuOutputBuffer = ppuOutputBuffer;
@@ -102,6 +123,9 @@ FrameInfo BaseVideoFilter::SendFrame(uint16_t* ppuOutputBuffer, uint32_t frameNu
 	_frameInfo = frameInfo;
 	UpdateBufferSize();
 	ApplyFilter(ppuOutputBuffer);
+	if(displayBuffer) {
+		displayBuffer->assign(_outputBuffer, _outputBuffer + _bufferSize);
+	}
 	_ppuOutputBuffer = nullptr;
 	return frameInfo;
 }
@@ -208,6 +232,77 @@ void BaseVideoFilter::TakeScreenshot(VideoFilterType filterType, string filename
 	}
 
 	delete[] frameBuffer;
+}
+
+ScreenshotCapture BaseVideoFilter::CaptureScreenshot(VideoFilterType filterType)
+{
+	ScreenshotCapture capture;
+	vector<uint32_t> frameBuffer;
+	FrameInfo frameInfo;
+	{
+		auto lock = _frameLock.AcquireSafe();
+		capture.Width = _frameInfo.Width;
+		capture.Height = _frameInfo.Height;
+		capture.FrameNumber = _frameNumber;
+		if(_bufferSize == 0 || !GetOutputBuffer()) {
+			capture.Width = 0;
+			capture.Height = 0;
+			return capture;
+		}
+		if(!ValidateScreenshotDimensions(_frameInfo) || _bufferSize != _frameInfo.Width * _frameInfo.Height) {
+			return capture;
+		}
+
+		frameBuffer.resize(_bufferSize);
+		memcpy(frameBuffer.data(), GetOutputBuffer(), _bufferSize * sizeof(frameBuffer[0]));
+		frameInfo = _frameInfo;
+	}
+
+	uint32_t* pngBuffer = frameBuffer.data();
+	uint8_t scale = 1;
+
+	uint32_t screenRotation = _emu->GetSettings()->GetVideoConfig().ScreenRotation;
+	_emu->GetScreenRotationOverride(screenRotation);
+	unique_ptr<RotateFilter> rotateFilter(new RotateFilter(screenRotation));
+	if(screenRotation != 0) {
+		FrameInfo rotatedFrameInfo = rotateFilter->GetFrameInfo(frameInfo);
+		if(!ValidateScreenshotDimensions(rotatedFrameInfo)) {
+			capture.Width = rotatedFrameInfo.Width;
+			capture.Height = rotatedFrameInfo.Height;
+			return capture;
+		}
+		pngBuffer = rotateFilter->ApplyFilter(pngBuffer, frameInfo.Width, frameInfo.Height);
+		frameInfo = rotatedFrameInfo;
+	}
+
+	unique_ptr<ScaleFilter> scaleFilter = ScaleFilter::GetScaleFilter(_emu, filterType);
+	if(scaleFilter) {
+		uint32_t filterScale = scaleFilter->GetScale();
+		if(filterScale == 0 || frameInfo.Width > MaxScreenshotDimension / filterScale || frameInfo.Height > MaxScreenshotDimension / filterScale) {
+			capture.Width = 0;
+			capture.Height = 0;
+			return capture;
+		}
+		FrameInfo scaledFrameInfo = scaleFilter->GetFrameInfo(frameInfo);
+		if(!ValidateScreenshotDimensions(scaledFrameInfo)) {
+			capture.Width = scaledFrameInfo.Width;
+			capture.Height = scaledFrameInfo.Height;
+			return capture;
+		}
+		pngBuffer = scaleFilter->ApplyFilter(pngBuffer, frameInfo.Width, frameInfo.Height);
+		frameInfo = scaledFrameInfo;
+		scale = scaleFilter->GetScale();
+	}
+
+	ScanlineFilter::ApplyFilter(pngBuffer, frameInfo.Width, frameInfo.Height, _emu->GetSettings()->GetVideoConfig().ScanlineIntensity, scale);
+	capture.Width = frameInfo.Width;
+	capture.Height = frameInfo.Height;
+	std::stringstream stream;
+	if(PNGHelper::WritePNG(stream, pngBuffer, frameInfo.Width, frameInfo.Height) && stream.good()) {
+		string png = stream.str();
+		capture.Png.assign(png.begin(), png.end());
+	}
+	return capture;
 }
 
 void BaseVideoFilter::TakeScreenshot(string romName, VideoFilterType filterType)
