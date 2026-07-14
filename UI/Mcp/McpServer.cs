@@ -30,6 +30,7 @@ internal sealed class McpServer : IDisposable
 	private long _nextGenerationId;
 	private bool _stopping;
 	private bool _resourcesDisposed;
+	private bool _coreReleaseCompleted;
 	private bool _disposed;
 
 	internal McpServer(
@@ -101,7 +102,7 @@ internal sealed class McpServer : IDisposable
 			}
 			_stopping = true;
 		}
-		_service.BeginServiceShutdown();
+		_service.AbandonBeforeCoreRelease();
 		LifecycleGeneration? generation;
 		Task? shutdownTask;
 		lock(_lifecycleLock) {
@@ -127,7 +128,6 @@ internal sealed class McpServer : IDisposable
 			TryStopApplication(generation.Application);
 		}
 
-		_service.DetachManagedResources();
 		DisposeResourceStores();
 		try {
 			if(shutdownTask is not null && !shutdownTask.Wait(RemainingStopBudget(stopStarted, boundedTimeout))) {
@@ -144,6 +144,18 @@ internal sealed class McpServer : IDisposable
 				_detachedShutdownTask = null;
 			}
 		}
+	}
+
+	internal void CompleteCoreRelease()
+	{
+		lock(_lifecycleLock) {
+			if(_coreReleaseCompleted) {
+				return;
+			}
+			_coreReleaseCompleted = true;
+		}
+		_service.DetachManagedResourcesAfterCoreRelease();
+		_service.Dispose();
 	}
 
 	internal void ProcessNotification(NotificationEventArgs e)

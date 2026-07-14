@@ -34,6 +34,7 @@ public sealed class McpServerTests
 		Assert.Equal("stale_resource", server.MemorySearches.Pin(search).Error?.Code);
 
 		server.Stop(TimeSpan.FromSeconds(1));
+		server.CompleteCoreRelease();
 		server.Dispose();
 
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
@@ -101,7 +102,7 @@ public sealed class McpServerTests
 		);
 
 		Assert.Equal([
-			"disabled-config", "config", "start", "dispose", "listener-dispose", "core-stop", "core-release"
+			"disabled-config", "config", "start", "listener-dispose", "core-stop", "core-release", "dispose"
 		], events);
 	}
 
@@ -144,7 +145,7 @@ public sealed class McpServerTests
 		await start;
 		lifecycle.StopBeforeCoreRelease(() => { }, () => { }, () => { });
 
-		Assert.Equal(["dispose", "core-stop", "core-release"], events);
+		Assert.Equal(["core-stop", "core-release", "dispose"], events);
 	}
 
 	[Fact]
@@ -642,7 +643,7 @@ public sealed class McpServerTests
 		Assert.InRange(elapsed, 0, 1000);
 		Assert.Equal(1, hostCleanupCalls);
 		Assert.Equal(0, breakpoints.DisposeCalls);
-		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.DetachCalls);
 		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
 		Assert.Equal(0, debuggerReleaseCalls);
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
@@ -654,6 +655,7 @@ public sealed class McpServerTests
 
 		releaseHostCleanup.SetResult();
 		await hostCleanupCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+		server.CompleteCoreRelease();
 
 		Assert.Equal(nativeCallsAfterStop, NativeCallCount(api));
 		server.Stop(TimeSpan.Zero);
@@ -691,6 +693,7 @@ public sealed class McpServerTests
 		Assert.InRange(elapsed, 0, 1000);
 		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
 		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, breakpoints.DetachCalls);
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
@@ -705,6 +708,7 @@ public sealed class McpServerTests
 
 		releaseRead.Set();
 		await read.WaitAsync(TimeSpan.FromSeconds(5));
+		server.CompleteCoreRelease();
 		Assert.Equal(0, breakpoints.DisposeCalls);
 		Assert.Equal(1, breakpoints.DetachCalls);
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
@@ -736,7 +740,7 @@ public sealed class McpServerTests
 
 		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
 		Assert.Equal("server_stopping", service.GetStatus().Error?.Code);
-		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.DetachCalls);
 		Assert.Equal(0, breakpoints.DisposeCalls);
 		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
 		Assert.Equal(1, debuggerInitializeCalls);
@@ -744,12 +748,98 @@ public sealed class McpServerTests
 		Assert.Equal(setTraceCalls, api.SetTraceOptionsCalls);
 		Assert.Equal(0, api.ClearExecutionTraceCalls);
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+		Assert.False(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
+
+		server.CompleteCoreRelease();
+		Assert.Equal(1, breakpoints.DetachCalls);
 		Assert.True(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
 
 		server.Stop(TimeSpan.Zero);
 		server.Dispose();
 		Assert.Equal(1, breakpoints.DetachCalls);
 		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
+	public async Task AutomationStop_DoesNotWaitForTracePublicationLockBeforeCoreRelease()
+	{
+		using ManualResetEventSlim publicationEntered = new();
+		using ManualResetEventSlim releasePublication = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.SetTraceOptionsHandler = (_, _) => {
+			publicationEntered.Set();
+			releasePublication.Wait(TimeSpan.FromSeconds(5));
+		};
+		TraceLoggerCoordinator traceCoordinator = new();
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: breakpoints,
+			traceCoordinator: traceCoordinator);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Task<McpServiceResult<TraceConfiguration>> publication = Task.Run(() =>
+			service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null));
+		Assert.True(publicationEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+
+		Assert.InRange(Environment.TickCount64 - started, 0, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+
+		releasePublication.Set();
+		Assert.Equal("server_stopping", (await publication.WaitAsync(TimeSpan.FromSeconds(5))).Error?.Code);
+		server.CompleteCoreRelease();
+		server.CompleteCoreRelease();
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+	}
+
+	[Fact]
+	public async Task AutomationStop_DoesNotWaitForBreakpointPublicationLockBeforeCoreRelease()
+	{
+		using ManualResetEventSlim publicationEntered = new();
+		using ManualResetEventSlim releasePublication = new();
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		TrackingBreakpointCollection breakpoints = new() {
+			ReplaceHandler = () => {
+				publicationEntered.Set();
+				releasePublication.Wait(TimeSpan.FromSeconds(5));
+			}
+		};
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: breakpoints);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Task<McpServiceResult<McpBreakpoint>> publication = Task.Run(() =>
+			service.SetBreakpoint(nameof(CpuType.Nes), nameof(MemoryType.NesWorkRam), "write", 0, null, null));
+		Assert.True(publicationEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+
+		Assert.InRange(Environment.TickCount64 - started, 0, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(0, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+
+		releasePublication.Set();
+		Assert.Equal("server_stopping", (await publication.WaitAsync(TimeSpan.FromSeconds(5))).Error?.Code);
+		server.CompleteCoreRelease();
+		server.Dispose();
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 	}
 
@@ -853,9 +943,11 @@ public sealed class McpServerTests
 		public int EmptyReplaceCalls { get; private set; }
 		public int DisposeCalls { get; private set; }
 		public int DetachCalls { get; private set; }
+		public Action? ReplaceHandler { get; init; }
 
 		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints)
 		{
+			ReplaceHandler?.Invoke();
 			if(breakpoints.Count == 0) {
 				EmptyReplaceCalls++;
 			}

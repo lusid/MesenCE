@@ -916,14 +916,17 @@ namespace Mesen.Windows
 
 			if(server != null) {
 				server.Stop(TimeSpan.FromSeconds(2));
+			}
+			disposeListener();
+			stopCore();
+			releaseCore();
+			if(server != null) {
+				server.CompleteCoreRelease();
 				_disposeServer(server);
 			}
 			lock(_lock) {
 				_stoppingServer = null;
 			}
-			disposeListener();
-			stopCore();
-			releaseCore();
 		}
 
 		internal void ProcessNotification(NotificationEventArgs e)

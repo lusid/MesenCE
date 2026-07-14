@@ -42,12 +42,12 @@ internal sealed class McpEmulatorService : IDisposable
 	private bool _breakpointReconciliationPending;
 	private long _nextBreakpointId;
 	private IDebuggerLifetimeLease? _debuggerLease;
-	private bool _serviceShutdownStarted;
+	private int _serviceShutdownStarted;
 	private bool _managedDetachmentCompleted;
 	private bool _debuggerCleanupCompleted;
 	private bool _breakpointCollectionDisposed;
 	private bool _exclusiveInputCleanupCompleted;
-	private bool _disposed;
+	private int _disposeRequested;
 
 	internal McpEmulatorService(
 		IMcpEmulatorApi api,
@@ -264,7 +264,7 @@ internal sealed class McpEmulatorService : IDisposable
 			replacements.Add(new(id, breakpoint));
 			_breakpointCollection.Replace(replacements);
 			lock(_executionLock) {
-				if(_serviceShutdownStarted) {
+				if(IsServiceStopping()) {
 					return ServiceStopping<McpBreakpoint>();
 				}
 				_mcpBreakpoints.Add(id, breakpoint);
@@ -597,7 +597,7 @@ internal sealed class McpEmulatorService : IDisposable
 			TraceConfiguration configured = new(cpu, true, indentCode, useLabels, condition, format, ticket.Generation);
 			bool stopping;
 			lock(_executionLock) {
-				stopping = _serviceShutdownStarted;
+				stopping = IsServiceStopping();
 				if(!stopping && _gate.Generation == ticket.Generation) {
 					_traceConfiguration = configured;
 					_traceCpu = cpuType;
@@ -1054,7 +1054,7 @@ internal sealed class McpEmulatorService : IDisposable
 		CapturedBreakEvent captured = new(copied, stableBreakpointId);
 		TaskCompletionSource<CapturedBreakEvent>? waiter;
 		lock(_executionLock) {
-			if(_serviceShutdownStarted) {
+			if(IsServiceStopping()) {
 				return;
 			}
 			_latestBreakEvent = copied;
@@ -1119,7 +1119,7 @@ internal sealed class McpEmulatorService : IDisposable
 	private void EnsureDebuggerLease()
 	{
 		lock(_executionLock) {
-			if(_serviceShutdownStarted) {
+			if(IsServiceStopping()) {
 				throw new OperationCanceledException("The MCP service is shutting down.");
 			}
 			_debuggerLease ??= _debuggerLifetime.Acquire();
@@ -1225,25 +1225,16 @@ internal sealed class McpEmulatorService : IDisposable
 		return new(name, value, bits, value.ToString($"X{digits}"));
 	}
 
-	internal void BeginServiceShutdown()
+	internal void AbandonBeforeCoreRelease()
 	{
+		if(Interlocked.Exchange(ref _serviceShutdownStarted, 1) != 0) {
+			return;
+		}
 		_executionCoordinator.BeginShutdown();
-		TaskCompletionSource<CapturedBreakEvent>[] waiters;
-		lock(_executionLock) {
-			if(_serviceShutdownStarted) {
-				return;
-			}
-			_serviceShutdownStarted = true;
-			waiters = [.. _breakWaiters.Values];
-			_breakWaiters.Clear();
-			_latestBreakEvent = null;
-			_latestBreakStableBreakpointId = null;
-			_latestBreakGeneration = -1;
-		}
-		foreach(TaskCompletionSource<CapturedBreakEvent> waiter in waiters) {
-			waiter.TrySetCanceled();
-		}
+		_gate.BeginShutdown();
 	}
+
+	internal void BeginServiceShutdown() => AbandonBeforeCoreRelease();
 
 	internal void CleanupDebuggerResources()
 	{
@@ -1304,17 +1295,16 @@ internal sealed class McpEmulatorService : IDisposable
 		return McpServiceResult<bool>.Success(true);
 	}
 
-	internal void DetachManagedResources()
+	internal void DetachManagedResourcesAfterCoreRelease()
 	{
-		BeginServiceShutdown();
-		_gate.BeginShutdown();
+		AbandonBeforeCoreRelease();
 		IDebuggerLifetimeLease? debuggerLease;
+		TaskCompletionSource<CapturedBreakEvent>[] waiters;
 		lock(_executionLock) {
 			if(_managedDetachmentCompleted) {
 				return;
 			}
 			_managedDetachmentCompleted = true;
-			_disposed = true;
 			_debuggerCleanupCompleted = true;
 			_exclusiveInputCleanupCompleted = true;
 			_traceConfiguration = null;
@@ -1323,6 +1313,11 @@ internal sealed class McpEmulatorService : IDisposable
 			_traceReconciliationPending = false;
 			_breakpointReconciliationPending = false;
 			_mcpBreakpoints.Clear();
+			waiters = [.. _breakWaiters.Values];
+			_breakWaiters.Clear();
+			_latestBreakEvent = null;
+			_latestBreakStableBreakpointId = null;
+			_latestBreakGeneration = -1;
 			debuggerLease = _debuggerLease;
 			_debuggerLease = null;
 		}
@@ -1338,6 +1333,9 @@ internal sealed class McpEmulatorService : IDisposable
 			}
 		} finally {
 			debuggerLease?.Detach();
+		}
+		foreach(TaskCompletionSource<CapturedBreakEvent> waiter in waiters) {
+			waiter.TrySetCanceled();
 		}
 	}
 
@@ -1506,9 +1504,7 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private bool IsServiceStopping()
 	{
-		lock(_executionLock) {
-			return _serviceShutdownStarted;
-		}
+		return Volatile.Read(ref _serviceShutdownStarted) != 0;
 	}
 
 	private static McpServiceResult<T> ServiceStopping<T>() =>
@@ -1528,15 +1524,10 @@ internal sealed class McpEmulatorService : IDisposable
 
 	public void Dispose()
 	{
-		lock(_executionLock) {
-			if(_disposed) {
-				return;
-			}
-			_disposed = true;
+		if(Interlocked.Exchange(ref _disposeRequested, 1) != 0) {
+			return;
 		}
-		BeginServiceShutdown();
-		CleanupDebuggerResources();
-		_gate.BeginShutdown();
-		_gate.DrainOperations();
+		AbandonBeforeCoreRelease();
+		DetachManagedResourcesAfterCoreRelease();
 	}
 }
