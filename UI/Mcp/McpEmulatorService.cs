@@ -578,7 +578,8 @@ internal sealed class McpEmulatorService : IDisposable
 		long leaseId,
 		TimeSpan remainingBudget,
 		bool quarantineOnFailure = true,
-		McpStateIdentity? expectedIdentity = null)
+		McpStateIdentity? expectedIdentity = null,
+		CancellationToken cancellationToken = default)
 	{
 		McpExecutionWaiter.Registration? waiter = null;
 		bool alreadyStopped = false;
@@ -587,6 +588,9 @@ internal sealed class McpEmulatorService : IDisposable
 				return ServiceStopping<bool>();
 			}
 			ReconcilePendingResources();
+			if(cancellationToken.IsCancellationRequested) {
+				return McpServiceResult<bool>.Failure("cancelled", "The operation was cancelled.");
+			}
 			if(expectedIdentity.HasValue && _emulatorIdentity.Current != expectedIdentity.Value) {
 				return McpServiceResult<bool>.Failure("state_changed", "Emulator state changed during the operation.");
 			}
@@ -623,6 +627,7 @@ internal sealed class McpEmulatorService : IDisposable
 				: TimeSpan.FromMilliseconds(Math.Min(remainingBudget.TotalMilliseconds, 5000));
 			using CancellationTokenSource timeoutCancellation = new(timeout);
 			using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+				cancellationToken,
 				timeoutCancellation.Token,
 				_executionCoordinator.ShutdownToken);
 			try {
@@ -641,6 +646,8 @@ internal sealed class McpEmulatorService : IDisposable
 		}
 		return _executionCoordinator.ShutdownToken.IsCancellationRequested || IsServiceStopping()
 			? new(McpStopReason.ServerStopping, null, null, false)
+			: cancellationToken.IsCancellationRequested
+				? new(McpStopReason.Cancelled, null, null, false)
 			: new(McpStopReason.Timeout, null, null, false);
 	}
 

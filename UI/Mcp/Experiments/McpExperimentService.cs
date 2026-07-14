@@ -73,7 +73,7 @@ internal sealed class McpExperimentService
 					return FailureFrom<RunExperimentResult, McpPinnedResource<McpSaveStateResource>>(pinResult);
 				}
 				statePin = pinResult.Value!;
-				if(CheckDeadline()) {
+				if(CheckCancellation() || CheckDeadline()) {
 					goto Cleanup;
 				}
 				McpServiceResult<McpStateIdentity> load = LoadOwnedState(
@@ -83,16 +83,12 @@ internal sealed class McpExperimentService
 					goto Cleanup;
 				}
 				expectedIdentity = load.Value!;
-				if(CheckDeadline()) {
+				if(CheckCancellation() || CheckDeadline()) {
 					goto Cleanup;
 				}
 			}
 
-			if(cancellationToken.IsCancellationRequested) {
-				SetFailure("cancelled");
-				goto Cleanup;
-			}
-			if(CheckDeadline()) {
+			if(CheckCancellation() || CheckDeadline()) {
 				goto Cleanup;
 			}
 
@@ -101,7 +97,7 @@ internal sealed class McpExperimentService
 				SetFailure(enabled.Error!.Code);
 				goto Cleanup;
 			}
-			if(CheckDeadline()) {
+			if(CheckCancellation() || CheckDeadline()) {
 				goto Cleanup;
 			}
 
@@ -109,7 +105,8 @@ internal sealed class McpExperimentService
 				lease.LeaseId,
 				Remaining(started, prepared.Experiment.TimeoutMs),
 				quarantineOnFailure: false,
-				expectedIdentity: expectedIdentity).ConfigureAwait(false);
+				expectedIdentity: expectedIdentity,
+				cancellationToken: cancellationToken).ConfigureAwait(false);
 			if(!initialStop.StopConfirmed) {
 				SetStopFailure(initialStop);
 				goto Cleanup;
@@ -119,7 +116,7 @@ internal sealed class McpExperimentService
 				SetFailure(initialIdentity.Error!.Code);
 				goto Cleanup;
 			}
-			if(CheckDeadline()) {
+			if(CheckCancellation() || CheckDeadline()) {
 				goto Cleanup;
 			}
 
@@ -130,7 +127,7 @@ internal sealed class McpExperimentService
 				goto Cleanup;
 			}
 			AddCheckpoint(initial.Value!.Result);
-			if(CheckDeadline()) {
+			if(CheckCancellation() || CheckDeadline()) {
 				goto Cleanup;
 			}
 			if(ApplyAssertionOutcome(initial.Value)) {
@@ -138,8 +135,7 @@ internal sealed class McpExperimentService
 			}
 
 			foreach(McpValidatedSegment segment in prepared.Experiment.Segments) {
-				if(cancellationToken.IsCancellationRequested) {
-					SetFailure("cancelled");
+				if(CheckCancellation()) {
 					break;
 				}
 				TimeSpan remaining = Remaining(started, prepared.Experiment.TimeoutMs);
@@ -153,7 +149,7 @@ internal sealed class McpExperimentService
 					SetFailure(input.Error!.Code);
 					break;
 				}
-				if(CheckDeadline()) {
+				if(CheckCancellation() || CheckDeadline()) {
 					break;
 				}
 				remaining = Remaining(started, prepared.Experiment.TimeoutMs);
@@ -162,6 +158,9 @@ internal sealed class McpExperimentService
 					break;
 				}
 
+				if(CheckCancellation()) {
+					break;
+				}
 				McpStopResult step = await _emulator.StepAndWaitAsync(
 					lease.LeaseId,
 					prepared.CpuType,
@@ -176,15 +175,21 @@ internal sealed class McpExperimentService
 
 				completedFrames += segment.Frames;
 				completedSegments.Add(segment.Index);
+				if(CheckCancellation()) {
+					break;
+				}
 				McpServiceResult<bool> postStepIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
 				if(!postStepIdentity.IsSuccess) {
 					SetFailure(postStepIdentity.Error!.Code);
 					break;
 				}
-				if(CheckDeadline()) {
+				if(CheckCancellation() || CheckDeadline()) {
 					break;
 				}
 				if(segment.CheckpointIndex.HasValue) {
+					if(CheckCancellation() || CheckDeadline()) {
+						break;
+					}
 					McpServiceResult<CheckpointCapture> checkpoint = CaptureCheckpoint(
 						lease.LeaseId, expectedIdentity, prepared, segment.CheckpointIndex.Value,
 						completedFrames, observationSlots, assertionResults);
@@ -193,7 +198,7 @@ internal sealed class McpExperimentService
 						break;
 					}
 					AddCheckpoint(checkpoint.Value!.Result);
-					if(CheckDeadline()) {
+					if(CheckCancellation() || CheckDeadline()) {
 						break;
 					}
 					if(ApplyAssertionOutcome(checkpoint.Value)) {
@@ -203,12 +208,7 @@ internal sealed class McpExperimentService
 			}
 
 			if(!halted && completedSegments.Count == prepared.Experiment.Segments.Count) {
-				if(cancellationToken.IsCancellationRequested) {
-					SetFailure("cancelled");
-					goto Cleanup;
-				}
-				if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero) {
-					SetFailure("timeout");
+				if(CheckCancellation() || CheckDeadline()) {
 					goto Cleanup;
 				}
 				int finalIndex = prepared.Experiment.Checkpoints.Count - 1;
@@ -219,14 +219,14 @@ internal sealed class McpExperimentService
 					goto Cleanup;
 				}
 				AddCheckpoint(final.Value!.Result);
-				if(CheckDeadline()) {
+				if(CheckCancellation() || CheckDeadline()) {
 					goto Cleanup;
 				}
 				if(ApplyAssertionOutcome(final.Value)) {
 					goto Cleanup;
 				}
 				if(prepared.Experiment.CaptureFinalScreenshot) {
-					if(CheckDeadline()) {
+					if(CheckCancellation() || CheckDeadline()) {
 						goto Cleanup;
 					}
 					McpServiceResult<McpScreenshotMetadata> capture = CaptureScreenshot(lease.LeaseId, expectedIdentity);
@@ -234,10 +234,13 @@ internal sealed class McpExperimentService
 						SetFailure(capture.Error!.Code);
 						goto Cleanup;
 					}
-					screenshot = capture.Value;
-					if(CheckDeadline()) {
+					if(CheckCancellation() || CheckDeadline()) {
 						goto Cleanup;
 					}
+					screenshot = capture.Value;
+				}
+				if(CheckCancellation() || CheckDeadline()) {
+					goto Cleanup;
 				}
 			}
 		} catch(Exception) {
@@ -246,11 +249,12 @@ internal sealed class McpExperimentService
 
 	Cleanup:
 		McpServiceResult<bool> cleanupIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
-		if(!cleanupIdentity.IsSuccess) {
+		if(!cleanupIdentity.IsSuccess && !HasEstablishedSpecificReason()) {
 			SetFailure(cleanupIdentity.Error!.Code);
 		}
 		TimeSpan cleanupBudget = Remaining(started, prepared.Experiment.TimeoutMs);
-		if(cleanupBudget <= TimeSpan.Zero && reason != McpExperimentReason.StateChanged) {
+		if(cleanupBudget <= TimeSpan.Zero && !HasEstablishedSpecificReason()
+			&& reason != McpExperimentReason.StateChanged) {
 			SetFailure("timeout");
 		}
 		try {
@@ -261,7 +265,7 @@ internal sealed class McpExperimentService
 			stopConfirmed = false;
 		}
 		if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero
-			&& reason != McpExperimentReason.StateChanged) {
+			&& !HasEstablishedSpecificReason() && reason != McpExperimentReason.StateChanged) {
 			SetFailure("timeout");
 		}
 
@@ -274,14 +278,14 @@ internal sealed class McpExperimentService
 				return McpServiceResult<bool>.Success(true);
 			});
 			inputReleased = release.IsSuccess;
-			if(release.IsSuccess && !cleanupIdentityMatched) {
+			if(release.IsSuccess && !cleanupIdentityMatched && !HasEstablishedSpecificReason()) {
 				SetFailure("state_changed");
 			}
 		} catch(Exception) {
 			inputReleased = false;
 		}
 		if(Remaining(started, prepared.Experiment.TimeoutMs) <= TimeSpan.Zero
-			&& reason != McpExperimentReason.StateChanged) {
+			&& !HasEstablishedSpecificReason() && reason != McpExperimentReason.StateChanged) {
 			SetFailure("timeout");
 		}
 		if(!stopConfirmed || !inputReleased) {
@@ -349,7 +353,8 @@ internal sealed class McpExperimentService
 		{
 			halted = true;
 			string mapped = MapFailureReason(errorCode);
-			status = mapped is McpExperimentReason.Reset or McpExperimentReason.RomTransition or McpExperimentReason.StateChanged
+			status = mapped is McpExperimentReason.Reset or McpExperimentReason.RomTransition
+				or McpExperimentReason.StateChanged or McpExperimentReason.Cancelled
 				? McpExperimentStatus.Interrupted
 				: McpExperimentStatus.Failed;
 			reason = mapped;
@@ -359,6 +364,11 @@ internal sealed class McpExperimentService
 		void SetStopFailure(McpStopResult stop)
 		{
 			halted = true;
+			if(stop.Reason is McpStopReason.Reset or McpStopReason.RomTransition
+				or McpStopReason.Cancelled or McpStopReason.Timeout) {
+				SetFailure(MapStopReason(stop.Reason));
+				return;
+			}
 			McpServiceResult<bool> stopIdentity = VerifyExpectedIdentity(lease.LeaseId, expectedIdentity);
 			if(!stopIdentity.IsSuccess) {
 				SetFailure(stopIdentity.Error!.Code);
@@ -391,6 +401,20 @@ internal sealed class McpExperimentService
 			SetFailure("timeout");
 			return true;
 		}
+
+		bool CheckCancellation()
+		{
+			if(!cancellationToken.IsCancellationRequested) {
+				return false;
+			}
+			SetFailure("cancelled");
+			return true;
+		}
+
+		bool HasEstablishedSpecificReason() => reason is McpExperimentReason.Reset
+			or McpExperimentReason.RomTransition
+			or McpExperimentReason.Cancelled
+			or McpExperimentReason.Timeout;
 	}
 
 	private McpServiceResult<PreparedExperiment> Prepare(RunExperimentRequest request)
@@ -608,6 +632,8 @@ internal sealed class McpExperimentService
 	private static string MapFailureReason(string code) => code switch {
 		"cancelled" => McpExperimentReason.Cancelled,
 		"timeout" => McpExperimentReason.Timeout,
+		"reset" => McpExperimentReason.Reset,
+		"rom_transition" => McpExperimentReason.RomTransition,
 		"state_changed" => McpExperimentReason.StateChanged,
 		"server_stopping" => McpExperimentReason.RomTransition,
 		_ => McpExperimentReason.NativeFailure
