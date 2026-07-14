@@ -51,6 +51,8 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public Action? ClearExecutionTraceHandler { get; set; }
 	public Func<uint>? GetExecutionTraceSizeHandler { get; set; }
 	public Func<uint, uint, TraceRow[]>? GetExecutionTraceHandler { get; set; }
+	public Func<McpServiceResult<byte[]>>? CreateSaveStateHandler { get; set; }
+	public Func<byte[], McpServiceResult<bool>>? LoadSaveStateHandler { get; set; }
 
 	public Action? OnRead { get; set; }
 	public int IsRunningCalls { get; private set; }
@@ -78,6 +80,8 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public int ClearExecutionTraceCalls { get; private set; }
 	public int GetExecutionTraceSizeCalls { get; private set; }
 	public int GetExecutionTraceCalls { get; private set; }
+	public int CreateSaveStateCalls { get; private set; }
+	public int LoadSaveStateCalls { get; private set; }
 	public uint LastReadStart { get; private set; }
 	public uint LastReadEndInclusive { get; private set; }
 	public uint LastWriteStart { get; private set; }
@@ -274,5 +278,17 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	{
 		GetExecutionTraceCalls++;
 		return GetExecutionTraceHandler?.Invoke(startOffset, maxRowCount) ?? ExecutionTrace;
+	}
+
+	public McpServiceResult<byte[]> CreateSaveState()
+	{
+		CreateSaveStateCalls++;
+		return CreateSaveStateHandler?.Invoke() ?? McpServiceResult<byte[]>.Success([]);
+	}
+
+	public McpServiceResult<bool> LoadSaveState(byte[] data)
+	{
+		LoadSaveStateCalls++;
+		return LoadSaveStateHandler?.Invoke(data) ?? McpServiceResult<bool>.Success(true);
 	}
 }

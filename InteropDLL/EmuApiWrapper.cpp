@@ -6,6 +6,7 @@
 #include "Core/Shared/SystemActionManager.h"
 #include "Core/Shared/MessageManager.h"
 #include "Core/Shared/SaveStateManager.h"
+#include "Core/Shared/EventType.h"
 #include "Core/Shared/Interfaces/INotificationListener.h"
 #include "Core/Shared/KeyManager.h"
 #include "Core/Shared/ShortcutKeyHandler.h"
@@ -18,6 +19,7 @@
 #include "Utilities/FolderUtilities.h"
 #include "Utilities/StringUtilities.h"
 #include "InteropNotificationListeners.h"
+#include <new>
 
 #ifdef _WIN32
 	#include "Windows/Renderer.h"
@@ -60,6 +62,68 @@ struct InteropRomInfo
 	DipSwitchInfo DipSwitches;
 	CpuType CpuTypes[5];
 	uint32_t CpuTypeCount;
+};
+
+enum class InteropApiResult : int32_t
+{
+	Success = 0,
+	NoGameLoaded = 1,
+	InvalidArgument = 2,
+	InvalidData = 3,
+	PayloadTooLarge = 4,
+	AllocationFailed = 5,
+	EncodeFailed = 6
+};
+
+struct InteropOwnedBuffer
+{
+	uint8_t* Data;
+	uint32_t Length;
+};
+
+class BoundedInteropStreamBuffer : public std::streambuf
+{
+private:
+	vector<uint8_t> _data;
+	size_t _maxLength;
+	bool _overflowed = false;
+
+protected:
+	int_type overflow(int_type value) override
+	{
+		if(traits_type::eq_int_type(value, traits_type::eof())) {
+			return traits_type::not_eof(value);
+		}
+		if(_data.size() == _maxLength) {
+			_overflowed = true;
+			return traits_type::eof();
+		}
+		_data.push_back((uint8_t)traits_type::to_char_type(value));
+		return value;
+	}
+
+	std::streamsize xsputn(const char* source, std::streamsize length) override
+	{
+		if(length <= 0) {
+			return 0;
+		}
+		size_t available = _maxLength - _data.size();
+		size_t requested = (size_t)length;
+		size_t writeLength = std::min(available, requested);
+		size_t offset = _data.size();
+		_data.resize(offset + writeLength);
+		memcpy(_data.data() + offset, source, writeLength);
+		if(writeLength != requested) {
+			_overflowed = true;
+		}
+		return (std::streamsize)writeLength;
+	}
+
+public:
+	explicit BoundedInteropStreamBuffer(size_t maxLength) : _maxLength(maxLength) {}
+
+	const vector<uint8_t>& GetData() const { return _data; }
+	bool Overflowed() const { return _overflowed; }
 };
 
 extern "C"
@@ -358,6 +422,86 @@ extern "C"
 	DllExport void __stdcall LoadStateFile(char* filepath)
 	{
 		_emu->GetSaveStateManager()->LoadState(filepath);
+	}
+
+	DllExport void __stdcall ReleaseInteropBuffer(uint8_t* data)
+	{
+		delete[] data;
+	}
+
+	DllExport InteropApiResult __stdcall CreateSaveStateBuffer(InteropOwnedBuffer& output)
+	{
+		static constexpr size_t MaxSaveStateSize = 16 * 1024 * 1024;
+		output = { nullptr, 0 };
+
+		try {
+			auto lock = _emu->AcquireLock();
+			if(!_emu->IsRunning()) {
+				return InteropApiResult::NoGameLoaded;
+			}
+
+			BoundedInteropStreamBuffer streamBuffer(MaxSaveStateSize);
+			ostream stream(&streamBuffer);
+			_emu->GetSaveStateManager()->SaveState(stream);
+			if(streamBuffer.Overflowed()) {
+				return InteropApiResult::PayloadTooLarge;
+			}
+			if(!stream.good()) {
+				return InteropApiResult::EncodeFailed;
+			}
+
+			const vector<uint8_t>& state = streamBuffer.GetData();
+			uint8_t* data = new(std::nothrow) uint8_t[state.size()];
+			if(data == nullptr) {
+				return InteropApiResult::AllocationFailed;
+			}
+			memcpy(data, state.data(), state.size());
+			output = { data, (uint32_t)state.size() };
+			_emu->ProcessEvent(EventType::StateSaved);
+			return InteropApiResult::Success;
+		} catch(const std::bad_alloc&) {
+			if(output.Data != nullptr) {
+				ReleaseInteropBuffer(output.Data);
+				output = { nullptr, 0 };
+			}
+			return InteropApiResult::AllocationFailed;
+		} catch(...) {
+			if(output.Data != nullptr) {
+				ReleaseInteropBuffer(output.Data);
+				output = { nullptr, 0 };
+			}
+			return InteropApiResult::EncodeFailed;
+		}
+	}
+
+	DllExport InteropApiResult __stdcall LoadSaveStateBuffer(const uint8_t* data, uint32_t length)
+	{
+		static constexpr uint32_t MaxSaveStateSize = 16 * 1024 * 1024;
+		if(data == nullptr || length == 0) {
+			return InteropApiResult::InvalidArgument;
+		}
+		if(length > MaxSaveStateSize) {
+			return InteropApiResult::PayloadTooLarge;
+		}
+
+		try {
+			auto lock = _emu->AcquireLock();
+			if(!_emu->IsRunning()) {
+				return InteropApiResult::NoGameLoaded;
+			}
+
+			string state((const char*)data, length);
+			std::istringstream stream(state, ios::in | ios::binary);
+			if(!_emu->GetSaveStateManager()->LoadState(stream)) {
+				return InteropApiResult::InvalidData;
+			}
+			_emu->ProcessEvent(EventType::StateLoaded);
+			return InteropApiResult::Success;
+		} catch(const std::bad_alloc&) {
+			return InteropApiResult::AllocationFailed;
+		} catch(...) {
+			return InteropApiResult::InvalidData;
+		}
 	}
 
 	DllExport void __stdcall LoadRecentGame(char* filepath, bool resetGame)

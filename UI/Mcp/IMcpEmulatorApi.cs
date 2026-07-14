@@ -30,4 +30,6 @@ internal interface IMcpEmulatorApi
 	void ClearExecutionTrace();
 	uint GetExecutionTraceSize();
 	TraceRow[] GetExecutionTrace(uint startOffset, uint maxRowCount);
+	McpServiceResult<byte[]> CreateSaveState();
+	McpServiceResult<bool> LoadSaveState(byte[] data);
 }
