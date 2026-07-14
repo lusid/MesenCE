@@ -88,6 +88,7 @@ public sealed class McpAutomationProtocolTests
 			McpAutomationLimits.MaxScreenshotDimension,
 			McpAutomationLimits.MaxScreenshotPixels,
 			McpAutomationLimits.MaxResultPage,
+			McpAutomationLimits.MaxRunSampleBytes,
 			McpAutomationLimits.MinExperimentTimeoutMs,
 			McpAutomationLimits.MaxExperimentTimeoutMs,
 			(int)McpAutomationLimits.ResourceIdleExpiration.TotalMinutes
@@ -107,6 +108,7 @@ public sealed class McpAutomationProtocolTests
 
 		string json = JsonSerializer.Serialize(capabilities, McpToolJsonContext.Default.McpAutomationCapabilities);
 		Assert.Contains("\"maxSaveStates\":8", json);
+		Assert.Contains("\"maxRunSampleBytes\":64", json);
 		Assert.Contains("\"resourceIdleExpirationMinutes\":30", json);
 		Assert.Contains("\"exclusiveInput\":true", json);
 		Assert.DoesNotContain("$type", json);
