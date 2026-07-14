@@ -423,7 +423,9 @@ public sealed class McpServerTests
 	{
 		FakeMcpEmulatorApi api = CreateRunningApi();
 		api.ControllerTopology = [new(0, 0, ControllerType.NesController, [new("A", 0, false)])];
-		using McpServer server = new(new McpEmulatorService(api));
+		using McpServer server = new(new McpEmulatorService(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { })));
 		await server.StartAsync(0);
 		await using McpClient client = await CreateClientAsync(server.Endpoint);
 

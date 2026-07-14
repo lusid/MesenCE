@@ -22,7 +22,7 @@ internal sealed class McpAutomationService
 
 	internal McpServiceResult<McpAutomationCapabilities> GetCapabilities()
 	{
-		return _emulator.ExecuteAutomation((api, identity) => {
+		return _emulator.ExecuteAutomationWithDebuggerLease((api, identity) => {
 			if(!api.IsRunning()) {
 				return NoGame<McpAutomationCapabilities>();
 			}

@@ -60,6 +60,33 @@ public sealed class McpAutomationServiceTests
 	}
 
 	[Fact]
+	public void Capabilities_FirstPausedCallInitializesDebuggerBeforeTopologyInspection()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes(paused: true);
+		api.ControllerTopology = [new(0, 0, ControllerType.NesController, [new("A", 0, false)])];
+		bool initialized = false;
+		api.GetControllerTopologyHandler = () => {
+			if(!initialized) {
+				api.SetDebuggerRequestBlocked(true);
+				api.SetDebuggerRequestBlocked(false);
+				initialized = true;
+			}
+			return api.ControllerTopology;
+		};
+		using AutomationFixture fixture = new(api, () => {
+			api.SetDebuggerRequestBlocked(true);
+			api.SetDebuggerRequestBlocked(false);
+			initialized = true;
+		});
+
+		McpAutomationCapabilities capabilities = AssertSuccess(fixture.Automation.GetCapabilities());
+
+		Assert.True(capabilities.DeterministicFrames);
+		Assert.True(initialized);
+		Assert.Equal(1, api.GetControllerTopologyCalls);
+	}
+
+	[Fact]
 	public void CreateSaveState_EnforcesStoreQuota()
 	{
 		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
@@ -99,6 +126,9 @@ public sealed class McpAutomationServiceTests
 	[InlineData("none")]
 	[InlineData("reset")]
 	[InlineData("multiple")]
+	[InlineData("rom")]
+	[InlineData("transition")]
+	[InlineData("blocked")]
 	public async Task LoadSaveState_RequiresExactlyOneAttributedStateLoadedNotification(string notifications)
 	{
 		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
@@ -111,6 +141,15 @@ public sealed class McpAutomationServiceTests
 			} else if(notifications == "multiple") {
 				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
 				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.GameReset });
+			} else if(notifications == "rom") {
+				fixture.Identity.NotifyRomChanged();
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
+			} else if(notifications == "transition") {
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.BeforeGameLoad });
+			} else if(notifications == "blocked") {
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
+				api.SetDebuggerRequestBlocked(true);
 			}
 			return McpServiceResult<bool>.Success(true);
 		};
@@ -224,13 +263,13 @@ public sealed class McpAutomationServiceTests
 
 	private sealed class AutomationFixture : IDisposable
 	{
-		internal AutomationFixture(FakeMcpEmulatorApi api)
+		internal AutomationFixture(FakeMcpEmulatorApi api, Action? debuggerInitialize = null)
 		{
 			Identity = new();
 			Coordinator = new();
 			Emulator = new(
 				api,
-				debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+				debuggerLifetime: new DebuggerLifetimeCoordinator(debuggerInitialize ?? (() => { }), () => { }),
 				breakpointCollection: new NoOpBreakpointCollection(),
 				traceCoordinator: new TraceLoggerCoordinator(),
 				emulatorIdentity: Identity,

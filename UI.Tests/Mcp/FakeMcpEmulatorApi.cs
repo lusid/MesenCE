@@ -99,8 +99,9 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public List<McpExclusiveControllerState> ExclusiveControllerStates { get; } = [];
 	public List<string> NativeCallLog { get; } = [];
 
-	public static FakeMcpEmulatorApi RunningNes() => new() {
+	public static FakeMcpEmulatorApi RunningNes(bool paused = false) => new() {
 		Running = true,
+		Paused = paused,
 		RomInfo = new RomInfo {
 			ConsoleType = ConsoleType.Nes,
 			RomPath = "game.nes",

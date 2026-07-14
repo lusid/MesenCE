@@ -1509,6 +1509,22 @@ internal sealed class McpEmulatorService : IDisposable
 		return Execute(() => operation(_api, _emulatorIdentity.Current));
 	}
 
+	internal McpServiceResult<T> ExecuteAutomationWithDebuggerLease<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		return ExecuteWithDebuggerLease((_, prepareDebuggerLease) => {
+			McpServiceResult<bool> prepared = prepareDebuggerLease();
+			if(!prepared.IsSuccess) {
+				return McpServiceResult<T>.Failure(prepared.Error!.Code, prepared.Error.Message);
+			}
+			McpStateIdentity identity = _emulatorIdentity.Current;
+			McpServiceResult<T> result = operation(_api, identity);
+			return _emulatorIdentity.Current == identity
+				? result
+				: McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
+		});
+	}
+
 	internal McpServiceResult<T> ExecuteAutomationTransaction<T>(
 		Func<IMcpEmulatorApi, McpStateIdentity, Action<Action<bool>>, McpServiceResult<T>> operation)
 	{

@@ -175,6 +175,42 @@ public sealed class McpExperimentServiceTests
 		Assert.Equal("resource_not_found", fixture.SaveStates.Pin(state.Id).Error?.Code);
 	}
 
+	[Fact]
+	public async Task RunAsync_FirstPausedRunInitializesDebuggerAndAcceptsOwnedStateLoadEpochChange()
+	{
+		bool initialized = false;
+		using ExperimentFixture fixture = new(paused: true, debuggerInitialize: api => {
+			api.SetDebuggerRequestBlocked(true);
+			api.SetDebuggerRequestBlocked(false);
+			initialized = true;
+		});
+		fixture.Api.GetControllerTopologyHandler = () => {
+			if(!initialized) {
+				fixture.Api.SetDebuggerRequestBlocked(true);
+				fixture.Api.SetDebuggerRequestBlocked(false);
+				initialized = true;
+			}
+			return fixture.Api.ControllerTopology;
+		};
+		fixture.Api.CreateSaveStateHandler = () => McpServiceResult<byte[]>.Success([0x12]);
+		McpSaveStateMetadata state = AssertSuccess(fixture.Automation.CreateSaveState());
+		fixture.Api.LoadSaveStateHandler = _ => {
+			fixture.Api.SetDebuggerRequestBlocked(true);
+			fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.StateLoaded });
+			fixture.Api.SetDebuggerRequestBlocked(false);
+			return McpServiceResult<bool>.Success(true);
+		};
+		fixture.CompleteEveryStep();
+
+		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+			BasicRequest() with { SaveStateId = state.Id }, CancellationToken.None));
+
+		Assert.Equal(McpExperimentStatus.Completed, result.Status);
+		Assert.Equal(["initial", "final"], result.Checkpoints.Select(checkpoint => checkpoint.Name));
+		Assert.Equal(1, result.CompletedFrames);
+		Assert.True(initialized);
+	}
+
 	[Theory]
 	[InlineData(ConsoleNotificationType.GameReset, McpExperimentReason.Reset)]
 	[InlineData(ConsoleNotificationType.BeforeGameLoad, McpExperimentReason.RomTransition)]
@@ -694,9 +730,13 @@ public sealed class McpExperimentServiceTests
 
 	private sealed class ExperimentFixture : IDisposable
 	{
-		internal ExperimentFixture(IMcpMonotonicClock? clock = null, Action? afterScreenshotAssigned = null)
+		internal ExperimentFixture(
+			IMcpMonotonicClock? clock = null,
+			Action? afterScreenshotAssigned = null,
+			Action<FakeMcpEmulatorApi>? debuggerInitialize = null,
+			bool paused = false)
 		{
-			Api = FakeMcpEmulatorApi.RunningNes();
+			Api = FakeMcpEmulatorApi.RunningNes(paused);
 			Api.MemorySizes[MemoryType.NesMemory] = 0x100;
 			Api.ControllerTopology = [
 				new(0, 0, ControllerType.NesController, [new("A", 0, false), new("Right", 7, false)]),
@@ -705,7 +745,8 @@ public sealed class McpExperimentServiceTests
 			Coordinator = new();
 			Emulator = new(
 				Api,
-				debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+				debuggerLifetime: new DebuggerLifetimeCoordinator(
+					() => debuggerInitialize?.Invoke(Api), () => { }),
 				breakpointCollection: new NoOpBreakpointCollection(),
 				traceCoordinator: new TraceLoggerCoordinator(),
 				executionCoordinator: Coordinator);

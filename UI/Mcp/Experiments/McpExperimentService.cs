@@ -446,7 +446,7 @@ internal sealed class McpExperimentService
 
 	private McpServiceResult<PreparedExperiment> Prepare(RunExperimentRequest request)
 	{
-		return _emulator.ExecuteAutomation((api, identity) => {
+		return _emulator.ExecuteAutomationWithDebuggerLease((api, identity) => {
 			if(!api.IsRunning()) {
 				return McpServiceResult<PreparedExperiment>.Failure("no_game", "No game is currently loaded.");
 			}

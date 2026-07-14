@@ -64,7 +64,8 @@ internal sealed class McpEmulatorGate
 			operation,
 			preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId),
 			postflight: (ticket, result) => Volatile.Read(ref _emulatorGeneration) ==
-				ticket.Generation + (result.IsSuccess ? 1 : 0));
+				ticket.Generation + (result.IsSuccess ? 1 : 0),
+			allowDebuggerBlockStateChangeOnSuccess: true);
 	}
 
 	internal McpServiceResult<T> ExecuteOwnedWithDebuggerLease<T>(
@@ -169,29 +170,35 @@ internal sealed class McpEmulatorGate
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, McpServiceResult<T>> operation,
 		Func<McpServiceResult<bool>>? preflight = null,
-		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null)
+		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
+		bool allowDebuggerBlockStateChangeOnSuccess = false)
 	{
-		return ExecuteLocked((ticket, _, _) => operation(ticket), null, preflight, postflight);
+		return ExecuteLocked(
+			(ticket, _, _) => operation(ticket), null, preflight, postflight,
+			allowDebuggerBlockStateChangeOnSuccess);
 	}
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation,
 		Action? acquireDebuggerLease,
 		Func<McpServiceResult<bool>>? preflight = null,
-		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null)
+		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
+		bool allowDebuggerBlockStateChangeOnSuccess = false)
 	{
 		return ExecuteLocked(
 			(ticket, prepareDebuggerLease, _) => operation(ticket, prepareDebuggerLease),
 			acquireDebuggerLease,
 			preflight,
-			postflight);
+			postflight,
+			allowDebuggerBlockStateChangeOnSuccess);
 	}
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, Action<Action<bool>>, McpServiceResult<T>> operation,
 		Action? acquireDebuggerLease = null,
 		Func<McpServiceResult<bool>>? preflight = null,
-		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null)
+		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null,
+		bool allowDebuggerBlockStateChangeOnSuccess = false)
 	{
 		_emulatorSemaphore.Wait();
 		try {
@@ -234,7 +241,8 @@ internal sealed class McpEmulatorGate
 						? generation == Volatile.Read(ref _emulatorGeneration)
 						: postflight(new(generation, debuggerBlockState), result))
 					&& Volatile.Read(ref _transitionActive) == 0
-					&& debuggerBlockState == endingDebuggerBlockState
+					&& (debuggerBlockState == endingDebuggerBlockState
+						|| (allowDebuggerBlockStateChangeOnSuccess && result.IsSuccess))
 					&& !IsDebuggerRequestBlocked(endingDebuggerBlockState);
 			} catch(Exception) {
 				transactionCompletion?.Invoke(false);
