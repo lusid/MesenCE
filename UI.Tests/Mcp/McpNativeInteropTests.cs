@@ -55,7 +55,7 @@ public sealed class McpNativeInteropTests
 	}
 
 	[Fact]
-	public void ControllerCleanup_DelegatesAndPrecedesDebuggerStorageTeardown()
+	public void DebuggerDestruction_ClearsExclusiveInputAndOwnsBreakpointAndTraceStorage()
 	{
 		int clearCalls = 0;
 		MesenMcpEmulatorApi api = new(
@@ -77,6 +77,24 @@ public sealed class McpNativeInteropTests
 
 		Assert.True(destructor >= 0 && clear > destructor && release > clear);
 		Assert.True(clearMethod >= 0 && storageReset > clearMethod);
+
+		string emulator = ReadRepositoryFile("Core/Shared/Emulator.cpp");
+		int emulatorRelease = emulator.IndexOf("bool Emulator::Release()", StringComparison.Ordinal);
+		int terminalBlock = emulator.IndexOf("BlockAllDebuggerRequests()", emulatorRelease, StringComparison.Ordinal);
+		int stop = emulator.IndexOf("Stop(true);", emulatorRelease, StringComparison.Ordinal);
+		int emulatorStop = emulator.IndexOf("void Emulator::Stop(", StringComparison.Ordinal);
+		int resetDebugger = emulator.IndexOf("ResetDebugger();", emulatorStop, StringComparison.Ordinal);
+		int resetMethod = emulator.IndexOf("void Emulator::ResetDebugger(", StringComparison.Ordinal);
+		int debuggerReset = emulator.IndexOf("_debugger.reset(", resetMethod, StringComparison.Ordinal);
+		Assert.True(emulatorRelease >= 0 && terminalBlock > emulatorRelease && stop > terminalBlock);
+		Assert.True(emulatorStop >= 0 && resetDebugger > emulatorStop);
+		Assert.True(resetMethod >= 0 && debuggerReset > resetMethod);
+
+		string debuggerHeader = ReadRepositoryFile("Core/Debugger/Debugger.h");
+		string nesDebuggerHeader = ReadRepositoryFile("Core/NES/Debugger/NesDebugger.h");
+		Assert.Contains("unique_ptr<IDebugger> Debugger;", debuggerHeader);
+		Assert.Contains("unique_ptr<BreakpointManager> _breakpointManager;", nesDebuggerHeader);
+		Assert.Contains("unique_ptr<NesTraceLogger> _traceLogger;", nesDebuggerHeader);
 	}
 
 	[Fact]

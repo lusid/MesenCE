@@ -921,8 +921,8 @@ namespace Mesen.Windows
 			lock(_lock) {
 				_stoppingServer = null;
 			}
-			stopCore();
 			disposeListener();
+			stopCore();
 			releaseCore();
 		}
 

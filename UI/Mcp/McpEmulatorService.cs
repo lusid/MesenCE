@@ -41,8 +41,9 @@ internal sealed class McpEmulatorService : IDisposable
 	private int _breakpointReconciliationVersion;
 	private bool _breakpointReconciliationPending;
 	private long _nextBreakpointId;
-	private IDisposable? _debuggerLease;
+	private IDebuggerLifetimeLease? _debuggerLease;
 	private bool _serviceShutdownStarted;
+	private bool _managedDetachmentCompleted;
 	private bool _debuggerCleanupCompleted;
 	private bool _breakpointCollectionDisposed;
 	private bool _exclusiveInputCleanupCompleted;
@@ -262,7 +263,12 @@ internal sealed class McpEmulatorService : IDisposable
 			List<BreakpointManager.ExternalBreakpoint> replacements = GetExternalBreakpoints();
 			replacements.Add(new(id, breakpoint));
 			_breakpointCollection.Replace(replacements);
-			_mcpBreakpoints.Add(id, breakpoint);
+			lock(_executionLock) {
+				if(_serviceShutdownStarted) {
+					return ServiceStopping<McpBreakpoint>();
+				}
+				_mcpBreakpoints.Add(id, breakpoint);
+			}
 
 			return McpServiceResult<McpBreakpoint>.Success(ToMcpBreakpoint(id, breakpoint));
 		});
@@ -589,15 +595,21 @@ internal sealed class McpEmulatorService : IDisposable
 				return TraceOwnershipConflict<TraceConfiguration>();
 			}
 			TraceConfiguration configured = new(cpu, true, indentCode, useLabels, condition, format, ticket.Generation);
+			bool stopping;
 			lock(_executionLock) {
-				if(_gate.Generation == ticket.Generation) {
+				stopping = _serviceShutdownStarted;
+				if(!stopping && _gate.Generation == ticket.Generation) {
 					_traceConfiguration = configured;
 					_traceCpu = cpuType;
-				} else {
+				} else if(!stopping) {
 					_traceReconciliationCpu = cpuType;
 					_traceReconciliationVersion++;
 					_traceReconciliationPending = true;
 				}
+			}
+			if(stopping) {
+				_traceCoordinator.Release(_traceOwner);
+				return ServiceStopping<TraceConfiguration>();
 			}
 			return McpServiceResult<TraceConfiguration>.Success(configured);
 		});
@@ -1106,7 +1118,12 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private void EnsureDebuggerLease()
 	{
-		_debuggerLease ??= _debuggerLifetime.Acquire();
+		lock(_executionLock) {
+			if(_serviceShutdownStarted) {
+				throw new OperationCanceledException("The MCP service is shutting down.");
+			}
+			_debuggerLease ??= _debuggerLifetime.Acquire();
+		}
 	}
 
 	private static McpServiceResult<T> FailureFrom<T>(McpServiceResult<bool> result)
@@ -1287,16 +1304,41 @@ internal sealed class McpEmulatorService : IDisposable
 		return McpServiceResult<bool>.Success(true);
 	}
 
-	internal void CompleteBoundedShutdown()
+	internal void DetachManagedResources()
 	{
-		lock(_executionLock) {
-			if(_disposed) {
-				return;
-			}
-			_disposed = true;
-		}
 		BeginServiceShutdown();
 		_gate.BeginShutdown();
+		IDebuggerLifetimeLease? debuggerLease;
+		lock(_executionLock) {
+			if(_managedDetachmentCompleted) {
+				return;
+			}
+			_managedDetachmentCompleted = true;
+			_disposed = true;
+			_debuggerCleanupCompleted = true;
+			_exclusiveInputCleanupCompleted = true;
+			_traceConfiguration = null;
+			_traceCpu = null;
+			_traceReconciliationCpu = null;
+			_traceReconciliationPending = false;
+			_breakpointReconciliationPending = false;
+			_mcpBreakpoints.Clear();
+			debuggerLease = _debuggerLease;
+			_debuggerLease = null;
+		}
+
+		_traceCoordinator.Release(_traceOwner);
+		try {
+			try {
+				_breakpointCollection.Detach();
+			} catch(Exception) {
+				// Native teardown owns the final breakpoint cleanup during application shutdown.
+			} finally {
+				_breakpointCollectionDisposed = true;
+			}
+		} finally {
+			debuggerLease?.Detach();
+		}
 	}
 
 	internal McpServiceResult<T> ExecuteAutomation<T>(
@@ -1326,17 +1368,6 @@ internal sealed class McpEmulatorService : IDisposable
 	internal void CleanupExclusiveInput()
 	{
 		_gate.ExecuteTerminalCleanup(CleanupExclusiveInputCore);
-	}
-
-	internal void CleanupNativeResources()
-	{
-		_gate.ExecuteTerminalCleanup(() => {
-			try {
-				return CleanupDebuggerResourcesCore();
-			} finally {
-				CleanupExclusiveInputCore();
-			}
-		});
 	}
 
 	private McpServiceResult<bool> CleanupExclusiveInputCore()

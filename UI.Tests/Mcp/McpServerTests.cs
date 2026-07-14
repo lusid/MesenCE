@@ -36,7 +36,7 @@ public sealed class McpServerTests
 		server.Stop(TimeSpan.FromSeconds(1));
 		server.Dispose();
 
-		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
 		Assert.Throws<ObjectDisposedException>(() => server.MemorySnapshots.Pin("missing"));
 		Assert.Throws<ObjectDisposedException>(() => server.MemorySearches.Pin("missing"));
@@ -101,7 +101,7 @@ public sealed class McpServerTests
 		);
 
 		Assert.Equal([
-			"disabled-config", "config", "start", "dispose", "core-stop", "listener-dispose", "core-release"
+			"disabled-config", "config", "start", "dispose", "listener-dispose", "core-stop", "core-release"
 		], events);
 	}
 
@@ -148,40 +148,28 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
-	public async Task MainWindowLifecycle_DrainsActiveAndRejectsQueuedInteropBeforeCoreRelease()
+	public async Task MainWindowLifecycle_DetachesServerBeforeListenerAndCoreRelease()
 	{
-		using ManualResetEventSlim readEntered = new();
-		using ManualResetEventSlim releaseRead = new();
-		using ManualResetEventSlim readExited = new();
 		FakeMcpEmulatorApi api = CreateRunningApi();
-		api.OnRead = () => {
-			readEntered.Set();
-			releaseRead.Wait(TimeSpan.FromSeconds(5));
-			readExited.Set();
-		};
 		McpEmulatorService service = new(api);
 		using McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
 		MainWindowMcpLifecycle lifecycle = new(() => server, (_, _) => Task.CompletedTask, _ => { }, _ => { });
 		await lifecycle.StartAsync(true, 7342);
 
-		Task<McpServiceResult<MemoryRead>> active = Task.Run(() => service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1));
-		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
-		Task<McpServiceResult<EmulatorStatus>> queued = Task.Run(service.GetStatus);
-		await Task.Delay(100);
-		bool releasedBeforeDrain = false;
-		Task shutdown = Task.Run(() => lifecycle.StopBeforeCoreRelease(
-			() => { },
-			() => { },
-			() => releasedBeforeDrain = !readExited.IsSet
-		));
-		await Task.Delay(100);
-		Assert.False(shutdown.IsCompleted);
+		List<string> events = [];
+		lifecycle.StopBeforeCoreRelease(
+			() => {
+				events.Add("core-stop");
+				Assert.Equal("server_stopping", service.GetStatus().Error?.Code);
+				Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+			},
+			() => events.Add("listener-dispose"),
+			() => events.Add("core-release"));
 
-		releaseRead.Set();
-		await shutdown.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.False(releasedBeforeDrain);
-		Assert.True((await active).IsSuccess);
-		Assert.Equal("server_stopping", (await queued).Error!.Code);
+		Assert.Equal(["listener-dispose", "core-stop", "core-release"], events);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 	}
 
 	[Fact]
@@ -653,9 +641,11 @@ public sealed class McpServerTests
 		Assert.True(hostCleanupEntered.IsSet);
 		Assert.InRange(elapsed, 0, 1000);
 		Assert.Equal(1, hostCleanupCalls);
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
-		Assert.Equal(1, debuggerReleaseCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
@@ -669,13 +659,14 @@ public sealed class McpServerTests
 		server.Stop(TimeSpan.Zero);
 		server.Dispose();
 		Assert.Equal(1, hostCleanupCalls);
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
-		Assert.Equal(1, debuggerReleaseCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
 	}
 
 	[Fact]
-	public async Task AutomationStop_WithBlockedNativeCall_IsBoundedDisposesManagedStoresAndLeavesCleanupAvailable()
+	public async Task AutomationStop_WithBlockedNativeCall_IsBoundedAndNeverStartsNativeCleanup()
 	{
 		using ManualResetEventSlim readEntered = new();
 		using ManualResetEventSlim releaseRead = new();
@@ -697,7 +688,7 @@ public sealed class McpServerTests
 		server.Stop(TimeSpan.FromMilliseconds(100));
 		long elapsed = Environment.TickCount64 - started;
 
-		Assert.InRange(elapsed, 50, 1000);
+		Assert.InRange(elapsed, 0, 1000);
 		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
 		Assert.Equal(0, breakpoints.DisposeCalls);
 		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
@@ -714,55 +705,52 @@ public sealed class McpServerTests
 
 		releaseRead.Set();
 		await read.WaitAsync(TimeSpan.FromSeconds(5));
-		await server.NativeCleanupTask.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 	}
 
 	[Fact]
-	public async Task AutomationStop_WhenAcquiredNativeCleanupBlocks_ReturnsBoundedAndCleanupFinishesExactlyOnce()
+	public void AutomationStop_DetachesManagedOwnershipWithoutNativeDebuggerCalls()
 	{
-		using ManualResetEventSlim cleanupEntered = new();
-		using ManualResetEventSlim releaseCleanup = new();
-		using ManualResetEventSlim cleanupExited = new();
 		FakeMcpEmulatorApi api = CreateRunningApi();
-		api.ClearExclusiveControllerOverridesHandler = () => {
-			cleanupEntered.Set();
-			releaseCleanup.Wait(TimeSpan.FromSeconds(5));
-			cleanupExited.Set();
-			throw new InvalidOperationException("native cleanup details");
-		};
 		TrackingBreakpointCollection breakpoints = new();
-		McpEmulatorService service = new(api, breakpointCollection: breakpoints);
+		int debuggerInitializeCalls = 0;
+		int debuggerReleaseCalls = 0;
+		TraceLoggerCoordinator traceCoordinator = new();
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => debuggerInitializeCalls++, () => debuggerReleaseCalls++),
+			breakpointCollection: breakpoints,
+			traceCoordinator: traceCoordinator);
 		McpServer server = new(service);
 		McpStateIdentity identity = server.EmulatorIdentity.Current;
 		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Assert.True(service.SetBreakpoint(nameof(CpuType.Nes), nameof(MemoryType.NesWorkRam), "write", 0, null, null).IsSuccess);
+		Assert.True(service.ConfigureExecutionTrace(nameof(CpuType.Nes), "enable", false, false, null, null).IsSuccess);
+		object otherTraceOwner = new();
+		Assert.False(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
+		int setTraceCalls = api.SetTraceOptionsCalls;
 
-		long started = Environment.TickCount64;
-		Task stop = Task.Run(() => server.Stop(TimeSpan.FromMilliseconds(200)));
-		Assert.True(cleanupEntered.Wait(TimeSpan.FromSeconds(5)));
-		Assert.False(stop.IsCompleted);
-		await stop.WaitAsync(TimeSpan.FromSeconds(2));
-		long elapsed = Environment.TickCount64 - started;
+		server.Stop(TimeSpan.FromSeconds(1));
 
-		Assert.InRange(elapsed, 100, 1000);
 		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
-		Assert.False(server.NativeCleanupTask.IsCompleted);
+		Assert.Equal("server_stopping", service.GetStatus().Error?.Code);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(1, debuggerInitializeCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(setTraceCalls, api.SetTraceOptionsCalls);
+		Assert.Equal(0, api.ClearExecutionTraceCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+		Assert.True(traceCoordinator.TryAcquireAndExecute(otherTraceOwner, () => { }));
 
-		started = Environment.TickCount64;
 		server.Stop(TimeSpan.Zero);
 		server.Dispose();
-		Assert.InRange(Environment.TickCount64 - started, 0, 500);
-		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
-
-		releaseCleanup.Set();
-		await server.NativeCleanupTask.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.True(cleanupExited.IsSet);
-		Assert.True(server.NativeCleanupTask.IsCompletedSuccessfully);
-		Assert.Equal(1, breakpoints.DisposeCalls);
-		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+		Assert.Equal(1, breakpoints.DetachCalls);
+		Assert.Equal(0, debuggerReleaseCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 	}
 
 	private static async Task<McpClient> CreateClientAsync(Uri endpoint)
@@ -864,6 +852,7 @@ public sealed class McpServerTests
 	{
 		public int EmptyReplaceCalls { get; private set; }
 		public int DisposeCalls { get; private set; }
+		public int DetachCalls { get; private set; }
 
 		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints)
 		{
@@ -881,6 +870,11 @@ public sealed class McpServerTests
 		public void Dispose()
 		{
 			DisposeCalls++;
+		}
+
+		public void Detach()
+		{
+			DetachCalls++;
 		}
 	}
 

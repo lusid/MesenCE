@@ -61,6 +61,7 @@ namespace Mesen.Debugger
 			public bool TryGetStableId(int nativeBreakpointId, out long stableId) =>
 				BreakpointManager.TryGetExternalStableId(_collectionId, nativeBreakpointId, out stableId);
 			public void Dispose() => BreakpointManager.RemoveExternal(_collectionId, ref _disposed);
+			internal void Detach() => BreakpointManager.DetachExternal(_collectionId, ref _disposed);
 		}
 
 		public static ExternalBreakpointCollection CreateExternalBreakpointCollection()
@@ -385,6 +386,23 @@ namespace Mesen.Debugger
 				disposed = true;
 				if(_externalBreakpoints.Remove(collectionId)) {
 					SetBreakpointsLocked();
+				}
+			}
+		}
+
+		private static void DetachExternal(long collectionId, ref bool disposed)
+		{
+			lock(_sync) {
+				if(disposed) {
+					return;
+				}
+				disposed = true;
+				_externalBreakpoints.Remove(collectionId);
+				foreach(int nativeId in _externalByNativeId
+					.Where(entry => entry.Value.CollectionId == collectionId)
+					.Select(entry => entry.Key)
+					.ToArray()) {
+					_externalByNativeId.Remove(nativeId);
 				}
 			}
 		}

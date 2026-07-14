@@ -27,7 +27,6 @@ internal sealed class McpServer : IDisposable
 	private readonly Func<WebApplication, CancellationToken, Task> _applicationCleanup;
 	private LifecycleGeneration? _generation;
 	private Task? _detachedShutdownTask;
-	private Task? _nativeCleanupTask;
 	private long _nextGenerationId;
 	private bool _stopping;
 	private bool _resourcesDisposed;
@@ -59,15 +58,6 @@ internal sealed class McpServer : IDisposable
 	internal McpSaveStateStore SaveStates => _saveStates;
 	internal McpMemorySnapshotStore MemorySnapshots => _memorySnapshots;
 	internal McpMemorySearchStore MemorySearches => _memorySearches;
-	internal Task NativeCleanupTask
-	{
-		get {
-			lock(_lifecycleLock) {
-				return _nativeCleanupTask ?? Task.CompletedTask;
-			}
-		}
-	}
-
 	internal Uri Endpoint
 	{
 		get
@@ -137,12 +127,8 @@ internal sealed class McpServer : IDisposable
 			TryStopApplication(generation.Application);
 		}
 
-		_service.CompleteBoundedShutdown();
+		_service.DetachManagedResources();
 		DisposeResourceStores();
-		Task nativeCleanupTask = StartNativeCleanup();
-		if(!nativeCleanupTask.Wait(RemainingStopBudget(stopStarted, boundedTimeout))) {
-			Log("[MCP] Native cleanup is continuing after the shutdown grace period.");
-		}
 		try {
 			if(shutdownTask is not null && !shutdownTask.Wait(RemainingStopBudget(stopStarted, boundedTimeout))) {
 				Log("[MCP] HTTP host cleanup is continuing after the shutdown grace period.");
@@ -199,20 +185,6 @@ internal sealed class McpServer : IDisposable
 			_saveStates.Dispose();
 			_memorySnapshots.Dispose();
 			_memorySearches.Dispose();
-		}
-	}
-
-	private Task StartNativeCleanup()
-	{
-		lock(_lifecycleLock) {
-			_nativeCleanupTask ??= Task.Run(() => {
-				try {
-					_service.CleanupNativeResources();
-				} catch(Exception) {
-					Log("[MCP] Native cleanup did not complete cleanly.");
-				}
-			});
-			return _nativeCleanupTask;
 		}
 	}
 

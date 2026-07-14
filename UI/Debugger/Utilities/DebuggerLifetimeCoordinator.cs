@@ -6,7 +6,12 @@ namespace Mesen.Debugger.Utilities;
 
 internal interface IDebuggerLifetimeCoordinator
 {
-	IDisposable Acquire();
+	IDebuggerLifetimeLease Acquire();
+}
+
+internal interface IDebuggerLifetimeLease : IDisposable
+{
+	void Detach();
 }
 
 internal sealed class DebuggerLifetimeCoordinator : IDebuggerLifetimeCoordinator
@@ -25,7 +30,7 @@ internal sealed class DebuggerLifetimeCoordinator : IDebuggerLifetimeCoordinator
 		_release = release;
 	}
 
-	public IDisposable Acquire()
+	public IDebuggerLifetimeLease Acquire()
 	{
 		lock(_lock) {
 			if(_leaseCount == 0) {
@@ -36,18 +41,19 @@ internal sealed class DebuggerLifetimeCoordinator : IDebuggerLifetimeCoordinator
 		return new Lease(this);
 	}
 
-	private void Release()
+	private void Release(bool releaseNative)
 	{
 		lock(_lock) {
-			if(--_leaseCount == 0) {
+			if(--_leaseCount == 0 && releaseNative) {
 				_release();
 			}
 		}
 	}
 
-	private sealed class Lease(DebuggerLifetimeCoordinator owner) : IDisposable
+	private sealed class Lease(DebuggerLifetimeCoordinator owner) : IDebuggerLifetimeLease
 	{
 		private DebuggerLifetimeCoordinator? _owner = owner;
-		public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Release();
+		public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Release(releaseNative: true);
+		public void Detach() => Interlocked.Exchange(ref _owner, null)?.Release(releaseNative: false);
 	}
 }
