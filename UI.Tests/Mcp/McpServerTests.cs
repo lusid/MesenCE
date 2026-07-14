@@ -265,8 +265,18 @@ public sealed class McpServerTests
 			"exact", "not_equal", "increased", "decreased", "changed", "unchanged", "increased_by", "decreased_by");
 		AssertSchemaBound(tools, "refine_memory_search", "delta", "minimum", 1);
 		AssertPagingSchema(tools, "get_memory_search_results");
+		AssertResourceIdSchema(RequestProperties(tools, "load_save_state").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "delete_save_state").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "compare_memory_snapshots").GetProperty("firstId"));
+		AssertResourceIdSchema(RequestProperties(tools, "compare_memory_snapshots").GetProperty("secondId"));
+		AssertResourceIdSchema(RequestProperties(tools, "delete_memory_snapshot").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "refine_memory_search").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "get_memory_search_results").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "undo_memory_search").GetProperty("id"));
+		AssertResourceIdSchema(RequestProperties(tools, "delete_memory_search").GetProperty("id"));
 
 		JsonElement experiment = RequestProperties(tools, "run_experiment");
+		AssertResourceIdSchema(experiment.GetProperty("saveStateId"), nullable: true);
 		Assert.Equal(["Nes"], experiment.GetProperty("cpu").GetProperty("enum").EnumerateArray().Select(value => value.GetString()));
 		Assert.Equal(McpAutomationLimits.MinExperimentTimeoutMs, experiment.GetProperty("timeoutMs").GetProperty("minimum").GetInt32());
 		Assert.Equal(McpAutomationLimits.MaxExperimentTimeoutMs, experiment.GetProperty("timeoutMs").GetProperty("maximum").GetInt32());
@@ -275,9 +285,11 @@ public sealed class McpServerTests
 		Assert.Equal(McpAutomationLimits.MaxSegments, segments.GetProperty("maxItems").GetInt32());
 		Assert.Equal(1, segments.GetProperty("items").GetProperty("properties").GetProperty("frames").GetProperty("minimum").GetInt32());
 		Assert.Equal(McpAutomationLimits.MaxExperimentFrames, segments.GetProperty("items").GetProperty("properties").GetProperty("frames").GetProperty("maximum").GetInt32());
-		JsonElement controller = segments.GetProperty("items").GetProperty("properties").GetProperty("controllers")
-			.GetProperty("items").GetProperty("properties");
-		Assert.Equal(0, controller.GetProperty("port").GetProperty("minimum").GetInt32());
+		JsonElement controllers = segments.GetProperty("items").GetProperty("properties").GetProperty("controllers");
+		Assert.Equal(McpAutomationLimits.MaxControllersPerSegment, controllers.GetProperty("maxItems").GetInt32());
+		JsonElement controller = controllers.GetProperty("items").GetProperty("properties");
+		Assert.Equal(McpAutomationLimits.MinPhysicalControllerPort, controller.GetProperty("port").GetProperty("minimum").GetInt32());
+		Assert.Equal(McpAutomationLimits.MaxPhysicalControllerPort, controller.GetProperty("port").GetProperty("maximum").GetInt32());
 		Assert.Equal(byte.MaxValue + 1, controller.GetProperty("buttons").GetProperty("maxItems").GetInt32());
 		JsonElement observations = experiment.GetProperty("observations");
 		Assert.Equal(McpAutomationLimits.MaxObservations, observations.GetProperty("maxItems").GetInt32());
@@ -1147,6 +1159,27 @@ public sealed class McpServerTests
 			RequestProperties(tools, toolName).GetProperty(property).GetProperty("enum")
 				.EnumerateArray().Select(value => value.GetString())
 		);
+	}
+
+	private static void AssertResourceIdSchema(JsonElement schema, bool nullable = false)
+	{
+		JsonElement stringSchema = schema;
+		if(schema.TryGetProperty("anyOf", out JsonElement anyOf)) {
+			JsonElement[] branches = anyOf.EnumerateArray().ToArray();
+			stringSchema = branches.Single(branch => branch.GetProperty("type").GetString() == "string");
+			Assert.Equal(nullable, branches.Any(branch => branch.GetProperty("type").GetString() == "null"));
+		} else if(schema.GetProperty("type").ValueKind == JsonValueKind.Array) {
+			string?[] types = schema.GetProperty("type").EnumerateArray().Select(value => value.GetString()).ToArray();
+			Assert.Contains("string", types);
+			Assert.Equal(nullable, types.Contains("null"));
+		} else {
+			Assert.Equal("string", schema.GetProperty("type").GetString());
+			Assert.False(nullable);
+		}
+
+		Assert.Equal(32, stringSchema.GetProperty("minLength").GetInt32());
+		Assert.Equal(32, stringSchema.GetProperty("maxLength").GetInt32());
+		Assert.Equal("^[0-9a-f]{32}$", stringSchema.GetProperty("pattern").GetString());
 	}
 
 	private static void AssertSchemaEnum(

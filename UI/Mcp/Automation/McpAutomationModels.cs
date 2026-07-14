@@ -17,6 +17,9 @@ internal static class McpAutomationLimits
 	internal const int MaxSearchAllocationBytes = 40 * 1024 * 1024;
 	internal const int MaxAggregateSearchAllocationBytes = 160 * 1024 * 1024;
 	internal const int MaxSegments = 256;
+	internal const int MaxControllersPerSegment = 8;
+	internal const int MinPhysicalControllerPort = 0;
+	internal const int MaxPhysicalControllerPort = byte.MaxValue;
 	internal const int MaxExperimentFrames = 3600;
 	internal const int MaxObservations = 256;
 	internal const int MaxAssertions = 256;

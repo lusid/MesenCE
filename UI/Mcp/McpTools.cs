@@ -29,6 +29,8 @@ public sealed record McpMemoryRead(string Space, uint Address, int Count, int[] 
 
 internal sealed class McpTools
 {
+	private const int ResourceIdLength = 32;
+	private const string ResourceIdPattern = "^[0-9a-f]{32}$";
 	private readonly McpEmulatorService _service;
 	private readonly McpAutomationService _automation;
 	private readonly McpExperimentService _experiments;
@@ -685,16 +687,29 @@ internal sealed class McpTools
 
 			bool changed = true;
 			switch(tool.ProtocolTool.Name) {
+				case "load_save_state":
+				case "delete_save_state":
+				case "delete_memory_snapshot":
+				case "undo_memory_search":
+				case "delete_memory_search":
+					SetResourceIdSchema(properties["id"]!);
+					break;
 				case "run_experiment": {
 					properties["cpu"]!["enum"] = new JsonArray("Nes");
+					SetResourceIdSchema(properties["saveStateId"]!);
 					SetRange(properties["timeoutMs"]!, McpAutomationLimits.MinExperimentTimeoutMs, McpAutomationLimits.MaxExperimentTimeoutMs);
 					JsonObject segments = properties["segments"]!.AsObject();
 					segments["minItems"] = 1;
 					segments["maxItems"] = McpAutomationLimits.MaxSegments;
 					JsonObject segmentProperties = segments["items"]!["properties"]!.AsObject();
 					SetRange(segmentProperties["frames"]!, 1, McpAutomationLimits.MaxExperimentFrames);
-					JsonObject controllerProperties = segmentProperties["controllers"]!["items"]!["properties"]!.AsObject();
-					controllerProperties["port"]!["minimum"] = 0;
+					JsonObject controllers = segmentProperties["controllers"]!.AsObject();
+					controllers["maxItems"] = McpAutomationLimits.MaxControllersPerSegment;
+					JsonObject controllerProperties = controllers["items"]!["properties"]!.AsObject();
+					SetRange(
+						controllerProperties["port"]!,
+						McpAutomationLimits.MinPhysicalControllerPort,
+						McpAutomationLimits.MaxPhysicalControllerPort);
 					controllerProperties["buttons"]!["maxItems"] = byte.MaxValue + 1;
 
 					JsonObject observations = properties["observations"]!.AsObject();
@@ -720,6 +735,8 @@ internal sealed class McpTools
 					SetRange(properties["count"]!, 1, McpAutomationLimits.MaxMemorySnapshotBytes);
 					break;
 				case "compare_memory_snapshots":
+					SetResourceIdSchema(properties["firstId"]!);
+					SetResourceIdSchema(properties["secondId"]!);
 					SetPaging(properties);
 					SetRange(properties["sampleBytes"]!, 0, McpAutomationLimits.MaxRunSampleBytes);
 					break;
@@ -730,12 +747,14 @@ internal sealed class McpTools
 					SetRange(properties["stride"]!, 1, 4);
 					break;
 				case "refine_memory_search":
+					SetResourceIdSchema(properties["id"]!);
 					properties["comparison"]!["enum"] = new JsonArray(
 						"exact", "not_equal", "increased", "decreased", "changed", "unchanged",
 						"increased_by", "decreased_by");
 					properties["delta"]!["minimum"] = 1;
 					break;
 				case "get_memory_search_results":
+					SetResourceIdSchema(properties["id"]!);
 					SetPaging(properties);
 					break;
 				default:
@@ -754,6 +773,44 @@ internal sealed class McpTools
 	{
 		properties["offset"]!["minimum"] = 0;
 		SetRange(properties["limit"]!, 1, McpAutomationLimits.MaxResultPage);
+	}
+
+	private static void SetResourceIdSchema(JsonNode schema)
+	{
+		JsonObject stringSchema = GetSchemaBranch(schema.AsObject(), "string");
+		stringSchema["minLength"] = ResourceIdLength;
+		stringSchema["maxLength"] = ResourceIdLength;
+		stringSchema["pattern"] = ResourceIdPattern;
+	}
+
+	private static JsonObject GetSchemaBranch(JsonObject schema, string type)
+	{
+		if(HasSchemaType(schema, type)) {
+			return schema;
+		}
+		if(schema["anyOf"] is JsonArray alternatives) {
+			foreach(JsonNode? alternative in alternatives) {
+				if(alternative is JsonObject candidate && HasSchemaType(candidate, type)) {
+					return candidate;
+				}
+			}
+		}
+		throw new InvalidOperationException($"Generated schema does not contain a {type} branch.");
+	}
+
+	private static bool HasSchemaType(JsonObject schema, string type)
+	{
+		if(schema["type"] is JsonValue value) {
+			return value.TryGetValue(out string? schemaType) && schemaType == type;
+		}
+		if(schema["type"] is JsonArray types) {
+			foreach(JsonNode? item in types) {
+				if(item is JsonValue candidate && candidate.TryGetValue(out string? schemaType) && schemaType == type) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	private static void SetRange(JsonNode schema, int minimum, int maximum)
