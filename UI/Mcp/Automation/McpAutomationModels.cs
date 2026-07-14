@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Mesen.Config;
 
 namespace Mesen.Mcp;
 
@@ -41,3 +42,7 @@ public sealed record McpSaveStateLoadResult(string Id, long RomIdentity, long Pr
 public sealed record McpDeleteResourceResult(string Id, bool Deleted);
 public sealed record McpScreenshotMetadata(int Width, int Height, uint FrameNumber, int PngBytes, long RomIdentity, long MutableStateGeneration);
 internal sealed record McpScreenshotCapture(McpScreenshotMetadata Metadata, byte[] Png);
+internal sealed record McpControllerControl(string Id, int NativeId, bool IsNumeric);
+internal sealed record McpControllerTopology(int Index, int PhysicalPort, ControllerType DeviceType, IReadOnlyList<McpControllerControl> Controls);
+internal sealed record McpControllerValue(int ControlId, int Value);
+internal sealed record McpExclusiveControllerState(int Port, IReadOnlyList<McpControllerValue> Values, bool Enabled = true);

@@ -45,6 +45,7 @@
 #include "WS/Debugger/WsDebugger.h"
 #include "WS/WsTypes.h"
 #include "Shared/BaseControlManager.h"
+#include "Shared/BaseControlDevice.h"
 #include "Shared/EmuSettings.h"
 #include "Shared/Audio/SoundMixer.h"
 #include "Shared/NotificationManager.h"
@@ -133,6 +134,7 @@ Debugger::Debugger(Emulator* emu, IConsole* console)
 
 Debugger::~Debugger()
 {
+	ClearExclusiveControllerOverrides();
 	Release();
 }
 
@@ -596,6 +598,54 @@ void Debugger::ProcessEvent(EventType type, std::optional<CpuType> cpuTypeOpt)
 
 		case EventType::InputPolled:
 			_debuggers[(int)evtCpuType].Debugger->ProcessInputOverrides(_inputOverrides);
+			{
+				ExclusiveControllerOverride overrides[8];
+				{
+					auto lock = _exclusiveInputLock.AcquireSafe();
+					for(int i = 0; i < 8; i++) {
+						overrides[i] = _exclusiveInputOverrides[i];
+					}
+				}
+
+				BaseControlManager* controlManager = _console->GetControlManager();
+				bool stateChanged = false;
+				for(int i = 0; i < 8; i++) {
+					if(!overrides[i].Enabled) {
+						continue;
+					}
+
+					shared_ptr<BaseControlDevice> device = controlManager->GetControlDeviceByIndex(i);
+					shared_ptr<BaseControlDevice> configuredDevice = overrides[i].Device.lock();
+					if(!device || device != configuredDevice) {
+						continue;
+					}
+
+					vector<DeviceButtonName> controls = device->GetKeyNameAssociations();
+					bool valid = true;
+					for(InteropControllerValue& value : overrides[i].Values) {
+						auto match = std::find_if(controls.begin(), controls.end(), [&](DeviceButtonName& control) {
+							return !control.IsNumeric && control.ButtonId == value.ControlId && control.ButtonId >= 0 && control.ButtonId <= UINT8_MAX;
+						});
+						if(match == controls.end() || (value.Value != 0 && value.Value != 1)) {
+							valid = false;
+							break;
+						}
+					}
+					if(!valid) {
+						continue;
+					}
+
+					device->ClearState();
+					for(InteropControllerValue& value : overrides[i].Values) {
+						device->SetBitValue((uint8_t)value.ControlId, value.Value != 0);
+					}
+					device->OnAfterSetState();
+					stateChanged = true;
+				}
+				if(stateChanged) {
+					controlManager->RefreshHubState();
+				}
+			}
 			break;
 
 		case EventType::StartFrame: {
@@ -1054,6 +1104,127 @@ void Debugger::GetAvailableInputOverrides(uint8_t* availableIndexes)
 	BaseControlManager* controlManager = _console->GetControlManager();
 	for(int i = 0; i < 8; i++) {
 		availableIndexes[i] = controlManager->GetControlDeviceByIndex(i) != nullptr;
+	}
+}
+
+uint32_t Debugger::GetControllerCount()
+{
+	BaseControlManager* controlManager = _console->GetControlManager();
+	uint32_t count = 0;
+	for(uint32_t i = 0; i < 8; i++) {
+		if(controlManager->GetControlDeviceByIndex((uint8_t)i)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+bool Debugger::GetControllerInfo(uint32_t ordinal, InteropControllerInfo& info)
+{
+	if(ordinal >= GetControllerCount()) {
+		return false;
+	}
+
+	BaseControlManager* controlManager = _console->GetControlManager();
+	uint32_t activeOrdinal = 0;
+	for(uint32_t i = 0; i < 8; i++) {
+		shared_ptr<BaseControlDevice> device = controlManager->GetControlDeviceByIndex((uint8_t)i);
+		if(device) {
+			if(activeOrdinal == ordinal) {
+				vector<DeviceButtonName> controls = device->GetKeyNameAssociations();
+				if(controls.size() > INT32_MAX) {
+					return false;
+				}
+				info.Index = (int32_t)i;
+				info.Port = device->GetPort();
+				info.DeviceType = (int32_t)device->GetControllerType();
+				info.ControlCount = (int32_t)controls.size();
+				return true;
+			}
+			activeOrdinal++;
+		}
+	}
+	return false;
+}
+
+bool Debugger::GetControllerControlInfo(uint32_t index, uint32_t controlIndex, InteropControllerControlInfo& info, string& name)
+{
+	if(index >= 8) {
+		return false;
+	}
+	shared_ptr<BaseControlDevice> device = _console->GetControlManager()->GetControlDeviceByIndex((uint8_t)index);
+	if(!device) {
+		return false;
+	}
+	vector<DeviceButtonName> controls = device->GetKeyNameAssociations();
+	if(controlIndex >= controls.size()) {
+		return false;
+	}
+	DeviceButtonName& control = controls[controlIndex];
+	info.ControlId = control.ButtonId;
+	info.IsNumeric = control.IsNumeric ? 1 : 0;
+	if(control.Name.size() > INT32_MAX) {
+		return false;
+	}
+	info.NameLength = (int32_t)control.Name.size();
+	name = control.Name;
+	return true;
+}
+
+bool Debugger::SetExclusiveControllerOverride(uint32_t index, int32_t enabled, InteropControllerValue* values, uint32_t valueCount)
+{
+	if(index >= 8 || (enabled != 0 && enabled != 1) || (valueCount > 0 && !values)) {
+		return false;
+	}
+	if(!enabled) {
+		if(valueCount != 0) {
+			return false;
+		}
+		auto lock = _exclusiveInputLock.AcquireSafe();
+		_exclusiveInputOverrides[index] = {};
+		return true;
+	}
+
+	shared_ptr<BaseControlDevice> device = _console->GetControlManager()->GetControlDeviceByIndex((uint8_t)index);
+	if(!device) {
+		return false;
+	}
+	vector<DeviceButtonName> controls = device->GetKeyNameAssociations();
+	if(valueCount > controls.size()) {
+		return false;
+	}
+
+	unordered_set<int32_t> seen;
+	for(uint32_t i = 0; i < valueCount; i++) {
+		if((values[i].Value != 0 && values[i].Value != 1) || !seen.insert(values[i].ControlId).second) {
+			return false;
+		}
+		auto match = std::find_if(controls.begin(), controls.end(), [&](DeviceButtonName& control) {
+			return !control.IsNumeric && control.ButtonId == values[i].ControlId && control.ButtonId >= 0 && control.ButtonId <= UINT8_MAX;
+		});
+		if(match == controls.end()) {
+			return false;
+		}
+	}
+
+	ExclusiveControllerOverride overrideState;
+	overrideState.Enabled = true;
+	overrideState.Device = device;
+	if(valueCount > 0) {
+		overrideState.Values.assign(values, values + valueCount);
+	}
+	{
+		auto lock = _exclusiveInputLock.AcquireSafe();
+		_exclusiveInputOverrides[index] = std::move(overrideState);
+	}
+	return true;
+}
+
+void Debugger::ClearExclusiveControllerOverrides()
+{
+	auto lock = _exclusiveInputLock.AcquireSafe();
+	for(int i = 0; i < 8; i++) {
+		_exclusiveInputOverrides[i] = {};
 	}
 }
 

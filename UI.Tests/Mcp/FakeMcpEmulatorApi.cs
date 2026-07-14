@@ -24,6 +24,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public CodeLineData[] DisassemblyOutput { get; init; } = [new(CpuType.Nes) { Address = 0x8000 }];
 	public StackFrameInfo[] Callstack { get; init; } = [new()];
 	public TraceRow[] ExecutionTrace { get; init; } = [];
+	public IReadOnlyList<McpControllerTopology> ControllerTopology { get; set; } = [];
 	public int ThrowOnDebuggerRequestBlockStateCall { get; set; }
 
 	public Func<bool>? IsRunningHandler { get; set; }
@@ -54,6 +55,9 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public Func<McpServiceResult<byte[]>>? CreateSaveStateHandler { get; set; }
 	public Func<byte[], McpServiceResult<bool>>? LoadSaveStateHandler { get; set; }
 	public Func<McpServiceResult<McpScreenshotCapture>>? CaptureScreenshotHandler { get; set; }
+	public Func<IReadOnlyList<McpControllerTopology>>? GetControllerTopologyHandler { get; set; }
+	public Func<McpExclusiveControllerState, bool>? SetExclusiveControllerOverrideHandler { get; set; }
+	public Action? ClearExclusiveControllerOverridesHandler { get; set; }
 
 	public Action? OnRead { get; set; }
 	public int IsRunningCalls { get; private set; }
@@ -84,6 +88,9 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public int CreateSaveStateCalls { get; private set; }
 	public int LoadSaveStateCalls { get; private set; }
 	public int CaptureScreenshotCalls { get; private set; }
+	public int GetControllerTopologyCalls { get; private set; }
+	public int SetExclusiveControllerOverrideCalls { get; private set; }
+	public int ClearExclusiveControllerOverridesCalls { get; private set; }
 	public uint LastReadStart { get; private set; }
 	public uint LastReadEndInclusive { get; private set; }
 	public uint LastWriteStart { get; private set; }
@@ -299,5 +306,23 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 		CaptureScreenshotCalls++;
 		return CaptureScreenshotHandler?.Invoke()
 			?? McpServiceResult<McpScreenshotCapture>.Failure("no_frame", "No decoded video frame is available.");
+	}
+
+	public IReadOnlyList<McpControllerTopology> GetControllerTopology()
+	{
+		GetControllerTopologyCalls++;
+		return GetControllerTopologyHandler?.Invoke() ?? ControllerTopology;
+	}
+
+	public bool SetExclusiveControllerOverride(McpExclusiveControllerState state)
+	{
+		SetExclusiveControllerOverrideCalls++;
+		return SetExclusiveControllerOverrideHandler?.Invoke(state) ?? true;
+	}
+
+	public void ClearExclusiveControllerOverrides()
+	{
+		ClearExclusiveControllerOverridesCalls++;
+		ClearExclusiveControllerOverridesHandler?.Invoke();
 	}
 }

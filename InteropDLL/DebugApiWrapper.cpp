@@ -151,6 +151,45 @@ extern "C"
 		WithDebugger(void, GetAvailableInputOverrides(availableIndexes));
 	}
 
+	DllExport uint32_t __stdcall GetControllerCount()
+	{
+		return WithDebugger(uint32_t, GetControllerCount());
+	}
+
+	DllExport bool __stdcall GetControllerInfo(uint32_t ordinal, InteropControllerInfo* info)
+	{
+		if(!info) {
+			return false;
+		}
+		return WrapDebuggerCall<bool>([&](Debugger* dbg) { return dbg->GetControllerInfo(ordinal, *info); });
+	}
+
+	DllExport bool __stdcall GetControllerControlInfo(uint32_t index, uint32_t controlIndex, InteropControllerControlInfo* info, char* name, uint32_t maxNameLength)
+	{
+		if(!info || !name || maxNameLength == 0) {
+			return false;
+		}
+		name[0] = '\0';
+		string controlName;
+		bool result = WrapDebuggerCall<bool>([&](Debugger* dbg) { return dbg->GetControllerControlInfo(index, controlIndex, *info, controlName); });
+		if(result && controlName.size() < maxNameLength) {
+			StringUtilities::CopyToBuffer(controlName, name, maxNameLength);
+		} else if(result) {
+			return false;
+		}
+		return result;
+	}
+
+	DllExport bool __stdcall SetExclusiveControllerOverride(uint32_t index, int32_t enabled, InteropControllerValue* values, uint32_t valueCount)
+	{
+		return WrapDebuggerCall<bool>([&](Debugger* dbg) { return dbg->SetExclusiveControllerOverride(index, enabled, values, valueCount); });
+	}
+
+	DllExport void __stdcall ClearExclusiveControllerOverrides()
+	{
+		WithDebugger(void, ClearExclusiveControllerOverrides());
+	}
+
 	DllExport void __stdcall GetTokenList(CpuType cpuType, char* tokenList)
 	{
 		WithDebugger(void, GetTokenList(cpuType, tokenList));
