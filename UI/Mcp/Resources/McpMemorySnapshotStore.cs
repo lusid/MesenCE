@@ -20,11 +20,12 @@ internal sealed class McpMemorySnapshotStore : McpResourceStore<McpMemorySnapsho
 		McpStateIdentity identity,
 		DateTimeOffset createdAt)
 	{
+		byte[] ownedData = (byte[])data.Clone();
 		McpServiceResult<McpResourceCreation<McpMemorySnapshotResource>> result = AddResource(id =>
 			new(
-				new(id, system, space, address, data.Length, identity.RomIdentity, identity.MutableStateGeneration, createdAt),
+				new(id, system, space, address, ownedData.Length, identity.RomIdentity, identity.MutableStateGeneration, createdAt),
 				identity,
-				data));
+				ownedData));
 		return result.IsSuccess
 			? McpServiceResult<McpMemorySnapshotMetadata>.Success(result.Value!.Value.Metadata)
 			: ForwardFailure<McpMemorySnapshotMetadata, McpResourceCreation<McpMemorySnapshotResource>>(result);

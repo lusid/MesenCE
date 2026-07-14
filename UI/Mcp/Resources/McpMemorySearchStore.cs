@@ -14,11 +14,12 @@ internal sealed class McpMemorySearchStore : McpResourceStore<McpMemorySearchRes
 
 	internal McpServiceResult<string> Create(McpMemorySearchResource resource)
 	{
-		if(resource.Count < 0 || resource.Count > McpAutomationLimits.MaxSearchRangeBytes) {
+		McpMemorySearchResource ownedResource = resource.CreateOwnedCopy();
+		if(ownedResource.Count < 0 || ownedResource.Count > McpAutomationLimits.MaxSearchRangeBytes) {
 			return McpServiceResult<string>.Failure("resource_limit", "The memory search range quota would be exceeded.");
 		}
 
-		McpServiceResult<McpResourceCreation<McpMemorySearchResource>> result = AddResource(_ => resource);
+		McpServiceResult<McpResourceCreation<McpMemorySearchResource>> result = AddResource(_ => ownedResource);
 		return result.IsSuccess
 			? McpServiceResult<string>.Success(result.Value!.Id)
 			: ForwardFailure<string, McpResourceCreation<McpMemorySearchResource>>(result);
@@ -28,10 +29,11 @@ internal sealed class McpMemorySearchStore : McpResourceStore<McpMemorySearchRes
 
 	internal McpServiceResult<bool> Replace(string id, McpMemorySearchResource replacement)
 	{
-		if(replacement.Count < 0 || replacement.Count > McpAutomationLimits.MaxSearchRangeBytes) {
+		McpMemorySearchResource ownedReplacement = replacement.CreateOwnedCopy();
+		if(ownedReplacement.Count < 0 || ownedReplacement.Count > McpAutomationLimits.MaxSearchRangeBytes) {
 			return McpServiceResult<bool>.Failure("resource_limit", "The memory search range quota would be exceeded.");
 		}
-		return ReplaceResource(id, replacement);
+		return ReplaceResource(id, ownedReplacement);
 	}
 
 	internal McpServiceResult<McpDeleteResourceResult> Delete(string id) => DeleteResource(id);

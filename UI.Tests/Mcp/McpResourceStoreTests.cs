@@ -55,6 +55,28 @@ public sealed class McpResourceStoreTests
 	}
 
 	[Fact]
+	public void SaveStateAndSnapshotStoresOwnCopiesOfCallerData()
+	{
+		byte[] saveData = [1, 2, 3];
+		byte[] snapshotData = [4, 5, 6];
+		using McpSaveStateStore saveStates = new(new FakeMcpMonotonicClock());
+		using McpMemorySnapshotStore snapshots = new(new FakeMcpMonotonicClock());
+		string saveId = AssertSuccess(saveStates.Create(saveData, Identity, DateTimeOffset.UnixEpoch)).Id;
+		string snapshotId = AssertSuccess(
+			snapshots.Create("NES", "cpu", 0, snapshotData, Identity, DateTimeOffset.UnixEpoch)).Id;
+
+		saveData[0] = 99;
+		snapshotData[0] = 99;
+
+		using McpPinnedResource<McpSaveStateResource> save = AssertSuccess(saveStates.Pin(saveId));
+		using McpPinnedResource<McpMemorySnapshotResource> snapshot = AssertSuccess(snapshots.Pin(snapshotId));
+		Assert.Equal([1, 2, 3], save.Value.Data);
+		Assert.Equal([4, 5, 6], snapshot.Value.Data);
+		Assert.NotSame(saveData, save.Value.Data);
+		Assert.NotSame(snapshotData, snapshot.Value.Data);
+	}
+
+	[Fact]
 	public void SuccessfulUseRefreshesIdleExpiration()
 	{
 		FakeMcpMonotonicClock clock = new();
@@ -149,6 +171,32 @@ public sealed class McpResourceStoreTests
 	}
 
 	[Fact]
+	public void SnapshotTopologyInvalidationRetainsStaleMetadataUntilExpiration()
+	{
+		FakeMcpMonotonicClock clock = new();
+		using McpMemorySnapshotStore store = new(clock);
+		string id = AssertSuccess(store.Create("NES", "cpu", 0, [1], Identity, DateTimeOffset.UnixEpoch)).Id;
+
+		store.InvalidateTopology(resource => resource.Metadata.Space == "cpu");
+
+		AssertError(store.Pin(id), "stale_resource");
+		clock.Advance(TimeSpan.FromMinutes(30));
+		AssertError(store.Pin(id), "resource_not_found");
+	}
+
+	[Fact]
+	public void SaveStatesAreScopedOnlyToRomIdentity()
+	{
+		using McpSaveStateStore store = new(new FakeMcpMonotonicClock());
+		string id = AssertSuccess(store.Create([1], Identity, DateTimeOffset.UnixEpoch)).Id;
+
+		store.InvalidateRom(Identity.RomIdentity);
+		AssertSuccess(store.Pin(id)).Dispose();
+		store.InvalidateRom(Identity.RomIdentity + 1);
+		AssertError(store.Pin(id), "stale_resource");
+	}
+
+	[Fact]
 	public void DisposeDefersPinnedDataCleanupAndRejectsFurtherUse()
 	{
 		FakeMcpMonotonicClock clock = new();
@@ -187,6 +235,60 @@ public sealed class McpResourceStoreTests
 		McpMemorySearchResource resource = SearchResource(state, undo);
 
 		Assert.Equal(3 + 5 + (7 * sizeof(int)) + 13, resource.AllocationBytes);
+	}
+
+	[Fact]
+	public void SearchStoreOwnsOneCloneOfEveryAddArrayAndPreservesAliases()
+	{
+		byte[] previous = [1, 2];
+		byte[] sharedSnapshot = [3, 4];
+		int[] sharedCandidates = [5, 6];
+		byte[] undoCurrent = [7, 8];
+		McpMemorySearchState state = new(previous, sharedSnapshot, sharedCandidates, 1, 2);
+		McpMemorySearchState undo = new(sharedSnapshot, undoCurrent, sharedCandidates, 0, 1);
+		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
+		string id = AssertSuccess(store.Create(SearchResource(state, undo)));
+
+		previous[0] = 99;
+		sharedSnapshot[0] = 99;
+		sharedCandidates[0] = 99;
+		undoCurrent[0] = 99;
+
+		using McpPinnedResource<McpMemorySearchResource> pin = AssertSuccess(store.Pin(id));
+		Assert.Equal([1, 2], pin.Value.State.PreviousSnapshot);
+		Assert.Equal([3, 4], pin.Value.State.CurrentSnapshot);
+		Assert.Equal([5, 6], pin.Value.State.CandidateOffsets);
+		Assert.Equal([7, 8], pin.Value.UndoState!.CurrentSnapshot);
+		Assert.Same(pin.Value.State.CurrentSnapshot, pin.Value.UndoState.PreviousSnapshot);
+		Assert.Same(pin.Value.State.CandidateOffsets, pin.Value.UndoState.CandidateOffsets);
+		Assert.Equal(2 + 2 + (2 * sizeof(int)) + 2, pin.Value.AllocationBytes);
+	}
+
+	[Fact]
+	public void SearchStoreOwnsOneCloneOfEveryReplacementArrayAndPreservesAliases()
+	{
+		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
+		string id = AssertSuccess(store.Create(SearchResource(new([1], [2], [3], 0, 1))));
+		byte[] previous = [4, 5];
+		byte[] sharedSnapshot = [6, 7];
+		int[] sharedCandidates = [8, 9];
+		byte[] undoCurrent = [10, 11];
+		McpMemorySearchState state = new(previous, sharedSnapshot, sharedCandidates, 2, 3);
+		McpMemorySearchState undo = new(sharedSnapshot, undoCurrent, sharedCandidates, 1, 2);
+
+		AssertSuccess(store.Replace(id, SearchResource(state, undo)));
+		previous[0] = 99;
+		sharedSnapshot[0] = 99;
+		sharedCandidates[0] = 99;
+		undoCurrent[0] = 99;
+
+		using McpPinnedResource<McpMemorySearchResource> pin = AssertSuccess(store.Pin(id));
+		Assert.Equal([4, 5], pin.Value.State.PreviousSnapshot);
+		Assert.Equal([6, 7], pin.Value.State.CurrentSnapshot);
+		Assert.Equal([8, 9], pin.Value.State.CandidateOffsets);
+		Assert.Equal([10, 11], pin.Value.UndoState!.CurrentSnapshot);
+		Assert.Same(pin.Value.State.CurrentSnapshot, pin.Value.UndoState.PreviousSnapshot);
+		Assert.Same(pin.Value.State.CandidateOffsets, pin.Value.UndoState.CandidateOffsets);
 	}
 
 	[Fact]
@@ -233,8 +335,35 @@ public sealed class McpResourceStoreTests
 		AssertError(store.Replace(id, SearchResource(excessive)), "resource_limit");
 
 		using McpPinnedResource<McpMemorySearchResource> pin = AssertSuccess(store.Pin(id));
-		Assert.Same(initial, pin.Value);
+		Assert.NotSame(initial, pin.Value);
+		Assert.Equal(initial.State.CurrentSnapshot, pin.Value.State.CurrentSnapshot);
 		Assert.Equal(2, pin.Value.State.MutableStateGeneration);
+	}
+
+	[Fact]
+	public void FailedSearchReplacementCloneCannotMutateInstalledState()
+	{
+		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
+		McpMemorySearchResource initial = SearchResource(new([1], [2], [3], 1, 2));
+		string id = AssertSuccess(store.Create(initial));
+		long retainedBytes = store.RetainedBytes;
+		byte[] rejectedPrevious = new byte[McpAutomationLimits.MaxSearchRangeBytes];
+		byte[] rejectedCurrent = new byte[McpAutomationLimits.MaxSearchRangeBytes];
+		int[] rejectedCandidates = new int[(McpAutomationLimits.MaxSearchAllocationBytes / sizeof(int)) -
+			(McpAutomationLimits.MaxSearchRangeBytes * 2 / sizeof(int)) + 1];
+		McpMemorySearchResource rejected = SearchResource(
+			new(rejectedPrevious, rejectedCurrent, rejectedCandidates, 2, 3));
+
+		AssertError(store.Replace(id, rejected), "resource_limit");
+		Assert.Equal(retainedBytes, store.RetainedBytes);
+		rejectedPrevious[0] = 99;
+		rejectedCurrent[0] = 99;
+		rejectedCandidates[0] = 99;
+
+		using McpPinnedResource<McpMemorySearchResource> pin = AssertSuccess(store.Pin(id));
+		Assert.Equal([1], pin.Value.State.PreviousSnapshot);
+		Assert.Equal([2], pin.Value.State.CurrentSnapshot);
+		Assert.Equal([3], pin.Value.State.CandidateOffsets);
 	}
 
 	[Fact]
@@ -250,7 +379,8 @@ public sealed class McpResourceStoreTests
 		Assert.True(AssertSuccess(store.Replace(id, replacement)));
 		Assert.Equal(initial.AllocationBytes + replacement.AllocationBytes, store.RetainedBytes);
 		using(McpPinnedResource<McpMemorySearchResource> currentPin = AssertSuccess(store.Pin(id))) {
-			Assert.Same(replacement, currentPin.Value);
+			Assert.NotSame(replacement, currentPin.Value);
+			Assert.Equal(replacement.State.CurrentSnapshot, currentPin.Value.State.CurrentSnapshot);
 		}
 
 		oldPin.Dispose();
@@ -258,7 +388,7 @@ public sealed class McpResourceStoreTests
 	}
 
 	[Fact]
-	public void SearchReplacementCountsArraysSharedWithPinnedVersionOnce()
+	public void SearchReplacementOwnsArraysIndependentlyFromPinnedVersion()
 	{
 		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
 		byte[] shared = new byte[20];
@@ -269,7 +399,11 @@ public sealed class McpResourceStoreTests
 
 		AssertSuccess(store.Replace(id, replacement));
 
-		Assert.Equal(initial.AllocationBytes + replacement.AllocationBytes - shared.Length, store.RetainedBytes);
+		using(McpPinnedResource<McpMemorySearchResource> replacementPin = AssertSuccess(store.Pin(id))) {
+			Assert.NotSame(oldPin.Value.State.CurrentSnapshot, replacementPin.Value.State.PreviousSnapshot);
+			Assert.Equal(shared, replacementPin.Value.State.PreviousSnapshot);
+		}
+		Assert.Equal(initial.AllocationBytes + replacement.AllocationBytes, store.RetainedBytes);
 		oldPin.Dispose();
 		Assert.Equal(replacement.AllocationBytes, store.RetainedBytes);
 	}
@@ -299,7 +433,22 @@ public sealed class McpResourceStoreTests
 		first.Dispose();
 		AssertSuccess(store.Replace(ids[0], smallReplacement));
 		using McpPinnedResource<McpMemorySearchResource> replacement = AssertSuccess(store.Pin(ids[0]));
-		Assert.Same(smallReplacement, replacement.Value);
+		Assert.NotSame(smallReplacement, replacement.Value);
+		Assert.Equal(smallReplacement.State.CurrentSnapshot, replacement.Value.State.CurrentSnapshot);
+	}
+
+	[Fact]
+	public void SearchTopologyInvalidationRetainsStaleMetadataUntilExpiration()
+	{
+		FakeMcpMonotonicClock clock = new();
+		using McpMemorySearchStore store = new(clock);
+		string id = AssertSuccess(store.Create(SearchResource(new([1], [2], [3], 1, 2))));
+
+		store.InvalidateTopology(resource => resource.Space == "cpu");
+
+		AssertError(store.Pin(id), "stale_resource");
+		clock.Advance(TimeSpan.FromMinutes(30));
+		AssertError(store.Pin(id), "resource_not_found");
 	}
 
 	private static McpMemorySearchResource SearchResource(

@@ -69,6 +69,41 @@ internal sealed record McpMemorySearchResource(
 		}
 		return [.. arrays];
 	}
+
+	internal McpMemorySearchResource CreateOwnedCopy()
+	{
+		Dictionary<Array, Array> copies = new(ReferenceEqualityComparer.Instance);
+
+		byte[] CopyBytes(byte[] source)
+		{
+			if(!copies.TryGetValue(source, out Array? copy)) {
+				copy = (byte[])source.Clone();
+				copies.Add(source, copy);
+			}
+			return (byte[])copy;
+		}
+
+		int[] CopyOffsets(int[] source)
+		{
+			if(!copies.TryGetValue(source, out Array? copy)) {
+				copy = (int[])source.Clone();
+				copies.Add(source, copy);
+			}
+			return (int[])copy;
+		}
+
+		McpMemorySearchState CopyState(McpMemorySearchState state) => new(
+			CopyBytes(state.PreviousSnapshot),
+			CopyBytes(state.CurrentSnapshot),
+			CopyOffsets(state.CandidateOffsets),
+			state.PreviousMutableStateGeneration,
+			state.MutableStateGeneration);
+
+		return this with {
+			State = CopyState(State),
+			UndoState = UndoState is null ? null : CopyState(UndoState)
+		};
+	}
 }
 
 internal abstract class McpResourceStore<T> : IDisposable where T : class

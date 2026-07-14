@@ -14,8 +14,9 @@ internal sealed class McpSaveStateStore : McpResourceStore<McpSaveStateResource>
 
 	internal McpServiceResult<McpSaveStateMetadata> Create(byte[] data, McpStateIdentity identity, DateTimeOffset createdAt)
 	{
+		byte[] ownedData = (byte[])data.Clone();
 		McpServiceResult<McpResourceCreation<McpSaveStateResource>> result = AddResource(id =>
-			new(new(id, data.Length, identity.RomIdentity, identity.MutableStateGeneration, createdAt), identity, data));
+			new(new(id, ownedData.Length, identity.RomIdentity, identity.MutableStateGeneration, createdAt), identity, ownedData));
 		return result.IsSuccess
 			? McpServiceResult<McpSaveStateMetadata>.Success(result.Value!.Value.Metadata)
 			: ForwardFailure<McpSaveStateMetadata, McpResourceCreation<McpSaveStateResource>>(result);
