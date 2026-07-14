@@ -50,4 +50,5 @@ internal sealed record McpControllerTopology(int Index, int PhysicalPort, Contro
 internal sealed record McpControllerValue(int ControlId, int Value);
 internal sealed record McpExclusiveControllerState(int NativeIndex, int Port, IReadOnlyList<McpControllerValue> Values, bool Enabled = true);
 internal sealed record McpAutomationStateContext(McpStateIdentity Identity, McpOperationTicket Ticket);
+internal sealed record McpAutomationPreparation<T>(T Value, McpAutomationStateContext Context);
 internal sealed record McpOwnedSaveStateLoad(McpSaveStateLoadResult Result, McpAutomationStateContext Context);

@@ -4,7 +4,7 @@ using System.Threading;
 namespace Mesen.Mcp;
 
 internal readonly record struct McpOperationTicket(long Generation, ulong DebuggerBlockState);
-internal sealed record McpStateLoadPostflight<T>(T Value, McpOperationTicket Ticket);
+internal sealed record McpOperationPostflight<T>(T Value, McpOperationTicket Ticket);
 
 internal sealed class McpEmulatorGate
 {
@@ -59,21 +59,36 @@ internal sealed class McpEmulatorGate
 		return ExecuteLocked(_ => operation(), preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId));
 	}
 
-	internal McpServiceResult<McpStateLoadPostflight<T>> ExecuteOwnedStateLoad<T>(
+	internal McpServiceResult<McpOperationPostflight<T>> ExecuteOwnedStateLoad<T>(
 		long leaseId,
+		McpOperationTicket? expectedTicket,
 		Func<McpOperationTicket, McpServiceResult<T>> operation)
 	{
 		McpOperationTicket endingTicket = default;
 		McpServiceResult<T> result = ExecuteLocked(
-			operation,
+			ticket => expectedTicket.HasValue && ticket != expectedTicket.Value
+				? StateChanged<T>()
+				: operation(ticket),
 			preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId),
 			postflight: (initial, ending, operationResult) => ending.Generation ==
 				initial.Generation + (operationResult.IsSuccess ? 1 : 0),
 			allowDebuggerBlockStateChangeOnSuccess: true,
 			acceptedPostflight: ticket => endingTicket = ticket);
 		return result.IsSuccess
-			? McpServiceResult<McpStateLoadPostflight<T>>.Success(new(result.Value!, endingTicket))
-			: McpServiceResult<McpStateLoadPostflight<T>>.Failure(result.Error!.Code, result.Error.Message);
+			? McpServiceResult<McpOperationPostflight<T>>.Success(new(result.Value!, endingTicket))
+			: McpServiceResult<McpOperationPostflight<T>>.Failure(result.Error!.Code, result.Error.Message);
+	}
+
+	internal McpServiceResult<McpOperationPostflight<T>> ExecuteWithDebuggerLeasePostflight<T>(
+		Action acquireDebuggerLease,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		McpOperationTicket endingTicket = default;
+		McpServiceResult<T> result = ExecuteLocked(
+			operation, acquireDebuggerLease, acceptedPostflight: ticket => endingTicket = ticket);
+		return result.IsSuccess
+			? McpServiceResult<McpOperationPostflight<T>>.Success(new(result.Value!, endingTicket))
+			: McpServiceResult<McpOperationPostflight<T>>.Failure(result.Error!.Code, result.Error.Message);
 	}
 
 	internal McpServiceResult<T> ExecuteOwnedWithDebuggerLease<T>(

@@ -67,7 +67,7 @@ internal sealed class McpAutomationService
 		}
 		using McpPinnedResource<McpSaveStateResource> pin = pinResult.Value!;
 		McpServiceResult<McpOwnedSaveStateLoad> load = LoadOwnedSaveState(
-			executionLease.LeaseId, id, pin.Value, cancellationToken);
+			executionLease.LeaseId, id, pin.Value, null, cancellationToken);
 		return load.IsSuccess
 			? McpServiceResult<McpSaveStateLoadResult>.Success(load.Value!.Result)
 			: ForwardFailure<McpSaveStateLoadResult, McpOwnedSaveStateLoad>(load);
@@ -77,12 +77,17 @@ internal sealed class McpAutomationService
 		long leaseId,
 		string id,
 		McpSaveStateResource state,
+		McpAutomationStateContext? expectedContext,
 		CancellationToken cancellationToken)
 	{
-		McpServiceResult<McpStateLoadPostflight<OwnedLoadIdentity>> load =
-			_emulator.ExecuteOwnedStateLoad(leaseId, (api, identity) => {
+		McpServiceResult<McpOperationPostflight<OwnedLoadIdentity>> load =
+			_emulator.ExecuteOwnedStateLoad(leaseId, expectedContext?.Ticket, (api, identity) => {
 			if(!api.IsRunning()) {
 				return NoGame<OwnedLoadIdentity>();
+			}
+			if(expectedContext is not null && identity != expectedContext.Identity) {
+				return McpServiceResult<OwnedLoadIdentity>.Failure(
+					"state_changed", "Emulator state changed before save-state restore.");
 			}
 			if(state.Identity.RomIdentity != identity.RomIdentity) {
 				return McpServiceResult<OwnedLoadIdentity>.Failure(
@@ -107,9 +112,9 @@ internal sealed class McpAutomationService
 				identity, current, api.IsPaused() ? "paused" : "running"));
 		});
 		if(!load.IsSuccess) {
-			return ForwardFailure<McpOwnedSaveStateLoad, McpStateLoadPostflight<OwnedLoadIdentity>>(load);
+			return ForwardFailure<McpOwnedSaveStateLoad, McpOperationPostflight<OwnedLoadIdentity>>(load);
 		}
-		McpStateLoadPostflight<OwnedLoadIdentity> postflight = load.Value!;
+		McpOperationPostflight<OwnedLoadIdentity> postflight = load.Value!;
 		OwnedLoadIdentity value = postflight.Value;
 		return McpServiceResult<McpOwnedSaveStateLoad>.Success(new(
 			new(id, value.Current.RomIdentity, value.Previous.MutableStateGeneration,

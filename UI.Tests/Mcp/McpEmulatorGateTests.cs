@@ -251,8 +251,8 @@ public sealed class McpEmulatorGateTests
 		Assert.True(acquisition.IsSuccess, acquisition.Error?.Code);
 		await using McpExecutionLease lease = acquisition.Value!;
 
-		McpServiceResult<McpStateLoadPostflight<int>> load = gate.ExecuteOwnedStateLoad(
-			lease.LeaseId,
+		McpServiceResult<McpOperationPostflight<int>> load = gate.ExecuteOwnedStateLoad(
+			lease.LeaseId, null,
 			_ => {
 				api.SetDebuggerRequestBlocked(true);
 				gate.NotifyEmulatorStateChanged();

@@ -175,6 +175,53 @@ public sealed class McpExperimentServiceTests
 		Assert.Equal("resource_not_found", fixture.SaveStates.Pin(state.Id).Error?.Code);
 	}
 
+	[Theory]
+	[InlineData("mutable")]
+	[InlineData("rom")]
+	[InlineData("ticket")]
+	public async Task RunAsync_PreLoadRaceRejectsBeforeStateOrInputMutation(string race)
+	{
+		ExperimentFixture? raceFixture = null;
+		using ExperimentFixture fixture = new(paused: true, afterPreparation: () => {
+			switch(race) {
+				case "mutable":
+					raceFixture!.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameReset });
+					break;
+				case "rom":
+					raceFixture!.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.BeforeGameLoad });
+					raceFixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.GameLoaded });
+					raceFixture.SaveStates.InvalidateRom(raceFixture.Emulator.EmulatorIdentity.Current.RomIdentity);
+					break;
+				case "ticket":
+					raceFixture!.Api.SetDebuggerRequestBlocked(true);
+					raceFixture.Api.SetDebuggerRequestBlocked(false);
+					break;
+			}
+		});
+		raceFixture = fixture;
+		fixture.Api.CreateSaveStateHandler = () => McpServiceResult<byte[]>.Success([0x12]);
+		McpSaveStateMetadata state = AssertSuccess(fixture.Automation.CreateSaveState());
+		fixture.Api.LoadSaveStateHandler = _ => {
+			fixture.Emulator.ProcessNotification(new() { NotificationType = ConsoleNotificationType.StateLoaded });
+			return McpServiceResult<bool>.Success(true);
+		};
+		fixture.CompleteEveryStep();
+		McpServiceResult<McpExperimentCapture> run = await fixture.Experiments.RunAsync(
+			BasicRequest() with {
+				SaveStateId = state.Id,
+				Segments = [new(1, [new(0, ["A"])], null)]
+			}, CancellationToken.None);
+
+		RunExperimentResult result = AssertSuccess(run);
+
+		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
+		Assert.Equal(McpExperimentReason.StateChanged, result.Reason);
+		Assert.Empty(result.Checkpoints);
+		Assert.Equal(0, result.CompletedFrames);
+		Assert.Equal(0, fixture.Api.LoadSaveStateCalls);
+		Assert.Equal(0, fixture.Api.SetExclusiveControllerOverrideCalls);
+	}
+
 	[Fact]
 	public async Task RunAsync_FirstPausedRunInitializesDebuggerAndAcceptsOwnedStateLoadEpochChange()
 	{
@@ -788,7 +835,8 @@ public sealed class McpExperimentServiceTests
 			IMcpMonotonicClock? clock = null,
 			Action? afterScreenshotAssigned = null,
 			Action<FakeMcpEmulatorApi>? debuggerInitialize = null,
-			bool paused = false)
+			bool paused = false,
+			Action? afterPreparation = null)
 		{
 			Api = FakeMcpEmulatorApi.RunningNes(paused);
 			Api.MemorySizes[MemoryType.NesMemory] = 0x100;
@@ -808,7 +856,7 @@ public sealed class McpExperimentServiceTests
 			Automation = new(Emulator, new McpAutomationAdapterRegistry(Api), SaveStates);
 			Experiments = new(
 				Emulator, new McpAutomationAdapterRegistry(Api), SaveStates, Automation,
-				clock, afterScreenshotAssigned);
+				clock, afterScreenshotAssigned, afterPreparation);
 		}
 
 		internal FakeMcpEmulatorApi Api { get; }

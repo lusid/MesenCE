@@ -1531,6 +1531,29 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 	}
 
+	internal McpServiceResult<McpAutomationPreparation<T>> ExecuteAutomationPreparation<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		McpStateIdentity identity = default;
+		McpServiceResult<McpOperationPostflight<T>> preparation = ExecuteWithDebuggerLeasePostflight(
+			(_, prepareDebuggerLease) => {
+				McpServiceResult<bool> prepared = prepareDebuggerLease();
+				if(!prepared.IsSuccess) {
+					return McpServiceResult<T>.Failure(prepared.Error!.Code, prepared.Error.Message);
+				}
+				identity = _emulatorIdentity.Current;
+				McpServiceResult<T> result = operation(_api, identity);
+				return _emulatorIdentity.Current == identity
+					? result
+					: McpServiceResult<T>.Failure("state_changed", "Emulator state changed during the operation.");
+			});
+		return preparation.IsSuccess
+			? McpServiceResult<McpAutomationPreparation<T>>.Success(new(
+				preparation.Value!.Value, new(identity, preparation.Value.Ticket)))
+			: McpServiceResult<McpAutomationPreparation<T>>.Failure(
+				preparation.Error!.Code, preparation.Error.Message);
+	}
+
 	internal McpServiceResult<T> ExecuteAutomationTransaction<T>(
 		Func<IMcpEmulatorApi, McpStateIdentity, Action<Action<bool>>, McpServiceResult<T>> operation)
 	{
@@ -1637,14 +1660,15 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 	}
 
-	internal McpServiceResult<McpStateLoadPostflight<T>> ExecuteOwnedStateLoad<T>(
+	internal McpServiceResult<McpOperationPostflight<T>> ExecuteOwnedStateLoad<T>(
 		long leaseId,
+		McpOperationTicket? expectedTicket,
 		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
 	{
 		if(IsServiceStopping()) {
-			return ServiceStopping<McpStateLoadPostflight<T>>();
+			return ServiceStopping<McpOperationPostflight<T>>();
 		}
-		return _gate.ExecuteOwnedStateLoad(leaseId, _ => {
+		return _gate.ExecuteOwnedStateLoad(leaseId, expectedTicket, _ => {
 			if(IsServiceStopping()) {
 				return ServiceStopping<T>();
 			}
@@ -1750,6 +1774,22 @@ internal sealed class McpEmulatorService : IDisposable
 			ReconcilePendingResources();
 			return operation(ticket, prepareDebuggerLease);
 		});
+	}
+
+	private McpServiceResult<McpOperationPostflight<T>> ExecuteWithDebuggerLeasePostflight<T>(
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<McpOperationPostflight<T>>();
+		}
+		return _gate.ExecuteWithDebuggerLeasePostflight(
+			EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
+				if(IsServiceStopping()) {
+					return ServiceStopping<T>();
+				}
+				ReconcilePendingResources();
+				return operation(ticket, prepareDebuggerLease);
+			});
 	}
 
 	private McpServiceResult<T> ExecuteMutationWithDebuggerLease<T>(

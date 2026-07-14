@@ -16,6 +16,7 @@ internal sealed class McpExperimentService
 	private readonly McpAutomationService _automation;
 	private readonly IMcpMonotonicClock _clock;
 	private readonly Action _afterScreenshotAssigned;
+	private readonly Action _afterPreparation;
 
 	internal McpExperimentService(
 		McpEmulatorService emulator,
@@ -23,7 +24,8 @@ internal sealed class McpExperimentService
 		McpSaveStateStore saveStates,
 		McpAutomationService automation,
 		IMcpMonotonicClock? clock = null,
-		Action? afterScreenshotAssigned = null)
+		Action? afterScreenshotAssigned = null,
+		Action? afterPreparation = null)
 	{
 		_emulator = emulator;
 		_adapters = adapters;
@@ -31,6 +33,7 @@ internal sealed class McpExperimentService
 		_automation = automation;
 		_clock = clock ?? McpMonotonicClock.Instance;
 		_afterScreenshotAssigned = afterScreenshotAssigned ?? (() => { });
+		_afterPreparation = afterPreparation ?? (() => { });
 	}
 
 	internal async Task<McpServiceResult<McpExperimentCapture>> RunAsync(
@@ -43,6 +46,7 @@ internal sealed class McpExperimentService
 			return FailureFrom<McpExperimentCapture, PreparedExperiment>(preparation);
 		}
 		PreparedExperiment prepared = preparation.Value!;
+		_afterPreparation();
 
 		McpServiceResult<McpExecutionLease> acquisition = await _emulator.ExecutionCoordinator
 			.TryAcquireAsync(cancellationToken)
@@ -69,7 +73,7 @@ internal sealed class McpExperimentService
 		bool leaseReleased = false;
 		bool quarantined = false;
 		bool halted = false;
-		McpStateIdentity expectedIdentity = prepared.PreflightIdentity;
+		McpStateIdentity expectedIdentity = prepared.PreflightContext.Identity;
 		McpAutomationStateContext? stateContext = null;
 
 		try {
@@ -77,6 +81,12 @@ internal sealed class McpExperimentService
 				McpServiceResult<McpPinnedResource<McpSaveStateResource>> pinResult =
 					_saveStates.Pin(prepared.Experiment.SaveStateId);
 				if(!pinResult.IsSuccess) {
+					McpServiceResult<bool> context = VerifyExpectedContext(
+						lease.LeaseId, prepared.PreflightContext);
+					if(!context.IsSuccess) {
+						SetFailure(context.Error!.Code);
+						goto Cleanup;
+					}
 					await lease.DisposeAsync().ConfigureAwait(false);
 					return FailureFrom<McpExperimentCapture, McpPinnedResource<McpSaveStateResource>>(pinResult);
 				}
@@ -85,7 +95,8 @@ internal sealed class McpExperimentService
 					goto Cleanup;
 				}
 				McpServiceResult<McpOwnedSaveStateLoad> load = _automation.LoadOwnedSaveState(
-					lease.LeaseId, prepared.Experiment.SaveStateId, statePin.Value, cancellationToken);
+					lease.LeaseId, prepared.Experiment.SaveStateId, statePin.Value,
+					prepared.PreflightContext, cancellationToken);
 				if(!load.IsSuccess) {
 					SetFailure(load.Error!.Code);
 					goto Cleanup;
@@ -462,7 +473,8 @@ internal sealed class McpExperimentService
 
 	private McpServiceResult<PreparedExperiment> Prepare(RunExperimentRequest request)
 	{
-		return _emulator.ExecuteAutomationWithDebuggerLease((api, identity) => {
+		McpServiceResult<McpAutomationPreparation<PreparedExperiment>> preparation =
+			_emulator.ExecuteAutomationPreparation((api, identity) => {
 			if(!api.IsRunning()) {
 				return McpServiceResult<PreparedExperiment>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -526,12 +538,23 @@ internal sealed class McpExperimentService
 			return McpServiceResult<PreparedExperiment>.Success(new(
 				experiment,
 				cpu.Value!,
-				identity,
+				new(identity, default),
 				controlledPorts,
 				neutral.Value!.Where(state => controlledPorts.Contains(state.Port)).ToArray(),
 				segmentStates));
 		});
+		return preparation.IsSuccess
+			? McpServiceResult<PreparedExperiment>.Success(preparation.Value!.Value with {
+				PreflightContext = preparation.Value.Context
+			})
+			: FailureFrom<PreparedExperiment, McpAutomationPreparation<PreparedExperiment>>(preparation);
 	}
+
+	private McpServiceResult<bool> VerifyExpectedContext(
+		long leaseId,
+		McpAutomationStateContext context) =>
+		_emulator.ExecuteOwnedForTicket(leaseId, context.Ticket, (_, identity) =>
+			identity == context.Identity ? McpServiceResult<bool>.Success(true) : StateChanged<bool>());
 
 	private McpServiceResult<bool> ApplyInput(
 		long leaseId,
@@ -692,7 +715,7 @@ internal sealed class McpExperimentService
 	private sealed record PreparedExperiment(
 		McpValidatedExperiment Experiment,
 		CpuType CpuType,
-		McpStateIdentity PreflightIdentity,
+		McpAutomationStateContext PreflightContext,
 		IReadOnlySet<int> ControlledPorts,
 		IReadOnlyList<McpExclusiveControllerState> InitialStates,
 		IReadOnlyList<IReadOnlyList<McpExclusiveControllerState>> SegmentStates);
