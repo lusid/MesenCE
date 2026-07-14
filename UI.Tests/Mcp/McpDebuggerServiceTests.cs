@@ -55,6 +55,51 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
+	public async Task ContinueUntilBreak_HoldsExecutionLeaseUntilCancellationCleanupCompletes()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		McpExecutionCoordinator coordinator = new();
+		using McpEmulatorService service = new(
+			api,
+			executionCoordinator: coordinator,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new FakeBreakpointCollection());
+		using CancellationTokenSource cancellation = new();
+		Task<McpServiceResult<ContinueResult>> active = service.ContinueUntilBreakAsync(
+			nameof(CpuType.Nes), 5000, cancellation.Token);
+
+		Assert.Equal("operation_in_progress", (await coordinator.TryAcquireAsync(CancellationToken.None)).Error?.Code);
+		Assert.Equal("operation_in_progress", service.Resume().Error?.Code);
+		Assert.Equal("operation_in_progress", service.Step(nameof(CpuType.Nes), "instruction").Error?.Code);
+		Assert.Equal(
+			"operation_in_progress",
+			(await service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 100, CancellationToken.None)).Error?.Code);
+
+		cancellation.Cancel();
+		Assert.Equal("cancelled", (await active.WaitAsync(TimeSpan.FromSeconds(5))).Error?.Code);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_ReleasesExecutionLeaseAfterCompletedResult()
+	{
+		McpExecutionCoordinator coordinator = new();
+		using McpEmulatorService service = new(
+			CreateApi(),
+			executionCoordinator: coordinator,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new FakeBreakpointCollection());
+		Task<McpServiceResult<ContinueResult>> active = service.ContinueUntilBreakAsync(
+			nameof(CpuType.Nes), 5000, CancellationToken.None);
+
+		Assert.Equal("operation_in_progress", (await coordinator.TryAcquireAsync(CancellationToken.None)).Error?.Code);
+		SendBreak(service, new BreakEvent { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 });
+
+		Assert.True((await active.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+	}
+
+	[Fact]
 	public async Task ContinueUntilBreak_CorrelatesNativeHitToStableMcpId()
 	{
 		FakeBreakpointCollection collection = new();

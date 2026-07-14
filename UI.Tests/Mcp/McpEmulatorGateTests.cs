@@ -37,6 +37,26 @@ public sealed class McpEmulatorGateTests
 	}
 
 	[Fact]
+	public async Task ExecuteOwned_WhenOwnerIsQuarantined_RejectsBeforeDelegate()
+	{
+		McpExecutionCoordinator coordinator = new();
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		McpEmulatorGate gate = new(api, coordinator);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+		coordinator.EnterQuarantine();
+		bool called = false;
+
+		McpServiceResult<int> result = gate.ExecuteOwned(lease.LeaseId, () => {
+			called = true;
+			return McpServiceResult<int>.Success(1);
+		});
+
+		Assert.Equal("execution_state_unknown", result.Error?.Code);
+		Assert.False(called);
+		Assert.Equal(0, api.DebuggerRequestBlockStateCalls);
+	}
+
+	[Fact]
 	public async Task ExecuteMutation_BlocksLeaseAcquisitionUntilMutationCompletes()
 	{
 		using ManualResetEventSlim mutationEntered = new();

@@ -17,24 +17,35 @@ internal sealed class McpExecutionCoordinator
 {
 	private readonly SemaphoreSlim _ownership = new(1, 1);
 	private readonly CancellationTokenSource _shutdownCancellation = new();
+	private readonly object _stateLock = new();
 	private long _nextLeaseId;
 	private long _activeLeaseId;
-	private int _quarantined;
-	private int _shutdownStarted;
+	private bool _mutationReservationActive;
+	private bool _quarantined;
+	private bool _shutdownStarted;
 
 	internal CancellationToken ShutdownToken => _shutdownCancellation.Token;
-	internal bool IsQuarantined => Volatile.Read(ref _quarantined) != 0;
+	internal bool IsQuarantined
+	{
+		get {
+			lock(_stateLock) {
+				return _quarantined;
+			}
+		}
+	}
 
 	internal async ValueTask<McpServiceResult<McpExecutionLease>> TryAcquireAsync(CancellationToken cancellationToken)
 	{
-		if(Volatile.Read(ref _shutdownStarted) != 0) {
-			return ServerStopping<McpExecutionLease>();
-		}
 		if(cancellationToken.IsCancellationRequested) {
 			return McpServiceResult<McpExecutionLease>.Failure("cancelled", "The operation was cancelled.");
 		}
-		if(IsQuarantined) {
-			return ExecutionStateUnknown<McpExecutionLease>();
+		lock(_stateLock) {
+			if(_shutdownStarted) {
+				return ServerStopping<McpExecutionLease>();
+			}
+			if(_quarantined) {
+				return ExecutionStateUnknown<McpExecutionLease>();
+			}
 		}
 
 		bool acquired;
@@ -44,50 +55,65 @@ internal sealed class McpExecutionCoordinator
 				_shutdownCancellation.Token);
 			acquired = await _ownership.WaitAsync(0, linkedCancellation.Token).ConfigureAwait(false);
 		} catch(OperationCanceledException) {
-			return Volatile.Read(ref _shutdownStarted) != 0
-				? ServerStopping<McpExecutionLease>()
-				: McpServiceResult<McpExecutionLease>.Failure("cancelled", "The operation was cancelled.");
+			lock(_stateLock) {
+				return _shutdownStarted
+					? ServerStopping<McpExecutionLease>()
+					: McpServiceResult<McpExecutionLease>.Failure("cancelled", "The operation was cancelled.");
+			}
 		}
 		if(!acquired) {
 			return OperationInProgress<McpExecutionLease>();
 		}
 
-		if(Volatile.Read(ref _shutdownStarted) != 0) {
-			_ownership.Release();
-			return ServerStopping<McpExecutionLease>();
+		McpServiceResult<McpExecutionLease>? rejected = null;
+		McpExecutionLease? lease = null;
+		lock(_stateLock) {
+			if(_shutdownStarted) {
+				rejected = ServerStopping<McpExecutionLease>();
+			} else if(_quarantined) {
+				rejected = ExecutionStateUnknown<McpExecutionLease>();
+			} else {
+				long leaseId = ++_nextLeaseId;
+				_activeLeaseId = leaseId;
+				lease = new(this, leaseId);
+			}
 		}
-		if(IsQuarantined) {
+		if(rejected is not null) {
 			_ownership.Release();
-			return ExecutionStateUnknown<McpExecutionLease>();
+			return rejected;
 		}
-
-		long leaseId = Interlocked.Increment(ref _nextLeaseId);
-		Volatile.Write(ref _activeLeaseId, leaseId);
-		return McpServiceResult<McpExecutionLease>.Success(new(this, leaseId));
+		return McpServiceResult<McpExecutionLease>.Success(lease!);
 	}
 
 	internal McpServiceResult<bool> ValidateMutation(McpExecutionMutation mutation)
 	{
-		if(Volatile.Read(ref _shutdownStarted) != 0) {
-			return ServerStopping<bool>();
+		lock(_stateLock) {
+			if(_shutdownStarted) {
+				return ServerStopping<bool>();
+			}
+			if(_quarantined && mutation != McpExecutionMutation.Pause) {
+				return ExecutionStateUnknown<bool>();
+			}
+			if(_activeLeaseId != 0 || _mutationReservationActive) {
+				return OperationInProgress<bool>();
+			}
+			return McpServiceResult<bool>.Success(true);
 		}
-		if(IsQuarantined && mutation != McpExecutionMutation.Pause) {
-			return ExecutionStateUnknown<bool>();
-		}
-		if(_ownership.CurrentCount == 0) {
-			return OperationInProgress<bool>();
-		}
-		return McpServiceResult<bool>.Success(true);
 	}
 
 	internal McpServiceResult<bool> ValidateOwnedMutation(long leaseId)
 	{
-		if(Volatile.Read(ref _shutdownStarted) != 0) {
-			return ServerStopping<bool>();
+		lock(_stateLock) {
+			if(_shutdownStarted) {
+				return ServerStopping<bool>();
+			}
+			if(_quarantined) {
+				return ExecutionStateUnknown<bool>();
+			}
+			return leaseId != 0 && _activeLeaseId == leaseId
+				? McpServiceResult<bool>.Success(true)
+				: OperationInProgress<bool>();
 		}
-		return leaseId != 0 && Volatile.Read(ref _activeLeaseId) == leaseId
-			? McpServiceResult<bool>.Success(true)
-			: OperationInProgress<bool>();
 	}
 
 	internal McpServiceResult<IDisposable> TryAcquireMutation(McpExecutionMutation mutation)
@@ -100,33 +126,71 @@ internal sealed class McpExecutionCoordinator
 			return OperationInProgress<IDisposable>();
 		}
 
-		if(Volatile.Read(ref _shutdownStarted) != 0) {
-			_ownership.Release();
-			return ServerStopping<IDisposable>();
+		McpServiceResult<IDisposable>? rejected = null;
+		lock(_stateLock) {
+			if(_shutdownStarted) {
+				rejected = ServerStopping<IDisposable>();
+			} else if(_quarantined && mutation != McpExecutionMutation.Pause) {
+				rejected = ExecutionStateUnknown<IDisposable>();
+			} else {
+				_mutationReservationActive = true;
+			}
 		}
-		if(IsQuarantined && mutation != McpExecutionMutation.Pause) {
+		if(rejected is not null) {
 			_ownership.Release();
-			return ExecutionStateUnknown<IDisposable>();
+			return rejected;
 		}
-		return McpServiceResult<IDisposable>.Success(new MutationLease(_ownership));
+		return McpServiceResult<IDisposable>.Success(new MutationLease(this));
 	}
 
-	internal void EnterQuarantine() => Interlocked.Exchange(ref _quarantined, 1);
-	internal void ConfirmStoppedAndClearQuarantine() => Interlocked.Exchange(ref _quarantined, 0);
-	internal void NotifyLifecycleRecovery() => Interlocked.Exchange(ref _quarantined, 0);
+	internal void EnterQuarantine()
+	{
+		lock(_stateLock) {
+			_quarantined = true;
+		}
+	}
+
+	internal void ConfirmStoppedAndClearQuarantine()
+	{
+		lock(_stateLock) {
+			_quarantined = false;
+		}
+	}
+
+	internal void NotifyLifecycleRecovery() => ConfirmStoppedAndClearQuarantine();
 
 	internal void BeginShutdown()
 	{
-		if(Interlocked.Exchange(ref _shutdownStarted, 1) == 0) {
+		bool cancel;
+		lock(_stateLock) {
+			cancel = !_shutdownStarted;
+			_shutdownStarted = true;
+		}
+		if(cancel) {
 			_shutdownCancellation.Cancel();
 		}
 	}
 
 	internal void Release(long leaseId)
 	{
-		if(Interlocked.CompareExchange(ref _activeLeaseId, 0, leaseId) == leaseId) {
+		bool release = false;
+		lock(_stateLock) {
+			if(_activeLeaseId == leaseId) {
+				_activeLeaseId = 0;
+				release = true;
+			}
+		}
+		if(release) {
 			_ownership.Release();
 		}
+	}
+
+	private void ReleaseMutation()
+	{
+		lock(_stateLock) {
+			_mutationReservationActive = false;
+		}
+		_ownership.Release();
 	}
 
 	private static McpServiceResult<T> OperationInProgress<T>() =>
@@ -140,16 +204,16 @@ internal sealed class McpExecutionCoordinator
 
 	private sealed class MutationLease : IDisposable
 	{
-		private SemaphoreSlim? _ownership;
+		private McpExecutionCoordinator? _coordinator;
 
-		internal MutationLease(SemaphoreSlim ownership)
+		internal MutationLease(McpExecutionCoordinator coordinator)
 		{
-			_ownership = ownership;
+			_coordinator = coordinator;
 		}
 
 		public void Dispose()
 		{
-			Interlocked.Exchange(ref _ownership, null)?.Release();
+			Interlocked.Exchange(ref _coordinator, null)?.ReleaseMutation();
 		}
 	}
 }

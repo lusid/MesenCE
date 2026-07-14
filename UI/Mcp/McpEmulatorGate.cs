@@ -46,7 +46,18 @@ internal sealed class McpEmulatorGate
 
 	internal McpServiceResult<T> ExecuteOwned<T>(long leaseId, Func<McpServiceResult<T>> operation)
 	{
-		return ExecuteLocked(_ => ExecuteValidated(_executionCoordinator.ValidateOwnedMutation(leaseId), operation));
+		return ExecuteLocked(_ => operation(), preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId));
+	}
+
+	internal McpServiceResult<T> ExecuteOwnedWithDebuggerLease<T>(
+		long leaseId,
+		Action acquireDebuggerLease,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(
+			operation,
+			acquireDebuggerLease,
+			() => _executionCoordinator.ValidateOwnedMutation(leaseId));
 	}
 
 	internal McpServiceResult<McpOperationTicket> CaptureTicket()
@@ -81,6 +92,16 @@ internal sealed class McpEmulatorGate
 		return ExecuteLocked(currentTicket => currentTicket != ticket
 			? StateChanged<T>()
 			: operation());
+	}
+
+	internal McpServiceResult<T> ExecuteOwnedForTicket<T>(
+		long leaseId,
+		McpOperationTicket ticket,
+		Func<McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(
+			currentTicket => currentTicket != ticket ? StateChanged<T>() : operation(),
+			preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId));
 	}
 
 	internal void NotifyEmulatorStateChanged()
@@ -127,19 +148,28 @@ internal sealed class McpEmulatorGate
 		}
 	}
 
-	private McpServiceResult<T> ExecuteLocked<T>(Func<McpOperationTicket, McpServiceResult<T>> operation)
+	private McpServiceResult<T> ExecuteLocked<T>(
+		Func<McpOperationTicket, McpServiceResult<T>> operation,
+		Func<McpServiceResult<bool>>? preflight = null)
 	{
-		return ExecuteLocked((ticket, _) => operation(ticket), null);
+		return ExecuteLocked((ticket, _) => operation(ticket), null, preflight);
 	}
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation,
-		Action? acquireDebuggerLease)
+		Action? acquireDebuggerLease,
+		Func<McpServiceResult<bool>>? preflight = null)
 	{
 		_emulatorSemaphore.Wait();
 		try {
 			if(Volatile.Read(ref _shutdownStarted) != 0) {
 				return McpServiceResult<T>.Failure("server_stopping", "The MCP server is shutting down.");
+			}
+			if(preflight is not null) {
+				McpServiceResult<bool> validation = preflight();
+				if(!validation.IsSuccess) {
+					return McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
+				}
 			}
 
 			long generation = Volatile.Read(ref _emulatorGeneration);

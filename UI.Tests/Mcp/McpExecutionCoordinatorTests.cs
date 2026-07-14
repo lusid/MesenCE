@@ -68,6 +68,43 @@ public sealed class McpExecutionCoordinatorTests
 	}
 
 	[Fact]
+	public async Task Quarantine_RejectsExistingOwner()
+	{
+		McpExecutionCoordinator coordinator = new();
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+
+		coordinator.EnterQuarantine();
+
+		Assert.Equal("execution_state_unknown", coordinator.ValidateOwnedMutation(lease.LeaseId).Error?.Code);
+	}
+
+	[Fact]
+	public async Task QuarantineAndAcquisition_AreSerializedAtAdmission()
+	{
+		for(int i = 0; i < 100; i++) {
+			McpExecutionCoordinator coordinator = new();
+			using Barrier start = new(2);
+			Task quarantine = Task.Run(() => {
+				start.SignalAndWait();
+				coordinator.EnterQuarantine();
+			});
+			Task<McpServiceResult<McpExecutionLease>> acquisition = Task.Run(async () => {
+				start.SignalAndWait();
+				return await coordinator.TryAcquireAsync(CancellationToken.None);
+			});
+
+			await Task.WhenAll(quarantine, acquisition);
+			McpServiceResult<McpExecutionLease> result = await acquisition;
+			if(result.IsSuccess) {
+				await using McpExecutionLease lease = result.Value!;
+				Assert.Equal("execution_state_unknown", coordinator.ValidateOwnedMutation(lease.LeaseId).Error?.Code);
+			} else {
+				Assert.Equal("execution_state_unknown", result.Error?.Code);
+			}
+		}
+	}
+
+	[Fact]
 	public void ConfirmedStopAndLifecycleRecovery_ClearQuarantine()
 	{
 		McpExecutionCoordinator coordinator = new();
