@@ -41,7 +41,8 @@ internal sealed record McpMemorySearchResource(
 	int Stride,
 	McpStateIdentity Identity,
 	McpMemorySearchState State,
-	McpMemorySearchState? UndoState = null)
+	McpMemorySearchState? UndoState = null,
+	int MemorySize = 0)
 {
 	internal long AllocationBytes
 	{

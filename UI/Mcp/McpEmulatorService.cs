@@ -1518,7 +1518,7 @@ internal sealed class McpEmulatorService : IDisposable
 			}
 			if(!_api.IsExecutionStopped()) {
 				return McpServiceResult<T>.Failure(
-					"debugger_unavailable", "Execution must be stopped for memory snapshot operations.");
+					"debugger_unavailable", "Execution must be stopped for memory capture operations.");
 			}
 			return operation(_api, _emulatorIdentity.Current);
 		});

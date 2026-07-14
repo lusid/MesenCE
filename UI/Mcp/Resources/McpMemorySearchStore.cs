@@ -12,6 +12,14 @@ internal sealed class McpMemorySearchStore : McpResourceStore<McpMemorySearchRes
 			McpAutomationLimits.MaxAggregateSearchAllocationBytes,
 			resource => resource.GetRetainedArrays()) { }
 
+	internal McpServiceResult<bool> CheckCreate(int count, long allocationBytes)
+	{
+		if(count < 0 || count > McpAutomationLimits.MaxSearchRangeBytes) {
+			return McpServiceResult<bool>.Failure("resource_limit", "The memory search range quota would be exceeded.");
+		}
+		return CheckAddResource(allocationBytes);
+	}
+
 	internal McpServiceResult<string> Create(McpMemorySearchResource resource)
 	{
 		McpMemorySearchResource ownedResource = resource.CreateOwnedCopy();
