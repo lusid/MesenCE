@@ -90,6 +90,27 @@ internal sealed class McpExecutionCoordinator
 			: OperationInProgress<bool>();
 	}
 
+	internal McpServiceResult<IDisposable> TryAcquireMutation(McpExecutionMutation mutation)
+	{
+		McpServiceResult<bool> validation = ValidateMutation(mutation);
+		if(!validation.IsSuccess) {
+			return McpServiceResult<IDisposable>.Failure(validation.Error!.Code, validation.Error.Message);
+		}
+		if(!_ownership.Wait(0)) {
+			return OperationInProgress<IDisposable>();
+		}
+
+		if(Volatile.Read(ref _shutdownStarted) != 0) {
+			_ownership.Release();
+			return ServerStopping<IDisposable>();
+		}
+		if(IsQuarantined && mutation != McpExecutionMutation.Pause) {
+			_ownership.Release();
+			return ExecutionStateUnknown<IDisposable>();
+		}
+		return McpServiceResult<IDisposable>.Success(new MutationLease(_ownership));
+	}
+
 	internal void EnterQuarantine() => Interlocked.Exchange(ref _quarantined, 1);
 	internal void ConfirmStoppedAndClearQuarantine() => Interlocked.Exchange(ref _quarantined, 0);
 	internal void NotifyLifecycleRecovery() => Interlocked.Exchange(ref _quarantined, 0);
@@ -116,6 +137,21 @@ internal sealed class McpExecutionCoordinator
 
 	private static McpServiceResult<T> ServerStopping<T>() =>
 		McpServiceResult<T>.Failure("server_stopping", "The MCP server is shutting down.");
+
+	private sealed class MutationLease : IDisposable
+	{
+		private SemaphoreSlim? _ownership;
+
+		internal MutationLease(SemaphoreSlim ownership)
+		{
+			_ownership = ownership;
+		}
+
+		public void Dispose()
+		{
+			Interlocked.Exchange(ref _ownership, null)?.Release();
+		}
+	}
 }
 
 internal sealed class McpExecutionLease : IAsyncDisposable

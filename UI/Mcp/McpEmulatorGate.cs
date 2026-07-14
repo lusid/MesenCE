@@ -32,7 +32,7 @@ internal sealed class McpEmulatorGate
 
 	internal McpServiceResult<T> ExecuteMutation<T>(McpExecutionMutation mutation, Func<McpServiceResult<T>> operation)
 	{
-		return ExecuteLocked(_ => ExecuteValidated(_executionCoordinator.ValidateMutation(mutation), operation));
+		return ExecuteLocked(_ => ExecuteMutationReserved(mutation, operation));
 	}
 
 	internal McpServiceResult<T> ExecuteMutationWithTicket<T>(
@@ -40,10 +40,7 @@ internal sealed class McpEmulatorGate
 		Func<McpOperationTicket, McpServiceResult<T>> operation)
 	{
 		return ExecuteLocked(ticket => {
-			McpServiceResult<bool> validation = _executionCoordinator.ValidateMutation(mutation);
-			return validation.IsSuccess
-				? operation(ticket)
-				: McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
+			return ExecuteMutationReserved(mutation, () => operation(ticket));
 		});
 	}
 
@@ -75,10 +72,7 @@ internal sealed class McpEmulatorGate
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
 	{
 		return ExecuteLocked((ticket, prepareDebuggerLease) => {
-			McpServiceResult<bool> validation = _executionCoordinator.ValidateMutation(mutation);
-			return validation.IsSuccess
-				? operation(ticket, prepareDebuggerLease)
-				: McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
+			return ExecuteMutationReserved(mutation, () => operation(ticket, prepareDebuggerLease));
 		}, acquireDebuggerLease);
 	}
 
@@ -219,6 +213,18 @@ internal sealed class McpEmulatorGate
 		return validation.IsSuccess
 			? operation()
 			: McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
+	}
+
+	private McpServiceResult<T> ExecuteMutationReserved<T>(
+		McpExecutionMutation mutation,
+		Func<McpServiceResult<T>> operation)
+	{
+		McpServiceResult<IDisposable> reservation = _executionCoordinator.TryAcquireMutation(mutation);
+		if(!reservation.IsSuccess) {
+			return McpServiceResult<T>.Failure(reservation.Error!.Code, reservation.Error.Message);
+		}
+		using IDisposable ownedReservation = reservation.Value!;
+		return operation();
 	}
 
 	private static McpServiceResult<T> InteropFailure<T>()

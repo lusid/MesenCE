@@ -37,6 +37,28 @@ public sealed class McpEmulatorGateTests
 	}
 
 	[Fact]
+	public async Task ExecuteMutation_BlocksLeaseAcquisitionUntilMutationCompletes()
+	{
+		using ManualResetEventSlim mutationEntered = new();
+		using ManualResetEventSlim releaseMutation = new();
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes(), coordinator);
+		Task<McpServiceResult<int>> mutation = Task.Run(() => gate.ExecuteMutation(McpExecutionMutation.Resume, () => {
+			mutationEntered.Set();
+			releaseMutation.Wait(TimeSpan.FromSeconds(5));
+			return McpServiceResult<int>.Success(1);
+		}));
+		Assert.True(mutationEntered.Wait(TimeSpan.FromSeconds(5)));
+
+		McpServiceResult<McpExecutionLease> blocked = await coordinator.TryAcquireAsync(CancellationToken.None);
+		Assert.Equal("operation_in_progress", blocked.Error?.Code);
+
+		releaseMutation.Set();
+		Assert.True((await mutation.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+	}
+
+	[Fact]
 	public async Task Execute_SerializesOperations()
 	{
 		using ManualResetEventSlim firstEntered = new();
