@@ -13,6 +13,36 @@ namespace UI.Tests.Mcp;
 public sealed class McpServerTests
 {
 	[Fact]
+	public void AutomationLifecycle_OwnsInvalidatesAndDisposesResourcesAndInputOnce()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		McpServer server = new(api);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		McpSaveStateMetadata state = server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).Value!;
+		McpMemorySnapshotMetadata snapshot = server.MemorySnapshots.Create(
+			"Nes", nameof(MemoryType.NesWorkRam), 0, [1], identity, DateTimeOffset.UnixEpoch).Value!;
+		string search = server.MemorySearches.Create(new(
+			"Nes", nameof(MemoryType.NesWorkRam), 0, 1, 1, false, "little", 1, identity,
+			new([1], [1], [0], 0, 0))).Value!;
+
+		server.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
+		Assert.True(server.MemorySnapshots.Pin(snapshot.Id).IsSuccess);
+		Assert.True(server.MemorySearches.Pin(search).IsSuccess);
+		server.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.GameLoaded });
+		Assert.Equal("stale_resource", server.SaveStates.Pin(state.Id).Error?.Code);
+		Assert.Equal("stale_resource", server.MemorySnapshots.Pin(snapshot.Id).Error?.Code);
+		Assert.Equal("stale_resource", server.MemorySearches.Pin(search).Error?.Code);
+
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+
+		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Throws<ObjectDisposedException>(() => server.MemorySnapshots.Pin("missing"));
+		Assert.Throws<ObjectDisposedException>(() => server.MemorySearches.Pin("missing"));
+	}
+
+	[Fact]
 	public async Task MainWindowNotification_ForwardsCodeBreakSynchronously()
 	{
 		McpEmulatorService service = new(

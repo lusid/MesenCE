@@ -49,6 +49,17 @@ internal sealed class McpEmulatorGate
 		return ExecuteLocked(_ => operation(), preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId));
 	}
 
+	internal McpServiceResult<T> ExecuteOwnedStateLoad<T>(
+		long leaseId,
+		Func<McpOperationTicket, McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(
+			operation,
+			preflight: () => _executionCoordinator.ValidateOwnedMutation(leaseId),
+			postflight: (ticket, result) => Volatile.Read(ref _emulatorGeneration) ==
+				ticket.Generation + (result.IsSuccess ? 1 : 0));
+	}
+
 	internal McpServiceResult<T> ExecuteOwnedWithDebuggerLease<T>(
 		long leaseId,
 		Action acquireDebuggerLease,
@@ -150,15 +161,17 @@ internal sealed class McpEmulatorGate
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, McpServiceResult<T>> operation,
-		Func<McpServiceResult<bool>>? preflight = null)
+		Func<McpServiceResult<bool>>? preflight = null,
+		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null)
 	{
-		return ExecuteLocked((ticket, _) => operation(ticket), null, preflight);
+		return ExecuteLocked((ticket, _) => operation(ticket), null, preflight, postflight);
 	}
 
 	private McpServiceResult<T> ExecuteLocked<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation,
 		Action? acquireDebuggerLease,
-		Func<McpServiceResult<bool>>? preflight = null)
+		Func<McpServiceResult<bool>>? preflight = null,
+		Func<McpOperationTicket, McpServiceResult<T>, bool>? postflight = null)
 	{
 		_emulatorSemaphore.Wait();
 		try {
@@ -193,7 +206,9 @@ internal sealed class McpEmulatorGate
 			if(!TryGetDebuggerRequestBlockState(out ulong endingDebuggerBlockState)) {
 				return InteropFailure<T>();
 			}
-			if(generation != Volatile.Read(ref _emulatorGeneration)
+			if((postflight is null
+					? generation != Volatile.Read(ref _emulatorGeneration)
+					: !postflight(new(generation, debuggerBlockState), result))
 				|| Volatile.Read(ref _transitionActive) != 0
 				|| debuggerBlockState != endingDebuggerBlockState
 				|| IsDebuggerRequestBlocked(endingDebuggerBlockState)) {

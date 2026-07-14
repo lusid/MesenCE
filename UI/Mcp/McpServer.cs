@@ -18,13 +18,25 @@ internal sealed class McpServer : IDisposable
 	private const long MaximumRequestBodySize = 512 * 1024;
 	private readonly object _lifecycleLock = new();
 	private readonly McpEmulatorService _service;
+	private readonly McpAutomationService _automationService;
+	private readonly McpSaveStateStore _saveStates;
+	private readonly McpMemorySnapshotStore _memorySnapshots;
+	private readonly McpMemorySearchStore _memorySearches;
 	private readonly Action<string> _toolLog;
 	private readonly Func<WebApplication, CancellationToken, Task> _applicationCleanup;
 	private LifecycleGeneration? _generation;
 	private Task? _detachedShutdownTask;
 	private long _nextGenerationId;
 	private bool _stopping;
+	private bool _resourcesDisposed;
 	private bool _disposed;
+
+	internal McpServer(
+		IMcpEmulatorApi api,
+		Action<string>? toolLog = null,
+		Func<WebApplication, CancellationToken, Task>? applicationCleanup = null)
+		: this(new McpEmulatorService(api), toolLog, applicationCleanup)
+	{ }
 
 	internal McpServer(
 		McpEmulatorService service,
@@ -32,9 +44,19 @@ internal sealed class McpServer : IDisposable
 		Func<WebApplication, CancellationToken, Task>? applicationCleanup = null)
 	{
 		_service = service;
+		_saveStates = new();
+		_memorySnapshots = new();
+		_memorySearches = new();
+		_automationService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
 		_toolLog = toolLog ?? Log;
 		_applicationCleanup = applicationCleanup ?? StopAndDisposeApplicationAsync;
 	}
+
+	internal McpAutomationService AutomationService => _automationService;
+	internal McpEmulatorIdentity EmulatorIdentity => _service.EmulatorIdentity;
+	internal McpSaveStateStore SaveStates => _saveStates;
+	internal McpMemorySnapshotStore MemorySnapshots => _memorySnapshots;
+	internal McpMemorySearchStore MemorySearches => _memorySearches;
 
 	internal Uri Endpoint
 	{
@@ -111,6 +133,8 @@ internal sealed class McpServer : IDisposable
 		}
 
 		_service.CleanupDebuggerResources();
+		_service.CleanupExclusiveInput();
+		DisposeResourceStores();
 		_service.Dispose();
 		lock(_lifecycleLock) {
 			if(_detachedShutdownTask?.IsCompleted == true) {
@@ -122,6 +146,18 @@ internal sealed class McpServer : IDisposable
 	internal void ProcessNotification(NotificationEventArgs e)
 	{
 		_service.ProcessNotification(e);
+		if(e.NotificationType is ConsoleNotificationType.GameLoaded
+			or ConsoleNotificationType.GameLoadFailed
+			or ConsoleNotificationType.EmulationStopped) {
+			lock(_lifecycleLock) {
+				if(!_resourcesDisposed) {
+					long romIdentity = _service.EmulatorIdentity.Current.RomIdentity;
+					_saveStates.InvalidateRom(romIdentity);
+					_memorySnapshots.InvalidateRom(romIdentity);
+					_memorySearches.InvalidateRom(romIdentity);
+				}
+			}
+		}
 	}
 
 	internal void DrainEmulatorOperations()
@@ -138,6 +174,19 @@ internal sealed class McpServer : IDisposable
 			_disposed = true;
 		}
 		Stop(MaximumStopTimeout);
+	}
+
+	private void DisposeResourceStores()
+	{
+		lock(_lifecycleLock) {
+			if(_resourcesDisposed) {
+				return;
+			}
+			_resourcesDisposed = true;
+			_saveStates.Dispose();
+			_memorySnapshots.Dispose();
+			_memorySearches.Dispose();
+		}
 	}
 
 	private async Task StartCoreAsync(LifecycleGeneration generation, ushort port)

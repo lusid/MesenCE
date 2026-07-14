@@ -45,6 +45,7 @@ internal sealed class McpEmulatorService : IDisposable
 	private bool _serviceShutdownStarted;
 	private bool _debuggerCleanupCompleted;
 	private bool _breakpointCollectionDisposed;
+	private bool _exclusiveInputCleanupCompleted;
 	private bool _disposed;
 
 	internal McpEmulatorService(
@@ -67,6 +68,10 @@ internal sealed class McpEmulatorService : IDisposable
 		_breakpointCollection = breakpointCollection ?? new McpBreakpointCollection();
 		_traceCoordinator = traceCoordinator ?? TraceLoggerCoordinator.Shared;
 	}
+
+	internal IMcpEmulatorApi Api => _api;
+	internal McpEmulatorIdentity EmulatorIdentity => _emulatorIdentity;
+	internal McpExecutionCoordinator ExecutionCoordinator => _executionCoordinator;
 
 	public McpServiceResult<EmulatorStatus> GetStatus()
 	{
@@ -1278,6 +1283,44 @@ internal sealed class McpEmulatorService : IDisposable
 	internal void DrainOperations()
 	{
 		_gate.DrainOperations();
+	}
+
+	internal McpServiceResult<T> ExecuteAutomation<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		return Execute(() => operation(_api, _emulatorIdentity.Current));
+	}
+
+	internal McpServiceResult<T> ExecuteOwnedStateLoad<T>(
+		long leaseId,
+		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteOwnedStateLoad(leaseId, _ => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			McpServiceResult<T> result = operation(_api, _emulatorIdentity.Current);
+			ReconcilePendingResources();
+			return result;
+		});
+	}
+
+	internal void CleanupExclusiveInput()
+	{
+		_gate.ExecuteTerminalCleanup(() => {
+			lock(_executionLock) {
+				if(_exclusiveInputCleanupCompleted) {
+					return McpServiceResult<bool>.Success(true);
+				}
+				_exclusiveInputCleanupCompleted = true;
+			}
+			_api.ClearExclusiveControllerOverrides();
+			return McpServiceResult<bool>.Success(true);
+		});
 	}
 
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
