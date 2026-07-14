@@ -150,6 +150,15 @@ internal sealed class McpExecutionCoordinator
 		}
 	}
 
+	internal void EnterQuarantineForOwner(long leaseId)
+	{
+		lock(_stateLock) {
+			if(leaseId != 0 && _activeLeaseId == leaseId) {
+				_quarantined = true;
+			}
+		}
+	}
+
 	internal void ConfirmStoppedAndClearQuarantine()
 	{
 		lock(_stateLock) {
