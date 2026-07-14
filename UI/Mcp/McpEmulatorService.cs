@@ -477,6 +477,10 @@ internal sealed class McpEmulatorService : IDisposable
 				InvalidateLatestBreak();
 				break;
 			case ConsoleNotificationType.StateLoaded:
+				_emulatorIdentity.NotifyStateLoaded();
+				_executionCoordinator.NotifyLifecycleRecovery();
+				InvalidateGenerationResources(_gate.NotifyEmulatorStateChanged);
+				break;
 			case ConsoleNotificationType.GameReset:
 				_emulatorIdentity.NotifyMutableStateChanged();
 				_executionCoordinator.NotifyLifecycleRecovery();
@@ -1226,63 +1230,76 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal void CleanupDebuggerResources()
 	{
-		_gate.ExecuteTerminalCleanup(() => {
+		_gate.ExecuteTerminalCleanup(CleanupDebuggerResourcesCore);
+	}
+
+	internal bool CleanupDebuggerResources(TimeSpan timeout) =>
+		_gate.TryExecuteTerminalCleanup(timeout, CleanupDebuggerResourcesCore);
+
+	private McpServiceResult<bool> CleanupDebuggerResourcesCore()
+	{
+		lock(_executionLock) {
+			if(_debuggerCleanupCompleted) {
+				return McpServiceResult<bool>.Success(true);
+			}
+		}
+
+		try {
+			ReconcilePendingTrace();
+			CpuType? traceCpu;
 			lock(_executionLock) {
-				if(_debuggerCleanupCompleted) {
-					return McpServiceResult<bool>.Success(true);
+				traceCpu = _traceCpu;
+			}
+			if(traceCpu.HasValue && _traceCoordinator.IsOwner(_traceOwner)) {
+				_traceCoordinator.TryReleaseAndExecute(_traceOwner, () => {
+					_api.SetTraceOptions(traceCpu.Value, DisabledTraceOptions());
+					_api.ClearExecutionTrace();
+				});
+				lock(_executionLock) {
+					_traceConfiguration = null;
+					_traceCpu = null;
 				}
 			}
-
+			if(_debuggerLease is not null || _mcpBreakpoints.Count > 0) {
+				_breakpointCollection.Replace([]);
+			}
+			_mcpBreakpoints.Clear();
+		} catch(Exception) {
+			// Continue through session disposal and lease release after partial native cleanup.
+		} finally {
+			_traceCoordinator.Release(_traceOwner);
 			try {
-				ReconcilePendingTrace();
-				CpuType? traceCpu;
-				lock(_executionLock) {
-					traceCpu = _traceCpu;
+				if(!_breakpointCollectionDisposed) {
+					_breakpointCollection.Dispose();
+					_breakpointCollectionDisposed = true;
 				}
-				if(traceCpu.HasValue && _traceCoordinator.IsOwner(_traceOwner)) {
-					_traceCoordinator.TryReleaseAndExecute(_traceOwner, () => {
-						_api.SetTraceOptions(traceCpu.Value, DisabledTraceOptions());
-						_api.ClearExecutionTrace();
-					});
+			} finally {
+				try {
+					_debuggerLease?.Dispose();
+				} finally {
+					_debuggerLease = null;
+					_mcpBreakpoints.Clear();
 					lock(_executionLock) {
 						_traceConfiguration = null;
 						_traceCpu = null;
-					}
-				}
-				if(_debuggerLease is not null || _mcpBreakpoints.Count > 0) {
-					_breakpointCollection.Replace([]);
-				}
-				_mcpBreakpoints.Clear();
-			} catch(Exception) {
-				// Continue through session disposal and lease release after partial native cleanup.
-			} finally {
-				_traceCoordinator.Release(_traceOwner);
-				try {
-					if(!_breakpointCollectionDisposed) {
-						_breakpointCollection.Dispose();
-						_breakpointCollectionDisposed = true;
-					}
-				} finally {
-					try {
-						_debuggerLease?.Dispose();
-					} finally {
-						_debuggerLease = null;
-						_mcpBreakpoints.Clear();
-						lock(_executionLock) {
-							_traceConfiguration = null;
-							_traceCpu = null;
-							_debuggerCleanupCompleted = true;
-						}
+						_debuggerCleanupCompleted = true;
 					}
 				}
 			}
-			return McpServiceResult<bool>.Success(true);
-		});
+		}
+		return McpServiceResult<bool>.Success(true);
 	}
 
-	internal void DrainOperations()
+	internal void CompleteBoundedShutdown()
 	{
-		_gate.DrainOperations();
+		lock(_executionLock) {
+			if(_disposed) {
+				return;
+			}
+			_disposed = true;
+		}
+		BeginServiceShutdown();
+		_gate.BeginShutdown();
 	}
 
 	internal McpServiceResult<T> ExecuteAutomation<T>(
@@ -1311,16 +1328,22 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal void CleanupExclusiveInput()
 	{
-		_gate.ExecuteTerminalCleanup(() => {
-			lock(_executionLock) {
-				if(_exclusiveInputCleanupCompleted) {
-					return McpServiceResult<bool>.Success(true);
-				}
-				_exclusiveInputCleanupCompleted = true;
+		_gate.ExecuteTerminalCleanup(CleanupExclusiveInputCore);
+	}
+
+	internal bool CleanupExclusiveInput(TimeSpan timeout) =>
+		_gate.TryExecuteTerminalCleanup(timeout, CleanupExclusiveInputCore);
+
+	private McpServiceResult<bool> CleanupExclusiveInputCore()
+	{
+		lock(_executionLock) {
+			if(_exclusiveInputCleanupCompleted) {
+				return McpServiceResult<bool>.Success(true);
 			}
-			_api.ClearExclusiveControllerOverrides();
-			return McpServiceResult<bool>.Success(true);
-		});
+			_exclusiveInputCleanupCompleted = true;
+		}
+		_api.ClearExclusiveControllerOverrides();
+		return McpServiceResult<bool>.Success(true);
 	}
 
 	private McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)

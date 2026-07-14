@@ -33,7 +33,7 @@ public sealed class McpServerTests
 		Assert.Equal("stale_resource", server.MemorySnapshots.Pin(snapshot.Id).Error?.Code);
 		Assert.Equal("stale_resource", server.MemorySearches.Pin(search).Error?.Code);
 
-		server.Stop(TimeSpan.Zero);
+		server.Stop(TimeSpan.FromSeconds(1));
 		server.Dispose();
 
 		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
@@ -675,7 +675,7 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
-	public async Task Stop_WithBlockedToolCall_WaitsForNativeDrainAndDoesNotResurrectHost()
+	public async Task AutomationStop_WithBlockedNativeCall_IsBoundedDisposesManagedStoresAndLeavesCleanupAvailable()
 	{
 		using ManualResetEventSlim readEntered = new();
 		using ManualResetEventSlim releaseRead = new();
@@ -684,32 +684,40 @@ public sealed class McpServerTests
 			readEntered.Set();
 			releaseRead.Wait(TimeSpan.FromSeconds(5));
 		};
-		using McpServer server = new(new McpEmulatorService(api));
-		await server.StartAsync(0);
-		Uri endpoint = server.Endpoint;
-		await using McpClient client = await CreateClientAsync(endpoint);
-		Task<CallToolResult> read = client.CallToolAsync("read_memory", Request(new {
-			space = nameof(MemoryType.NesWorkRam),
-			address = 0U,
-			count = 2
-		})).AsTask();
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(api, breakpointCollection: breakpoints);
+		McpServer server = new(service);
+		McpStateIdentity identity = server.EmulatorIdentity.Current;
+		Assert.True(server.SaveStates.Create([1], identity, DateTimeOffset.UnixEpoch).IsSuccess);
+		Task<McpServiceResult<MemoryRead>> read = Task.Run(() =>
+			service.ReadMemory(nameof(MemoryType.NesWorkRam), 0, 1));
 		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
 
-		Task stop = Task.Run(() => server.Stop(TimeSpan.FromSeconds(30)));
-		await Task.Delay(TimeSpan.FromMilliseconds(2200));
-		Assert.False(stop.IsCompleted);
-		releaseRead.Set();
-		await stop.WaitAsync(TimeSpan.FromSeconds(5));
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+		long elapsed = Environment.TickCount64 - started;
 
+		Assert.InRange(elapsed, 50, 1000);
+		Assert.Throws<ObjectDisposedException>(() => server.SaveStates.Pin("missing"));
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
 		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
-		Exception requestFailure = await Assert.ThrowsAnyAsync<Exception>(async () => await read.WaitAsync(TimeSpan.FromSeconds(5)));
-		Assert.IsNotType<TimeoutException>(requestFailure);
-		server.Stop(TimeSpan.FromSeconds(2));
-		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
-		using HttpClient httpClient = new();
-		await Assert.ThrowsAsync<HttpRequestException>(() => httpClient.GetAsync(endpoint));
+
+		started = Environment.TickCount64;
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+		Assert.InRange(Environment.TickCount64 - started, 0, 500);
+		Assert.Equal(0, breakpoints.DisposeCalls);
+		Assert.Equal(0, api.ClearExclusiveControllerOverridesCalls);
+
+		releaseRead.Set();
+		await read.WaitAsync(TimeSpan.FromSeconds(5));
+		service.CleanupDebuggerResources();
+		service.CleanupExclusiveInput();
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, api.ClearExclusiveControllerOverridesCalls);
 	}
 
 	private static async Task<McpClient> CreateClientAsync(Uri endpoint)

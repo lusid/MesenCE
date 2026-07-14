@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -91,13 +92,17 @@ internal sealed class McpServer : IDisposable
 
 	internal void Stop(TimeSpan timeout)
 	{
-		lock(_lifecycleLock) {
-			_stopping = true;
-		}
-		_service.BeginServiceShutdown();
 		TimeSpan boundedTimeout = timeout <= TimeSpan.Zero
 			? TimeSpan.Zero
 			: timeout < MaximumStopTimeout ? timeout : MaximumStopTimeout;
+		long stopStarted = Stopwatch.GetTimestamp();
+		lock(_lifecycleLock) {
+			if(_stopping) {
+				return;
+			}
+			_stopping = true;
+		}
+		_service.BeginServiceShutdown();
 		LifecycleGeneration? generation;
 		Task? shutdownTask;
 		lock(_lifecycleLock) {
@@ -122,8 +127,13 @@ internal sealed class McpServer : IDisposable
 			TryCancel(generation.RequestCancellation);
 			TryStopApplication(generation.Application);
 		}
+
+		_service.CleanupDebuggerResources(RemainingStopBudget(stopStarted, boundedTimeout));
+		_service.CleanupExclusiveInput(RemainingStopBudget(stopStarted, boundedTimeout));
+		DisposeResourceStores();
+		_service.CompleteBoundedShutdown();
 		try {
-			if(shutdownTask is not null && !shutdownTask.Wait(boundedTimeout)) {
+			if(shutdownTask is not null && !shutdownTask.Wait(RemainingStopBudget(stopStarted, boundedTimeout))) {
 				Log("[MCP] HTTP host cleanup is continuing after the shutdown grace period.");
 			}
 		} catch(AggregateException ex) {
@@ -132,10 +142,6 @@ internal sealed class McpServer : IDisposable
 			Log($"[MCP] Stop did not complete cleanly: {ex.GetBaseException().Message}");
 		}
 
-		_service.CleanupDebuggerResources();
-		_service.CleanupExclusiveInput();
-		DisposeResourceStores();
-		_service.Dispose();
 		lock(_lifecycleLock) {
 			if(_detachedShutdownTask?.IsCompleted == true) {
 				_detachedShutdownTask = null;
@@ -160,11 +166,6 @@ internal sealed class McpServer : IDisposable
 		}
 	}
 
-	internal void DrainEmulatorOperations()
-	{
-		_service.DrainOperations();
-	}
-
 	public void Dispose()
 	{
 		lock(_lifecycleLock) {
@@ -187,6 +188,12 @@ internal sealed class McpServer : IDisposable
 			_memorySnapshots.Dispose();
 			_memorySearches.Dispose();
 		}
+	}
+
+	private static TimeSpan RemainingStopBudget(long started, TimeSpan budget)
+	{
+		TimeSpan remaining = budget - Stopwatch.GetElapsedTime(started);
+		return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
 	}
 
 	private async Task StartCoreAsync(LifecycleGeneration generation, ushort port)

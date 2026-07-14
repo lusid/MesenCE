@@ -478,11 +478,14 @@ public sealed class McpDebuggerServiceTests
 			breakpointCollection: new FakeBreakpointCollection());
 
 		service.ProcessNotification(Notification(ConsoleNotificationType.StateLoaded));
-		Assert.Equal(new McpStateIdentity(0, 1), identity.Current);
+		Assert.Equal(new McpStateIdentity(0, 1, 1), identity.Current);
+
+		service.ProcessNotification(Notification(ConsoleNotificationType.GameReset));
+		Assert.Equal(new McpStateIdentity(0, 2, 1), identity.Current);
 
 		coordinator.EnterQuarantine();
 		service.ProcessNotification(Notification(ConsoleNotificationType.GameLoaded));
-		Assert.Equal(new McpStateIdentity(1, 2), identity.Current);
+		Assert.Equal(new McpStateIdentity(1, 3, 1), identity.Current);
 		Assert.False(coordinator.IsQuarantined);
 	}
 

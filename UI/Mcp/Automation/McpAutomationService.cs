@@ -85,7 +85,8 @@ internal sealed class McpAutomationService
 			}
 			McpStateIdentity current = _emulator.EmulatorIdentity.Current;
 			if(current.RomIdentity != identity.RomIdentity ||
-				current.MutableStateGeneration != previousGeneration + 1) {
+				current.MutableStateGeneration != previousGeneration + 1 ||
+				current.StateLoadedSequence != identity.StateLoadedSequence + 1) {
 				return McpServiceResult<McpSaveStateLoadResult>.Failure(
 					"state_changed", "Emulator state changed unexpectedly during the operation.");
 			}

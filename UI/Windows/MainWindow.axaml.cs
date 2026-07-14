@@ -917,7 +917,6 @@ namespace Mesen.Windows
 			if(server != null) {
 				server.Stop(TimeSpan.FromSeconds(2));
 				_disposeServer(server);
-				server.DrainEmulatorOperations();
 			}
 			lock(_lock) {
 				_stoppingServer = null;

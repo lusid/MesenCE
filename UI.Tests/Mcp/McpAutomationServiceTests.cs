@@ -95,6 +95,32 @@ public sealed class McpAutomationServiceTests
 		Assert.Equal("resource_not_found", fixture.SaveStates.Pin(state.Id).Error?.Code);
 	}
 
+	[Theory]
+	[InlineData("none")]
+	[InlineData("reset")]
+	[InlineData("multiple")]
+	public async Task LoadSaveState_RequiresExactlyOneAttributedStateLoadedNotification(string notifications)
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.CreateSaveStateHandler = () => McpServiceResult<byte[]>.Success([1]);
+		using AutomationFixture fixture = new(api);
+		McpSaveStateMetadata state = AssertSuccess(fixture.Automation.CreateSaveState());
+		api.LoadSaveStateHandler = _ => {
+			if(notifications == "reset") {
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.GameReset });
+			} else if(notifications == "multiple") {
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.StateLoaded });
+				fixture.Emulator.ProcessNotification(new NotificationEventArgs { NotificationType = ConsoleNotificationType.GameReset });
+			}
+			return McpServiceResult<bool>.Success(true);
+		};
+
+		McpServiceResult<McpSaveStateLoadResult> result =
+			await fixture.Automation.LoadSaveStateAsync(state.Id, CancellationToken.None);
+
+		Assert.Equal("state_changed", result.Error?.Code);
+	}
+
 	[Fact]
 	public async Task LoadSaveState_RejectsConcurrentExecutionAndStaleRomBeforeNativeMutation()
 	{
@@ -150,6 +176,44 @@ public sealed class McpAutomationServiceTests
 		using AutomationFixture fixture = new(api);
 
 		Assert.Equal("payload_too_large", fixture.Automation.CaptureScreenshot().Error?.Code);
+	}
+
+	[Theory]
+	[InlineData(0, 1)]
+	[InlineData(1, 0)]
+	public void CaptureScreenshot_RejectsZeroDimensions(int width, int height)
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(new(
+			new(width, height, 3, 1, 0, 0),
+			[1]));
+		using AutomationFixture fixture = new(api);
+
+		Assert.Equal("interop_failure", fixture.Automation.CaptureScreenshot().Error?.Code);
+	}
+
+	[Fact]
+	public void CaptureScreenshot_RejectsExcessivePixelArea()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(new(
+			new(McpAutomationLimits.MaxScreenshotDimension, McpAutomationLimits.MaxScreenshotDimension + 1, 3, 1, 0, 0),
+			[1]));
+		using AutomationFixture fixture = new(api);
+
+		Assert.Equal("payload_too_large", fixture.Automation.CaptureScreenshot().Error?.Code);
+	}
+
+	[Fact]
+	public void CaptureScreenshot_RejectsPngMetadataLengthMismatch()
+	{
+		FakeMcpEmulatorApi api = FakeMcpEmulatorApi.RunningNes();
+		api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(new(
+			new(1, 1, 3, 2, 0, 0),
+			[1]));
+		using AutomationFixture fixture = new(api);
+
+		Assert.Equal("interop_failure", fixture.Automation.CaptureScreenshot().Error?.Code);
 	}
 
 	private static T AssertSuccess<T>(McpServiceResult<T> result)
