@@ -383,6 +383,65 @@ public sealed class McpDebuggerServiceTests
 	}
 
 	[Fact]
+	public async Task ExecutionLease_RejectsAllCompetingExecutionMutations()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		McpExecutionCoordinator coordinator = new();
+		using McpEmulatorService service = new(
+			api,
+			executionCoordinator: coordinator,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new FakeBreakpointCollection());
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+
+		Assert.Equal("operation_in_progress", service.Pause().Error?.Code);
+		Assert.Equal("operation_in_progress", service.Resume().Error?.Code);
+		Assert.Equal("operation_in_progress", service.Step(nameof(CpuType.Nes), "instruction").Error?.Code);
+		Assert.Equal("operation_in_progress", (await service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 100, CancellationToken.None)).Error?.Code);
+		Assert.Equal((0, 0, 0), (api.PauseCalls, api.ResumeDebuggerCalls, api.StepCalls));
+	}
+
+	[Fact]
+	public void Quarantine_StatusIsUnknownAndConfirmedPauseRecovers()
+	{
+		FakeMcpEmulatorApi api = CreateApi();
+		McpExecutionCoordinator coordinator = new();
+		using McpEmulatorService service = new(
+			api,
+			executionCoordinator: coordinator,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new FakeBreakpointCollection());
+		coordinator.EnterQuarantine();
+
+		Assert.Equal(EmulatorStatus.Unknown, service.GetStatus().Value?.State);
+		Assert.Equal("execution_state_unknown", service.Resume().Error?.Code);
+		Assert.True(service.Pause().IsSuccess);
+		Assert.False(coordinator.IsQuarantined);
+		Assert.True(service.Resume().IsSuccess);
+	}
+
+	[Fact]
+	public void ProcessNotification_SeparatesMutableAndRomIdentityAndRecoversLifecycle()
+	{
+		McpEmulatorIdentity identity = new();
+		McpExecutionCoordinator coordinator = new();
+		using McpEmulatorService service = new(
+			CreateApi(),
+			emulatorIdentity: identity,
+			executionCoordinator: coordinator,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new FakeBreakpointCollection());
+
+		service.ProcessNotification(Notification(ConsoleNotificationType.StateLoaded));
+		Assert.Equal(new McpStateIdentity(0, 1), identity.Current);
+
+		coordinator.EnterQuarantine();
+		service.ProcessNotification(Notification(ConsoleNotificationType.GameLoaded));
+		Assert.Equal(new McpStateIdentity(1, 2), identity.Current);
+		Assert.False(coordinator.IsQuarantined);
+	}
+
+	[Fact]
 	public void SetBreakpoint_PreservesExistingCollectionEntriesAndReturnsStableId()
 	{
 		string? evaluatedExpression = null;

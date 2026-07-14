@@ -8,23 +8,48 @@ internal readonly record struct McpOperationTicket(long Generation, ulong Debugg
 internal sealed class McpEmulatorGate
 {
 	private readonly IMcpEmulatorApi _api;
+	private readonly McpExecutionCoordinator _executionCoordinator;
 	private readonly SemaphoreSlim _emulatorSemaphore = new(1, 1);
 	private readonly CancellationTokenSource _shutdownCancellation = new();
 	private long _emulatorGeneration;
 	private int _transitionActive;
 	private int _shutdownStarted;
 
-	internal McpEmulatorGate(IMcpEmulatorApi api)
+	internal McpEmulatorGate(IMcpEmulatorApi api, McpExecutionCoordinator? executionCoordinator = null)
 	{
 		_api = api;
+		_executionCoordinator = executionCoordinator ?? new();
 	}
 
+	internal McpExecutionCoordinator ExecutionCoordinator => _executionCoordinator;
 	internal long Generation => Volatile.Read(ref _emulatorGeneration);
 	internal CancellationToken ShutdownToken => _shutdownCancellation.Token;
 
 	internal McpServiceResult<T> Execute<T>(Func<McpServiceResult<T>> operation)
 	{
 		return ExecuteLocked(_ => operation());
+	}
+
+	internal McpServiceResult<T> ExecuteMutation<T>(McpExecutionMutation mutation, Func<McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(_ => ExecuteValidated(_executionCoordinator.ValidateMutation(mutation), operation));
+	}
+
+	internal McpServiceResult<T> ExecuteMutationWithTicket<T>(
+		McpExecutionMutation mutation,
+		Func<McpOperationTicket, McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(ticket => {
+			McpServiceResult<bool> validation = _executionCoordinator.ValidateMutation(mutation);
+			return validation.IsSuccess
+				? operation(ticket)
+				: McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
+		});
+	}
+
+	internal McpServiceResult<T> ExecuteOwned<T>(long leaseId, Func<McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked(_ => ExecuteValidated(_executionCoordinator.ValidateOwnedMutation(leaseId), operation));
 	}
 
 	internal McpServiceResult<McpOperationTicket> CaptureTicket()
@@ -42,6 +67,19 @@ internal sealed class McpEmulatorGate
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
 	{
 		return ExecuteLocked(operation, acquireDebuggerLease);
+	}
+
+	internal McpServiceResult<T> ExecuteMutationWithDebuggerLease<T>(
+		McpExecutionMutation mutation,
+		Action acquireDebuggerLease,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		return ExecuteLocked((ticket, prepareDebuggerLease) => {
+			McpServiceResult<bool> validation = _executionCoordinator.ValidateMutation(mutation);
+			return validation.IsSuccess
+				? operation(ticket, prepareDebuggerLease)
+				: McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
+		}, acquireDebuggerLease);
 	}
 
 	internal McpServiceResult<T> ExecuteForTicket<T>(McpOperationTicket ticket, Func<McpServiceResult<T>> operation)
@@ -172,6 +210,15 @@ internal sealed class McpEmulatorGate
 			state = 0;
 			return false;
 		}
+	}
+
+	private static McpServiceResult<T> ExecuteValidated<T>(
+		McpServiceResult<bool> validation,
+		Func<McpServiceResult<T>> operation)
+	{
+		return validation.IsSuccess
+			? operation()
+			: McpServiceResult<T>.Failure(validation.Error!.Code, validation.Error.Message);
 	}
 
 	private static McpServiceResult<T> InteropFailure<T>()

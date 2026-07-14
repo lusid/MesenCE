@@ -21,6 +21,8 @@ internal sealed class McpEmulatorService : IDisposable
 
 	private readonly IMcpEmulatorApi _api;
 	private readonly McpEmulatorGate _gate;
+	private readonly McpEmulatorIdentity _emulatorIdentity;
+	private readonly McpExecutionCoordinator _executionCoordinator;
 	private readonly IDebuggerLifetimeCoordinator _debuggerLifetime;
 	private readonly ITraceLoggerCoordinator _traceCoordinator;
 	private readonly object _traceOwner = new();
@@ -50,10 +52,17 @@ internal sealed class McpEmulatorService : IDisposable
 		McpEmulatorGate? gate = null,
 		IDebuggerLifetimeCoordinator? debuggerLifetime = null,
 		IMcpBreakpointCollection? breakpointCollection = null,
-		ITraceLoggerCoordinator? traceCoordinator = null)
+		ITraceLoggerCoordinator? traceCoordinator = null,
+		McpEmulatorIdentity? emulatorIdentity = null,
+		McpExecutionCoordinator? executionCoordinator = null)
 	{
 		_api = api;
-		_gate = gate ?? new McpEmulatorGate(api);
+		_executionCoordinator = executionCoordinator ?? gate?.ExecutionCoordinator ?? new();
+		if(gate != null && executionCoordinator != null && !ReferenceEquals(gate.ExecutionCoordinator, executionCoordinator)) {
+			throw new ArgumentException("The gate and service must share one execution coordinator.", nameof(executionCoordinator));
+		}
+		_gate = gate ?? new McpEmulatorGate(api, _executionCoordinator);
+		_emulatorIdentity = emulatorIdentity ?? new();
 		_debuggerLifetime = debuggerLifetime ?? DebuggerLifetimeCoordinator.Shared;
 		_breakpointCollection = breakpointCollection ?? new McpBreakpointCollection();
 		_traceCoordinator = traceCoordinator ?? TraceLoggerCoordinator.Shared;
@@ -66,13 +75,14 @@ internal sealed class McpEmulatorService : IDisposable
 				return McpServiceResult<EmulatorStatus>.Success(new(false, null, null, "stopped", MesenVersion, McpVersion));
 			}
 
-			bool paused = _api.IsPaused();
+			bool quarantined = _executionCoordinator.IsQuarantined;
+			bool paused = !quarantined && _api.IsPaused();
 			RomInfo romInfo = _api.GetRomInfo();
 			return McpServiceResult<EmulatorStatus>.Success(new(
 				true,
 				romInfo.ConsoleType.ToString(),
 				romInfo.GetRomName(),
-				paused ? "paused" : "running",
+				quarantined ? EmulatorStatus.Unknown : paused ? "paused" : "running",
 				MesenVersion,
 				McpVersion
 			));
@@ -452,6 +462,10 @@ internal sealed class McpEmulatorService : IDisposable
 				if(copiedBreak.HasValue) {
 					RecordCodeBreak(copiedBreak.Value);
 				}
+				_executionCoordinator.NotifyLifecycleRecovery();
+				break;
+			case ConsoleNotificationType.GamePaused:
+				_executionCoordinator.NotifyLifecycleRecovery();
 				break;
 			case ConsoleNotificationType.GameResumed:
 			case ConsoleNotificationType.DebuggerResumed:
@@ -459,6 +473,8 @@ internal sealed class McpEmulatorService : IDisposable
 				break;
 			case ConsoleNotificationType.StateLoaded:
 			case ConsoleNotificationType.GameReset:
+				_emulatorIdentity.NotifyMutableStateChanged();
+				_executionCoordinator.NotifyLifecycleRecovery();
 				InvalidateGenerationResources(_gate.NotifyEmulatorStateChanged);
 				break;
 			case ConsoleNotificationType.BeforeGameLoad:
@@ -469,6 +485,8 @@ internal sealed class McpEmulatorService : IDisposable
 			case ConsoleNotificationType.GameLoaded:
 			case ConsoleNotificationType.GameLoadFailed:
 			case ConsoleNotificationType.EmulationStopped:
+				_emulatorIdentity.NotifyRomChanged();
+				_executionCoordinator.NotifyLifecycleRecovery();
 				InvalidateGenerationResources(_gate.EndEmulatorTransition);
 				break;
 		}
@@ -621,18 +639,21 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal McpServiceResult<ExecutionState> Pause()
 	{
-		return ExecuteWithTicket(ticket => {
+		return ExecuteMutationWithTicket(McpExecutionMutation.Pause, ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
 			_api.Pause();
+			if(_api.IsExecutionStopped()) {
+				_executionCoordinator.ConfirmStoppedAndClearQuarantine();
+			}
 			return McpServiceResult<ExecutionState>.Success(new("paused", ticket.Generation));
 		});
 	}
 
 	internal McpServiceResult<ExecutionState> Resume()
 	{
-		return ExecuteWithTicket(ticket => {
+		return ExecuteMutationWithTicket(McpExecutionMutation.Resume, ticket => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -659,7 +680,7 @@ internal sealed class McpEmulatorService : IDisposable
 			return McpServiceResult<ExecutionState>.Failure("invalid_step_type", "The selected step type is not supported.");
 		}
 
-		return ExecuteWithDebuggerLease((ticket, prepareDebuggerLease) => {
+		return ExecuteMutationWithDebuggerLease(McpExecutionMutation.Step, (ticket, prepareDebuggerLease) => {
 			if(!_api.IsRunning()) {
 				return McpServiceResult<ExecutionState>.Failure("no_game", "No game is currently loaded.");
 			}
@@ -695,7 +716,7 @@ internal sealed class McpEmulatorService : IDisposable
 		McpOperationTicket ticket = default;
 		CpuType cpuType = default;
 		TaskCompletionSource<CapturedBreakEvent>? waiter = null;
-		McpServiceResult<ExecutionState> setup = ExecuteWithDebuggerLease((currentTicket, prepareDebuggerLease) => {
+		McpServiceResult<ExecutionState> setup = ExecuteMutationWithDebuggerLease(McpExecutionMutation.Continue, (currentTicket, prepareDebuggerLease) => {
 			if(timeoutMs is < McpDebuggerLimits.MinContinueTimeoutMs or > McpDebuggerLimits.MaxContinueTimeoutMs) {
 				return McpServiceResult<ExecutionState>.Failure("invalid_timeout", "Continue timeout is outside the supported range.");
 			}
@@ -719,8 +740,8 @@ internal sealed class McpEmulatorService : IDisposable
 				if(_gate.Generation != currentTicket.Generation) {
 					return McpServiceResult<ExecutionState>.Failure("state_changed", "Emulator state changed during the operation.");
 				}
-				if(_breakWaiters.ContainsKey(cpuType)) {
-					return McpServiceResult<ExecutionState>.Failure("operation_in_progress", "A continue operation is already active for this CPU.");
+				if(_breakWaiters.Count > 0) {
+					return McpServiceResult<ExecutionState>.Failure("operation_in_progress", "A continue operation is already active.");
 				}
 				waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
 				_breakWaiters.Add(cpuType, waiter);
@@ -1169,6 +1190,7 @@ internal sealed class McpEmulatorService : IDisposable
 
 	internal void BeginServiceShutdown()
 	{
+		_executionCoordinator.BeginShutdown();
 		TaskCompletionSource<CapturedBreakEvent>[] waiters;
 		lock(_executionLock) {
 			if(_serviceShutdownStarted) {
@@ -1275,6 +1297,22 @@ internal sealed class McpEmulatorService : IDisposable
 		});
 	}
 
+	private McpServiceResult<T> ExecuteMutationWithTicket<T>(
+		McpExecutionMutation mutation,
+		Func<McpOperationTicket, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteMutationWithTicket(mutation, ticket => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(ticket);
+		});
+	}
+
 	private McpServiceResult<T> ExecuteWithDebuggerLease<T>(
 		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
 	{
@@ -1282,6 +1320,22 @@ internal sealed class McpEmulatorService : IDisposable
 			return ServiceStopping<T>();
 		}
 		return _gate.ExecuteWithDebuggerLease(EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
+			if(IsServiceStopping()) {
+				return ServiceStopping<T>();
+			}
+			ReconcilePendingResources();
+			return operation(ticket, prepareDebuggerLease);
+		});
+	}
+
+	private McpServiceResult<T> ExecuteMutationWithDebuggerLease<T>(
+		McpExecutionMutation mutation,
+		Func<McpOperationTicket, Func<McpServiceResult<bool>>, McpServiceResult<T>> operation)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteMutationWithDebuggerLease(mutation, EnsureDebuggerLease, (ticket, prepareDebuggerLease) => {
 			if(IsServiceStopping()) {
 				return ServiceStopping<T>();
 			}

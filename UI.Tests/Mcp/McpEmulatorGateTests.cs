@@ -6,6 +6,37 @@ namespace UI.Tests.Mcp;
 public sealed class McpEmulatorGateTests
 {
 	[Fact]
+	public async Task Execute_ReadOnlyCallRemainsAvailableWhileExecutionLeaseIsOwned()
+	{
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes(), coordinator);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+
+		McpServiceResult<int> result = gate.Execute(() => McpServiceResult<int>.Success(1));
+
+		Assert.Equal(1, result.Value);
+	}
+
+	[Fact]
+	public async Task ExecuteMutation_RejectsCompetitorAndAllowsOwner()
+	{
+		McpExecutionCoordinator coordinator = new();
+		McpEmulatorGate gate = new(FakeMcpEmulatorApi.RunningNes(), coordinator);
+		await using McpExecutionLease lease = (await coordinator.TryAcquireAsync(CancellationToken.None)).Value!;
+		bool competitorCalled = false;
+
+		McpServiceResult<int> competitor = gate.ExecuteMutation(McpExecutionMutation.Step, () => {
+			competitorCalled = true;
+			return McpServiceResult<int>.Success(1);
+		});
+		McpServiceResult<int> owner = gate.ExecuteOwned(lease.LeaseId, () => McpServiceResult<int>.Success(2));
+
+		Assert.Equal("operation_in_progress", competitor.Error?.Code);
+		Assert.False(competitorCalled);
+		Assert.Equal(2, owner.Value);
+	}
+
+	[Fact]
 	public async Task Execute_SerializesOperations()
 	{
 		using ManualResetEventSlim firstEntered = new();
