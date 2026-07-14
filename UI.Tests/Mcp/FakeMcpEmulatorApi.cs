@@ -53,6 +53,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public Func<uint, uint, TraceRow[]>? GetExecutionTraceHandler { get; set; }
 	public Func<McpServiceResult<byte[]>>? CreateSaveStateHandler { get; set; }
 	public Func<byte[], McpServiceResult<bool>>? LoadSaveStateHandler { get; set; }
+	public Func<McpServiceResult<McpScreenshotCapture>>? CaptureScreenshotHandler { get; set; }
 
 	public Action? OnRead { get; set; }
 	public int IsRunningCalls { get; private set; }
@@ -82,6 +83,7 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	public int GetExecutionTraceCalls { get; private set; }
 	public int CreateSaveStateCalls { get; private set; }
 	public int LoadSaveStateCalls { get; private set; }
+	public int CaptureScreenshotCalls { get; private set; }
 	public uint LastReadStart { get; private set; }
 	public uint LastReadEndInclusive { get; private set; }
 	public uint LastWriteStart { get; private set; }
@@ -290,5 +292,12 @@ internal sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
 	{
 		LoadSaveStateCalls++;
 		return LoadSaveStateHandler?.Invoke(data) ?? McpServiceResult<bool>.Success(true);
+	}
+
+	public McpServiceResult<McpScreenshotCapture> CaptureScreenshot()
+	{
+		CaptureScreenshotCalls++;
+		return CaptureScreenshotHandler?.Invoke()
+			?? McpServiceResult<McpScreenshotCapture>.Failure("no_frame", "No decoded video frame is available.");
 	}
 }

@@ -80,4 +80,132 @@ public sealed class McpNativeInteropTests
 		Assert.Equal(1, api.CreateSaveStateCalls);
 		Assert.Equal(1, api.LoadSaveStateCalls);
 	}
+
+	[Fact]
+	public void ScreenshotInteropInfo_HasFixedAbiLayout()
+	{
+		Assert.Equal(LayoutKind.Sequential, typeof(InteropScreenshotInfo).StructLayoutAttribute?.Value);
+		Assert.Equal(0, Marshal.OffsetOf<InteropScreenshotInfo>(nameof(InteropScreenshotInfo.Width)).ToInt32());
+		Assert.Equal(4, Marshal.OffsetOf<InteropScreenshotInfo>(nameof(InteropScreenshotInfo.Height)).ToInt32());
+		Assert.Equal(8, Marshal.OffsetOf<InteropScreenshotInfo>(nameof(InteropScreenshotInfo.FrameNumber)).ToInt32());
+		Assert.Equal(12, Marshal.OffsetOf<InteropScreenshotInfo>(nameof(InteropScreenshotInfo.PngLength)).ToInt32());
+		Assert.Equal(16, Marshal.SizeOf<InteropScreenshotInfo>());
+		Assert.Equal(7, (int)InteropApiResult.NoFrame);
+	}
+
+	[Fact]
+	public void ScreenshotCapture_CopiesBytesAndMetadataAndReleasesBufferOnce()
+	{
+		byte[] png = [0x89, 0x50, 0x4E, 0x47];
+		IntPtr pointer = Marshal.AllocHGlobal(png.Length);
+		Marshal.Copy(png, 0, pointer, png.Length);
+		int releaseCount = 0;
+
+		InteropScreenshotResult result = EmuApi.CaptureScreenshot(
+			(out InteropOwnedBuffer buffer, out InteropScreenshotInfo info) => {
+				buffer = new InteropOwnedBuffer { Data = pointer, Length = (uint)png.Length };
+				info = new InteropScreenshotInfo { Width = 256, Height = 240, FrameNumber = 123, PngLength = (uint)png.Length };
+				return InteropApiResult.Success;
+			},
+			data => {
+				Assert.Equal(pointer, data);
+				releaseCount++;
+				Marshal.FreeHGlobal(data);
+			});
+
+		Assert.Equal(InteropApiResult.Success, result.Result);
+		Assert.Equal(png, result.Png);
+		Assert.Equal(256u, result.Info.Width);
+		Assert.Equal(240u, result.Info.Height);
+		Assert.Equal(123u, result.Info.FrameNumber);
+		Assert.Equal((uint)png.Length, result.Info.PngLength);
+		Assert.Equal(1, releaseCount);
+	}
+
+	[Fact]
+	public void ScreenshotCapture_NoFrameIsExplicitAndDoesNotReleaseNullBuffer()
+	{
+		int releaseCount = 0;
+
+		InteropScreenshotResult result = EmuApi.CaptureScreenshot(
+			(out InteropOwnedBuffer buffer, out InteropScreenshotInfo info) => {
+				buffer = default;
+				info = default;
+				return InteropApiResult.NoFrame;
+			},
+			_ => releaseCount++);
+
+		Assert.Equal(InteropApiResult.NoFrame, result.Result);
+		Assert.Empty(result.Png);
+		Assert.Equal(0, releaseCount);
+	}
+
+	[Theory]
+	[InlineData(4097u, 1u, 1u, InteropApiResult.InvalidData)]
+	[InlineData(1u, 4097u, 1u, InteropApiResult.InvalidData)]
+	[InlineData(4096u, 4096u, 1u, InteropApiResult.Success)]
+	[InlineData(4096u, 4097u, 1u, InteropApiResult.InvalidData)]
+	[InlineData(1u, 1u, 0u, InteropApiResult.InvalidData)]
+	[InlineData(1u, 1u, 8u * 1024u * 1024u + 1u, InteropApiResult.PayloadTooLarge)]
+	public void ScreenshotValidateLimits_RejectsInvalidDimensionsPixelsAndPayload(
+		uint width,
+		uint height,
+		uint pngLength,
+		InteropApiResult expected)
+	{
+		InteropScreenshotInfo info = new() { Width = width, Height = height, PngLength = pngLength };
+
+		Assert.Equal(expected, EmuApi.ValidateScreenshotLimits(info));
+	}
+
+	[Fact]
+	public void ScreenshotCapture_RejectsInvalidNativePayloadAndReleasesBufferOnce()
+	{
+		IntPtr pointer = Marshal.AllocHGlobal(1);
+		int releaseCount = 0;
+
+		InteropScreenshotResult result = EmuApi.CaptureScreenshot(
+			(out InteropOwnedBuffer buffer, out InteropScreenshotInfo info) => {
+				buffer = new InteropOwnedBuffer { Data = pointer, Length = 1 };
+				info = new InteropScreenshotInfo { Width = 256, Height = 240, FrameNumber = 9, PngLength = 2 };
+				return InteropApiResult.Success;
+			},
+			data => {
+				releaseCount++;
+				Marshal.FreeHGlobal(data);
+			});
+
+		Assert.Equal(InteropApiResult.InvalidData, result.Result);
+		Assert.Equal(9u, result.Info.FrameNumber);
+		Assert.Empty(result.Png);
+		Assert.Equal(1, releaseCount);
+	}
+
+	[Fact]
+	public void ScreenshotAdapter_PreservesMetadataAndReportsCaptureFailures()
+	{
+		byte[] png = [0x89, 0x50, 0x4E, 0x47];
+		InteropScreenshotInfo info = new() { Width = 256, Height = 240, FrameNumber = 456, PngLength = (uint)png.Length };
+		MesenMcpEmulatorApi successApi = new(
+			() => default,
+			_ => default,
+			() => new InteropScreenshotResult(InteropApiResult.Success, info, png));
+		MesenMcpEmulatorApi noFrameApi = new(
+			() => default,
+			_ => default,
+			() => new InteropScreenshotResult(InteropApiResult.NoFrame, default, []));
+		MesenMcpEmulatorApi encodeFailureApi = new(
+			() => default,
+			_ => default,
+			() => new InteropScreenshotResult(InteropApiResult.EncodeFailed, info, []));
+
+		McpServiceResult<McpScreenshotCapture> capture = successApi.CaptureScreenshot();
+
+		Assert.Equal(256, capture.Value?.Metadata.Width);
+		Assert.Equal(240, capture.Value?.Metadata.Height);
+		Assert.Equal(456u, capture.Value?.Metadata.FrameNumber);
+		Assert.Equal(png, capture.Value?.Png);
+		Assert.Equal("no_frame", noFrameApi.CaptureScreenshot().Error?.Code);
+		Assert.Equal("encoding_failed", encodeFailureApi.CaptureScreenshot().Error?.Code);
+	}
 }

@@ -5,6 +5,14 @@
 
 class Emulator;
 
+struct ScreenshotCapture
+{
+	vector<uint8_t> Png;
+	uint32_t Width = 0;
+	uint32_t Height = 0;
+	uint32_t FrameNumber = 0;
+};
+
 class BaseVideoFilter
 {
 private:
@@ -15,6 +23,7 @@ private:
 	OverscanDimensions _overscan = {};
 	bool _isOddFrame = false;
 	uint32_t _videoPhase = 0;
+	uint32_t _frameNumber = 0;
 
 	void UpdateBufferSize();
 
@@ -47,6 +56,7 @@ public:
 	FrameInfo SendFrame(uint16_t* ppuOutputBuffer, uint32_t frameNumber, uint32_t videoPhase, void* frameData, bool enableOverscan = true);
 	void TakeScreenshot(string romName, VideoFilterType filterType);
 	void TakeScreenshot(VideoFilterType filterType, string filename, std::stringstream* stream = nullptr);
+	ScreenshotCapture CaptureScreenshot(VideoFilterType filterType);
 
 	virtual HudScaleFactors GetScaleFactor() { return { 1.0, 1.0 }; }
 	virtual OverscanDimensions GetOverscan();

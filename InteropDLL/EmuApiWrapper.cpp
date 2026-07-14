@@ -2,6 +2,7 @@
 #include "Core/Shared/Emulator.h"
 #include "Core/Shared/EmuSettings.h"
 #include "Core/Shared/Video/VideoDecoder.h"
+#include "Core/Shared/Video/BaseVideoFilter.h"
 #include "Core/Shared/Video/VideoRenderer.h"
 #include "Core/Shared/SystemActionManager.h"
 #include "Core/Shared/MessageManager.h"
@@ -72,13 +73,22 @@ enum class InteropApiResult : int32_t
 	InvalidData = 3,
 	PayloadTooLarge = 4,
 	AllocationFailed = 5,
-	EncodeFailed = 6
+	EncodeFailed = 6,
+	NoFrame = 7
 };
 
 struct InteropOwnedBuffer
 {
 	uint8_t* Data;
 	uint32_t Length;
+};
+
+struct InteropScreenshotInfo
+{
+	uint32_t Width;
+	uint32_t Height;
+	uint32_t FrameNumber;
+	uint32_t PngLength;
 };
 
 class BoundedInteropStreamBuffer : public std::streambuf
@@ -501,6 +511,57 @@ extern "C"
 			return InteropApiResult::AllocationFailed;
 		} catch(...) {
 			return InteropApiResult::InvalidData;
+		}
+	}
+
+	DllExport InteropApiResult __stdcall CaptureScreenshotPng(InteropOwnedBuffer& output, InteropScreenshotInfo& info)
+	{
+		static constexpr uint32_t MaxPngSize = 8 * 1024 * 1024;
+		static constexpr uint32_t MaxDimension = 4096;
+		static constexpr uint32_t MaxPixels = 16777216;
+		output = { nullptr, 0 };
+		info = {};
+
+		try {
+			if(!_emu->IsRunning()) {
+				return InteropApiResult::NoGameLoaded;
+			}
+
+			ScreenshotCapture capture = _emu->GetVideoDecoder()->CaptureScreenshot();
+			info = { capture.Width, capture.Height, capture.FrameNumber, 0 };
+			if(capture.Width == 0 || capture.Height == 0) {
+				return InteropApiResult::NoFrame;
+			}
+			if(capture.Width > MaxDimension || capture.Height > MaxDimension || capture.Width > MaxPixels / capture.Height) {
+				return InteropApiResult::InvalidData;
+			}
+			if(capture.Png.empty()) {
+				return InteropApiResult::EncodeFailed;
+			}
+			if(capture.Png.size() > MaxPngSize) {
+				return InteropApiResult::PayloadTooLarge;
+			}
+
+			uint8_t* data = new(std::nothrow) uint8_t[capture.Png.size()];
+			if(data == nullptr) {
+				return InteropApiResult::AllocationFailed;
+			}
+			memcpy(data, capture.Png.data(), capture.Png.size());
+			output = { data, (uint32_t)capture.Png.size() };
+			info.PngLength = output.Length;
+			return InteropApiResult::Success;
+		} catch(const std::bad_alloc&) {
+			if(output.Data != nullptr) {
+				ReleaseInteropBuffer(output.Data);
+				output = { nullptr, 0 };
+			}
+			return InteropApiResult::AllocationFailed;
+		} catch(...) {
+			if(output.Data != nullptr) {
+				ReleaseInteropBuffer(output.Data);
+				output = { nullptr, 0 };
+			}
+			return InteropApiResult::EncodeFailed;
 		}
 	}
 

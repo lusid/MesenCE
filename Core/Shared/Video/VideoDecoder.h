@@ -10,6 +10,7 @@ class ScaleFilter;
 class RotateFilter;
 class IRenderingDevice;
 class Emulator;
+struct ScreenshotCapture;
 
 class VideoDecoder
 {
@@ -21,6 +22,7 @@ private:
 	unique_ptr<thread> _decodeThread;
 
 	SimpleLock _stopStartLock;
+	SimpleLock _videoFilterLock;
 	AutoResetEvent _waitForFrame;
 
 	atomic<bool> _frameChanged;
@@ -35,7 +37,7 @@ private:
 	RenderedFrame _frame = {};
 
 	VideoFilterType _videoFilterType = VideoFilterType::None;
-	unique_ptr<BaseVideoFilter> _videoFilter;
+	shared_ptr<BaseVideoFilter> _videoFilter;
 	unique_ptr<ScaleFilter> _scaleFilter;
 	unique_ptr<RotateFilter> _rotateFilter;
 
@@ -52,6 +54,7 @@ public:
 	void DecodeFrame(bool synchronous = false);
 	void TakeScreenshot(string romName = "");
 	void TakeScreenshot(std::stringstream& stream);
+	ScreenshotCapture CaptureScreenshot();
 
 	void ForceFilterUpdate() { _forceFilterUpdate = true; }
 

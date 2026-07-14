@@ -32,4 +32,5 @@ internal interface IMcpEmulatorApi
 	TraceRow[] GetExecutionTrace(uint startOffset, uint maxRowCount);
 	McpServiceResult<byte[]> CreateSaveState();
 	McpServiceResult<bool> LoadSaveState(byte[] data);
+	McpServiceResult<McpScreenshotCapture> CaptureScreenshot();
 }

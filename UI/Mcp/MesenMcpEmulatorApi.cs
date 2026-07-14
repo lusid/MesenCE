@@ -8,15 +8,23 @@ internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 {
 	private readonly Func<InteropBufferResult> _createSaveState;
 	private readonly Func<byte[], InteropApiResult> _loadSaveState;
+	private readonly Func<InteropScreenshotResult> _captureScreenshot;
 
-	public MesenMcpEmulatorApi() : this(EmuApi.CreateSaveState, EmuApi.LoadSaveState) {}
+	public MesenMcpEmulatorApi() : this(EmuApi.CreateSaveState, EmuApi.LoadSaveState, EmuApi.CaptureScreenshot) {}
 
 	internal MesenMcpEmulatorApi(
 		Func<InteropBufferResult> createSaveState,
 		Func<byte[], InteropApiResult> loadSaveState)
+		: this(createSaveState, loadSaveState, EmuApi.CaptureScreenshot) {}
+
+	internal MesenMcpEmulatorApi(
+		Func<InteropBufferResult> createSaveState,
+		Func<byte[], InteropApiResult> loadSaveState,
+		Func<InteropScreenshotResult> captureScreenshot)
 	{
 		_createSaveState = createSaveState;
 		_loadSaveState = loadSaveState;
+		_captureScreenshot = captureScreenshot;
 	}
 
 	public bool IsRunning() => EmuApi.IsRunning();
@@ -63,6 +71,30 @@ internal sealed class MesenMcpEmulatorApi : IMcpEmulatorApi
 			InteropApiResult.NoGameLoaded => McpServiceResult<bool>.Failure("no_game", "No game is currently loaded."),
 			InteropApiResult.PayloadTooLarge => McpServiceResult<bool>.Failure("payload_too_large", "The save state exceeds the native size limit."),
 			_ => McpServiceResult<bool>.Failure("interop_failure", "Native emulator interop failed.")
+		};
+	}
+
+	public McpServiceResult<McpScreenshotCapture> CaptureScreenshot()
+	{
+		InteropScreenshotResult result = _captureScreenshot();
+		if(result.Result == InteropApiResult.Success) {
+			InteropApiResult validationResult = EmuApi.ValidateScreenshotLimits(result.Info);
+			if(validationResult == InteropApiResult.PayloadTooLarge) {
+				return McpServiceResult<McpScreenshotCapture>.Failure("payload_too_large", "The screenshot exceeds the native size limit.");
+			}
+			if(validationResult != InteropApiResult.Success || result.Png.Length != result.Info.PngLength) {
+				return McpServiceResult<McpScreenshotCapture>.Failure("interop_failure", "Native emulator interop failed.");
+			}
+			return McpServiceResult<McpScreenshotCapture>.Success(new(
+				new McpScreenshotMetadata((int)result.Info.Width, (int)result.Info.Height, result.Info.FrameNumber, result.Png.Length, 0, 0),
+				result.Png));
+		}
+		return result.Result switch {
+			InteropApiResult.NoGameLoaded => McpServiceResult<McpScreenshotCapture>.Failure("no_game", "No game is currently loaded."),
+			InteropApiResult.NoFrame => McpServiceResult<McpScreenshotCapture>.Failure("no_frame", "No decoded video frame is available."),
+			InteropApiResult.PayloadTooLarge => McpServiceResult<McpScreenshotCapture>.Failure("payload_too_large", "The screenshot exceeds the native size limit."),
+			InteropApiResult.EncodeFailed => McpServiceResult<McpScreenshotCapture>.Failure("encoding_failed", "The native screenshot encoder failed."),
+			_ => McpServiceResult<McpScreenshotCapture>.Failure("interop_failure", "Native emulator interop failed.")
 		};
 	}
 }
