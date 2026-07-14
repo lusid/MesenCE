@@ -19,6 +19,18 @@ internal sealed class McpPinnedResource<T> : IDisposable where T : class
 	public void Dispose() => Interlocked.Exchange(ref _release, null)?.Invoke();
 }
 
+internal sealed class McpResourceTransaction
+{
+	private Action<bool>? _complete;
+
+	internal McpResourceTransaction(Action<bool> complete)
+	{
+		_complete = complete;
+	}
+
+	internal void Complete(bool commit) => Interlocked.Exchange(ref _complete, null)?.Invoke(commit);
+}
+
 internal sealed record McpSaveStateResource(McpSaveStateMetadata Metadata, McpStateIdentity Identity, byte[] Data);
 
 internal sealed record McpMemorySnapshotResource(McpMemorySnapshotMetadata Metadata, McpStateIdentity Identity, byte[] Data);
@@ -140,6 +152,11 @@ internal abstract class McpResourceStore<T> : IDisposable where T : class
 		get { lock(_sync) { return _retainedBytes; } }
 	}
 
+	internal int ResourceEntryCount
+	{
+		get { lock(_sync) { return _entries.Count; } }
+	}
+
 	protected McpServiceResult<bool> CheckAddResource(long size)
 	{
 		lock(_sync) {
@@ -175,6 +192,50 @@ internal abstract class McpResourceStore<T> : IDisposable where T : class
 			_entries.Add(id, entry);
 			_retainedCount++;
 			return McpServiceResult<McpResourceCreation<T>>.Success(new(id, value));
+		}
+	}
+
+	protected McpServiceResult<McpTransactionalResourceCreation<T>> AddResourceTransactional(Func<string, T> create)
+	{
+		lock(_sync) {
+			ThrowIfDisposed();
+			long now = _clock.GetTimestamp();
+			Sweep(now);
+			if(_retainedCount >= _maxCount) {
+				return LimitFailure<McpTransactionalResourceCreation<T>>();
+			}
+
+			string id = CreateId();
+			T value = create(id);
+			Array[] allocations = GetDistinctAllocations(value);
+			long size = GetSize(allocations);
+			long addedBytes = GetAddedBytes(allocations, null);
+			if(size > _maxItemBytes || addedBytes > _maxAggregateBytes - _retainedBytes) {
+				return LimitFailure<McpTransactionalResourceCreation<T>>();
+			}
+
+			Entry entry = new(id, now);
+			Version version = AddVersion(entry, value, allocations);
+			entry.Current = version;
+			_entries.Add(id, entry);
+			_retainedCount++;
+			McpResourceTransaction transaction = new(commit => {
+				if(commit) {
+					return;
+				}
+				lock(_sync) {
+					if(!_entries.TryGetValue(id, out Entry? currentEntry) || !ReferenceEquals(currentEntry, entry)) {
+						return;
+					}
+					if(ReferenceEquals(entry.Current, version)) {
+						_entries.Remove(id);
+						RemoveEntry(entry);
+					} else if(entry.IsStale && entry.Current is null && version.Retired) {
+						_entries.Remove(id);
+					}
+				}
+			});
+			return McpServiceResult<McpTransactionalResourceCreation<T>>.Success(new(id, value, transaction));
 		}
 	}
 
@@ -262,6 +323,79 @@ internal abstract class McpResourceStore<T> : IDisposable where T : class
 			entry.Current = AddVersion(entry, replacement, allocations);
 			entry.LastUsed = now;
 			return McpServiceResult<bool>.Success(true);
+		}
+	}
+
+	protected McpServiceResult<bool> CheckTransactionalReplaceResource(string id, long replacementSize)
+	{
+		lock(_sync) {
+			ThrowIfDisposed();
+			Sweep(_clock.GetTimestamp());
+			if(!_entries.TryGetValue(id, out Entry? entry)) {
+				return NotFound<bool>(id);
+			}
+			if(entry.IsStale || entry.Current is null) {
+				return Stale<bool>(id);
+			}
+			return replacementSize > _maxItemBytes || replacementSize > _maxAggregateBytes - _retainedBytes
+				? LimitFailure<bool>()
+				: McpServiceResult<bool>.Success(true);
+		}
+	}
+
+	protected McpServiceResult<McpResourceTransaction> ReplaceResourceTransactional(string id, T replacement)
+	{
+		lock(_sync) {
+			ThrowIfDisposed();
+			long now = _clock.GetTimestamp();
+			Sweep(now);
+			if(!_entries.TryGetValue(id, out Entry? entry)) {
+				return NotFound<McpResourceTransaction>(id);
+			}
+			if(entry.IsStale || entry.Current is null) {
+				return Stale<McpResourceTransaction>(id);
+			}
+
+			Version previous = entry.Current;
+			Array[] allocations = GetDistinctAllocations(replacement);
+			long replacementSize = GetSize(allocations);
+			long addedBytes = GetAddedBytes(allocations, null);
+			if(replacementSize > _maxItemBytes || addedBytes > _maxAggregateBytes - _retainedBytes) {
+				return LimitFailure<McpResourceTransaction>();
+			}
+
+			long previousLastUsed = entry.LastUsed;
+			previous.PinCount++;
+			previous.Retired = true;
+			Version committed = AddVersion(entry, replacement, allocations);
+			entry.Current = committed;
+			entry.LastUsed = now;
+			return McpServiceResult<McpResourceTransaction>.Success(new(commit => {
+				lock(_sync) {
+					bool canRollback = !commit
+						&& _entries.TryGetValue(id, out Entry? currentEntry)
+						&& ReferenceEquals(currentEntry, entry)
+						&& !entry.IsStale
+						&& !entry.Removed
+						&& ReferenceEquals(entry.Current, committed);
+					if(canRollback) {
+						committed.Retired = true;
+						entry.Current = previous;
+						if(committed.PinCount == 0) {
+							CleanupVersion(entry, committed);
+						}
+						previous.Retired = false;
+						previous.PinCount--;
+						entry.LastUsed = previousLastUsed;
+						return;
+					}
+
+					previous.PinCount--;
+					if(previous.PinCount == 0 && previous.Retired) {
+						CleanupVersion(entry, previous);
+					}
+				}
+			}));
 		}
 	}
 
@@ -513,3 +647,4 @@ internal abstract class McpResourceStore<T> : IDisposable where T : class
 }
 
 internal sealed record McpResourceCreation<T>(string Id, T Value) where T : class;
+internal sealed record McpTransactionalResourceCreation<T>(string Id, T Value, McpResourceTransaction Transaction) where T : class;

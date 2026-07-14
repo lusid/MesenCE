@@ -1509,6 +1509,18 @@ internal sealed class McpEmulatorService : IDisposable
 		return Execute(() => operation(_api, _emulatorIdentity.Current));
 	}
 
+	internal McpServiceResult<T> ExecuteAutomationTransaction<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, Action<Action<bool>>, McpServiceResult<T>> operation)
+	{
+		McpStateIdentity identity = default;
+		return ExecuteTransactional(
+			registerCompletion => {
+				identity = _emulatorIdentity.Current;
+				return operation(_api, identity, registerCompletion);
+			},
+			ticket => _gate.Generation == ticket.Generation && _emulatorIdentity.Current == identity);
+	}
+
 	internal McpServiceResult<T> ExecuteStoppedMemorySnapshot<T>(
 		Func<IMcpEmulatorApi, McpStateIdentity, McpServiceResult<T>> operation)
 	{
@@ -1522,6 +1534,29 @@ internal sealed class McpEmulatorService : IDisposable
 			}
 			return operation(_api, _emulatorIdentity.Current);
 		});
+	}
+
+	internal McpServiceResult<T> ExecuteStoppedMemoryTransaction<T>(
+		Func<IMcpEmulatorApi, McpStateIdentity, Action<Action<bool>>, McpServiceResult<T>> operation)
+	{
+		McpStateIdentity identity = default;
+		bool captureStarted = false;
+		return ExecuteTransactional(
+			registerCompletion => {
+				if(!_api.IsRunning()) {
+					return McpServiceResult<T>.Failure("no_game", "No game is currently loaded.");
+				}
+				if(!_api.IsExecutionStopped()) {
+					return McpServiceResult<T>.Failure(
+						"debugger_unavailable", "Execution must be stopped for memory capture operations.");
+				}
+				identity = _emulatorIdentity.Current;
+				captureStarted = true;
+				return operation(_api, identity, registerCompletion);
+			},
+			ticket => !captureStarted || (_gate.Generation == ticket.Generation
+				&& _emulatorIdentity.Current == identity
+				&& _api.IsExecutionStopped()));
 	}
 
 	internal McpServiceResult<T> ExecuteOwned<T>(
@@ -1610,6 +1645,24 @@ internal sealed class McpEmulatorService : IDisposable
 			ReconcilePendingResources();
 			return operation();
 		});
+	}
+
+	private McpServiceResult<T> ExecuteTransactional<T>(
+		Func<Action<Action<bool>>, McpServiceResult<T>> operation,
+		Func<McpOperationTicket, bool> postflight)
+	{
+		if(IsServiceStopping()) {
+			return ServiceStopping<T>();
+		}
+		return _gate.ExecuteTransactional(
+			registerCompletion => {
+				if(IsServiceStopping()) {
+					return ServiceStopping<T>();
+				}
+				ReconcilePendingResources();
+				return operation(registerCompletion);
+			},
+			(ticket, _) => postflight(ticket));
 	}
 
 	private McpServiceResult<T> ExecuteWithTicket<T>(Func<McpOperationTicket, McpServiceResult<T>> operation)

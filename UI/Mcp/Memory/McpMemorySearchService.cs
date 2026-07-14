@@ -48,7 +48,7 @@ internal sealed class McpMemorySearchService
 		int positionCount = GetPositionCount(count, width, stride);
 		int wordCount = GetWordCount(positionCount);
 		long allocationBytes = count + ((long)wordCount * sizeof(int));
-		return _emulator.ExecuteStoppedMemorySnapshot((api, identity) => {
+		return _emulator.ExecuteStoppedMemoryTransaction((api, identity, registerCompletion) => {
 			if(!TryResolveMemorySpace(api, space, out MemoryType type, out int memorySize)) {
 				return Failure<StartMemorySearchResult>("unknown_memory_space", "The selected memory space is not available.");
 			}
@@ -82,12 +82,16 @@ internal sealed class McpMemorySearchService
 				McpMemorySearchResource resource = new(
 					system, space, address, count, width, signed, byteOrder, stride, identity, state,
 					MemorySize: memorySize);
-				McpServiceResult<string> created = _searches.Create(resource);
+				McpServiceResult<McpTransactionalResourceCreation<McpMemorySearchResource>> created =
+					_searches.CreateTransactional(resource);
+				if(created.IsSuccess) {
+					registerCompletion(created.Value!.Transaction.Complete);
+				}
 				return created.IsSuccess
 					? McpServiceResult<StartMemorySearchResult>.Success(new(
-						created.Value!, system, space, address, count, width, signed, byteOrder, stride,
+						created.Value!.Id, system, space, address, count, width, signed, byteOrder, stride,
 						candidateCount, identity.RomIdentity, generation))
-					: ForwardFailure<StartMemorySearchResult, string>(created);
+					: ForwardFailure<StartMemorySearchResult, McpTransactionalResourceCreation<McpMemorySearchResource>>(created);
 			} catch(OutOfMemoryException) {
 				return Failure<StartMemorySearchResult>("resource_limit", "The memory search allocation could not be completed.");
 			}
@@ -102,7 +106,7 @@ internal sealed class McpMemorySearchService
 			return ForwardFailure<RefineMemorySearchResult, bool>(operands);
 		}
 
-		return _emulator.ExecuteStoppedMemorySnapshot((api, identity) => {
+		return _emulator.ExecuteStoppedMemoryTransaction((api, identity, registerCompletion) => {
 			McpServiceResult<McpPinnedResource<McpMemorySearchResource>> pinResult = _searches.Pin(id);
 			if(!pinResult.IsSuccess) {
 				return ForwardFailure<RefineMemorySearchResult, McpPinnedResource<McpMemorySearchResource>>(pinResult);
@@ -121,6 +125,11 @@ internal sealed class McpMemorySearchService
 
 				if(value.HasValue && !IsRepresentable(value.Value, resource.Width, resource.Signed)) {
 					return Failure<RefineMemorySearchResult>("invalid_value", "The comparison value is outside the selected numeric range.");
+				}
+				McpServiceResult<bool> capacity = _searches.CheckTransactionalReplace(
+					id, GetRefinementAllocationBytes(resource));
+				if(!capacity.IsSuccess) {
+					return ForwardFailure<RefineMemorySearchResult, bool>(capacity);
 				}
 				currentSnapshot = api.GetMemoryValues(
 					ParseMemoryType(resource.Space), resource.Address, checked(resource.Address + (uint)resource.Count - 1));
@@ -157,16 +166,17 @@ internal sealed class McpMemorySearchService
 				}
 			}
 
-			McpServiceResult<bool> replaced;
+			McpServiceResult<McpResourceTransaction> replaced;
 			try {
-				replaced = _searches.Replace(id, replacement);
+				replaced = _searches.ReplaceTransactional(id, replacement);
 			}
 			catch(OutOfMemoryException) {
 				return Failure<RefineMemorySearchResult>("resource_limit", "The memory search allocation could not be completed.");
 			}
 			if(!replaced.IsSuccess) {
-				return ForwardFailure<RefineMemorySearchResult, bool>(replaced);
+				return ForwardFailure<RefineMemorySearchResult, McpResourceTransaction>(replaced);
 			}
+			registerCompletion(replaced.Value!.Complete);
 
 			int candidateCount = CountCandidates(replacement.State.CandidateOffsets);
 			return McpServiceResult<RefineMemorySearchResult>.Success(new(
@@ -232,7 +242,7 @@ internal sealed class McpMemorySearchService
 
 	internal McpServiceResult<UndoMemorySearchResult> UndoMemorySearch(string id)
 	{
-		return _emulator.ExecuteAutomation((api, identity) => {
+		return _emulator.ExecuteAutomationTransaction((api, identity, registerCompletion) => {
 			McpServiceResult<McpPinnedResource<McpMemorySearchResource>> pinResult = _searches.Pin(id);
 			if(!pinResult.IsSuccess) {
 				return ForwardFailure<UndoMemorySearchResult, McpPinnedResource<McpMemorySearchResource>>(pinResult);
@@ -251,16 +261,23 @@ internal sealed class McpMemorySearchService
 				replacement = resource with { Identity = identity, State = resource.UndoState, UndoState = null };
 			}
 
-			McpServiceResult<bool> replaced;
+			McpServiceResult<bool> capacity = _searches.CheckTransactionalReplace(
+				id, GetStateAllocationBytes(replacement.State));
+			if(!capacity.IsSuccess) {
+				return ForwardFailure<UndoMemorySearchResult, bool>(capacity);
+			}
+
+			McpServiceResult<McpResourceTransaction> replaced;
 			try {
-				replaced = _searches.Replace(id, replacement);
+				replaced = _searches.ReplaceTransactional(id, replacement);
 			}
 			catch(OutOfMemoryException) {
 				return Failure<UndoMemorySearchResult>("resource_limit", "The memory search allocation could not be completed.");
 			}
 			if(!replaced.IsSuccess) {
-				return ForwardFailure<UndoMemorySearchResult, bool>(replaced);
+				return ForwardFailure<UndoMemorySearchResult, McpResourceTransaction>(replaced);
 			}
+			registerCompletion(replaced.Value!.Complete);
 			return McpServiceResult<UndoMemorySearchResult>.Success(new(
 				id,
 				CountCandidates(replacement.State.CandidateOffsets),
@@ -382,6 +399,25 @@ internal sealed class McpMemorySearchService
 			count += BitOperations.PopCount((uint)word);
 		}
 		return count;
+	}
+
+	private static long GetRefinementAllocationBytes(McpMemorySearchResource resource) =>
+		GetStateAllocationBytes(resource.State)
+			+ resource.Count
+			+ Buffer.ByteLength(resource.State.CandidateOffsets);
+
+	private static long GetStateAllocationBytes(McpMemorySearchState state)
+	{
+		HashSet<Array> arrays = new(ReferenceEqualityComparer.Instance) {
+			state.PreviousSnapshot,
+			state.CurrentSnapshot,
+			state.CandidateOffsets
+		};
+		long bytes = 0;
+		foreach(Array array in arrays) {
+			bytes += Buffer.ByteLength(array);
+		}
+		return bytes;
 	}
 
 	private static bool TryResolveMemorySpace(

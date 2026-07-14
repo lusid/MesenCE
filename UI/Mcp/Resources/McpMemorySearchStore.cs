@@ -33,6 +33,17 @@ internal sealed class McpMemorySearchStore : McpResourceStore<McpMemorySearchRes
 			: ForwardFailure<string, McpResourceCreation<McpMemorySearchResource>>(result);
 	}
 
+	internal McpServiceResult<McpTransactionalResourceCreation<McpMemorySearchResource>> CreateTransactional(
+		McpMemorySearchResource resource)
+	{
+		McpMemorySearchResource ownedResource = resource.CreateOwnedCopy();
+		if(ownedResource.Count < 0 || ownedResource.Count > McpAutomationLimits.MaxSearchRangeBytes) {
+			return McpServiceResult<McpTransactionalResourceCreation<McpMemorySearchResource>>.Failure(
+				"resource_limit", "The memory search range quota would be exceeded.");
+		}
+		return AddResourceTransactional(_ => ownedResource);
+	}
+
 	internal McpServiceResult<McpPinnedResource<McpMemorySearchResource>> Pin(string id) => PinResource(id);
 
 	internal McpServiceResult<bool> Replace(string id, McpMemorySearchResource replacement)
@@ -42,6 +53,20 @@ internal sealed class McpMemorySearchStore : McpResourceStore<McpMemorySearchRes
 			return McpServiceResult<bool>.Failure("resource_limit", "The memory search range quota would be exceeded.");
 		}
 		return ReplaceResource(id, ownedReplacement);
+	}
+
+	internal McpServiceResult<bool> CheckTransactionalReplace(string id, long replacementSize) =>
+		CheckTransactionalReplaceResource(id, replacementSize);
+
+	internal McpServiceResult<McpResourceTransaction> ReplaceTransactional(
+		string id, McpMemorySearchResource replacement)
+	{
+		McpMemorySearchResource ownedReplacement = replacement.CreateOwnedCopy();
+		if(ownedReplacement.Count < 0 || ownedReplacement.Count > McpAutomationLimits.MaxSearchRangeBytes) {
+			return McpServiceResult<McpResourceTransaction>.Failure(
+				"resource_limit", "The memory search range quota would be exceeded.");
+		}
+		return ReplaceResourceTransactional(id, ownedReplacement);
 	}
 
 	internal McpServiceResult<McpDeleteResourceResult> Delete(string id) => DeleteResource(id);

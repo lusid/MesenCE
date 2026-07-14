@@ -7,11 +7,23 @@ public sealed class McpMemorySearchServiceTests
 {
 	public static TheoryData<int, bool, string, byte[], long[]> DecodeCases => new() {
 		{ 1, false, "little", [0x00, 0x7F, 0x80, 0xFF], [0, 127, 128, 255] },
+		{ 1, false, "big", [0x00, 0x7F, 0x80, 0xFF], [0, 127, 128, 255] },
+		{ 1, true, "little", [0x00, 0x7F, 0x80, 0xFF], [0, 127, -128, -1] },
 		{ 1, true, "big", [0x00, 0x7F, 0x80, 0xFF], [0, 127, -128, -1] },
 		{ 2, false, "little", [0x34, 0x12, 0xFE, 0xFF], [0x1234, 0xFFFE] },
+		{ 2, false, "big", [0x12, 0x34, 0xFF, 0xFE], [0x1234, 0xFFFE] },
+		{ 2, true, "little", [0x34, 0x12, 0xFE, 0xFF], [0x1234, -2] },
 		{ 2, true, "big", [0x12, 0x34, 0xFF, 0xFE], [0x1234, -2] },
 		{ 4, false, "little", [0x78, 0x56, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF], [0x12345678, 4294967295] },
+		{ 4, false, "big", [0x12, 0x34, 0x56, 0x78, 0xFF, 0xFF, 0xFF, 0xFF], [0x12345678, 4294967295] },
+		{ 4, true, "little", [0x78, 0x56, 0x34, 0x12, 0xFE, 0xFF, 0xFF, 0xFF], [0x12345678, -2] },
 		{ 4, true, "big", [0x12, 0x34, 0x56, 0x78, 0xFF, 0xFF, 0xFF, 0xFE], [0x12345678, -2] }
+	};
+
+	public static TheoryData<int, int> StrideCases => new() {
+		{ 1, 1 },
+		{ 2, 1 }, { 2, 2 },
+		{ 4, 1 }, { 4, 2 }, { 4, 3 }, { 4, 4 }
 	};
 
 	[Theory]
@@ -32,16 +44,19 @@ public sealed class McpMemorySearchServiceTests
 			results.Candidates.Select(candidate => candidate.Address));
 	}
 
-	[Fact]
-	public void StartMemorySearch_UsesStrideAndRequiresTheCompleteValueToFit()
+	[Theory]
+	[MemberData(nameof(StrideCases))]
+	public void StartMemorySearch_UsesEveryStrideAndRequiresTheCompleteValueToFit(int width, int stride)
 	{
-		using SearchFixture fixture = new(17, [1, 2, 3, 4, 5, 6, 7]);
+		int count = width + (2 * stride);
+		byte[] data = Enumerable.Range(1, count).Select(value => (byte)value).ToArray();
+		using SearchFixture fixture = new(count, data);
 
 		StartMemorySearchResult result = AssertSuccess(fixture.Service.StartMemorySearch(
-			nameof(MemoryType.NesWorkRam), 10, 7, 4, false, "little", 3, null));
+			nameof(MemoryType.NesWorkRam), 0, count, width, false, "little", stride, null));
 
-		Assert.Equal(2, result.CandidateCount);
-		Assert.Equal([10U, 13U], AssertSuccess(fixture.Service.GetMemorySearchResults(result.Id, 0, 10))
+		Assert.Equal(3, result.CandidateCount);
+		Assert.Equal([0U, (uint)stride, (uint)(2 * stride)], AssertSuccess(fixture.Service.GetMemorySearchResults(result.Id, 0, 10))
 			.Candidates.Select(candidate => candidate.Address));
 	}
 
@@ -195,6 +210,134 @@ public sealed class McpMemorySearchServiceTests
 		Assert.Equal(calls, fixture.Api.GetMemoryValuesCalls);
 	}
 
+	[Theory]
+	[InlineData("generation", "state_changed")]
+	[InlineData("rom", "state_changed")]
+	[InlineData("debugger", "state_changed")]
+	[InlineData("execution", "state_changed")]
+	[InlineData("interop", "interop_failure")]
+	public void StartMemorySearch_PostflightFailureRollsBackTheExactCreatedSession(string failure, string error)
+	{
+		using SearchFixture fixture = new(1, [7]);
+		ConfigurePostflightFailure(fixture, failure);
+
+		AssertError(fixture.Service.StartMemorySearch(
+			nameof(MemoryType.NesWorkRam), 0, 1, 1, false, "little", 1, null), error);
+
+		Assert.Equal(0, fixture.Store.RetainedBytes);
+		Assert.Equal(0, fixture.Store.ResourceEntryCount);
+	}
+
+	[Fact]
+	public void StartMemorySearch_PostflightLifecycleInvalidationStillRemovesTheUnreturnedSession()
+	{
+		using SearchFixture fixture = new(1, [7]);
+		int calls = 0;
+		fixture.Api.GetDebuggerRequestBlockStateHandler = () => {
+			if(++calls == 2) {
+				Assert.Equal(1, fixture.Store.ResourceEntryCount);
+				fixture.Identity.NotifyRomChanged();
+				fixture.Store.InvalidateRom(fixture.Identity.Current.RomIdentity);
+				fixture.Gate.NotifyEmulatorStateChanged();
+			}
+			return 0;
+		};
+
+		AssertError(fixture.Service.StartMemorySearch(
+			nameof(MemoryType.NesWorkRam), 0, 1, 1, false, "little", 1, null), "state_changed");
+
+		Assert.Equal(0, fixture.Store.RetainedBytes);
+		Assert.Equal(0, fixture.Store.ResourceEntryCount);
+	}
+
+	[Theory]
+	[InlineData("generation", "state_changed")]
+	[InlineData("rom", "state_changed")]
+	[InlineData("debugger", "state_changed")]
+	[InlineData("execution", "state_changed")]
+	[InlineData("interop", "interop_failure")]
+	public void RefineMemorySearch_PostflightFailureRestoresTheExactPriorVersion(string failure, string error)
+	{
+		using SearchFixture fixture = new(3, [1, 2, 3]);
+		string id = Start(fixture, count: 3);
+		fixture.Api.ReadData = [1, 4, 5];
+		AssertSuccess(fixture.Service.RefineMemorySearch(id, "changed", null, null));
+		fixture.Api.ReadData = [9, 4, 6];
+		McpMemorySearchResource before = SnapshotResource(fixture, id);
+		Assert.NotNull(before.UndoState);
+		long retainedBytes = fixture.Store.RetainedBytes;
+		ConfigurePostflightFailure(fixture, failure);
+
+		AssertError(fixture.Service.RefineMemorySearch(id, "changed", null, null), error);
+
+		McpMemorySearchResource after = SnapshotResource(fixture, id);
+		AssertResourceStateEqual(before, after);
+		Assert.Equal(retainedBytes, fixture.Store.RetainedBytes);
+	}
+
+	[Fact]
+	public void RefineMemorySearch_PostflightLifecycleInvalidationWinsWithoutResurrectingPriorState()
+	{
+		using SearchFixture fixture = new(2, [1, 2]);
+		string id = Start(fixture, count: 2);
+		fixture.Api.ReadData = [3, 4];
+		int calls = 0;
+		fixture.Api.GetDebuggerRequestBlockStateHandler = () => {
+			if(++calls == 2) {
+				fixture.Identity.NotifyRomChanged();
+				fixture.Store.InvalidateRom(fixture.Identity.Current.RomIdentity);
+				fixture.Gate.NotifyEmulatorStateChanged();
+			}
+			return 0;
+		};
+
+		AssertError(fixture.Service.RefineMemorySearch(id, "changed", null, null), "state_changed");
+
+		AssertError(fixture.Store.Pin(id), "stale_resource");
+		Assert.Equal(0, fixture.Store.RetainedBytes);
+	}
+
+	[Fact]
+	public void RefineMemorySearch_RejectsPerSessionAllocationBeforeNativeCaptureAndPreservesUndo()
+	{
+		using SearchFixture fixture = new(1, [9]);
+		int candidateWords = (McpAutomationLimits.MaxSearchAllocationBytes / sizeof(int)) - 2;
+		McpMemorySearchState state = new([1], [2], new int[candidateWords], 3, 4);
+		McpMemorySearchState undo = new([5], [6], [7], 1, 2);
+		string id = AddSearch(fixture, state, undo);
+		McpMemorySearchResource before = SnapshotResource(fixture, id);
+		long retainedBytes = fixture.Store.RetainedBytes;
+
+		AssertError(fixture.Service.RefineMemorySearch(id, "changed", null, null), "resource_limit");
+
+		Assert.Equal(0, fixture.Api.GetMemoryValuesCalls);
+		AssertResourceStateEqual(before, SnapshotResource(fixture, id));
+		Assert.Equal(retainedBytes, fixture.Store.RetainedBytes);
+	}
+
+	[Fact]
+	public void RefineMemorySearch_RejectsAggregateAllocationBeforeNativeCaptureAndPreservesUndo()
+	{
+		using SearchFixture fixture = new(1, [9]);
+		int fullWords = (McpAutomationLimits.MaxSearchAllocationBytes - 1) / sizeof(int);
+		for(int index = 0; index < 3; index++) {
+			AddSearch(fixture, new([1], [1], new int[fullWords], 0, 0));
+		}
+
+		int targetWords = (McpAutomationLimits.MaxSearchAllocationBytes - 2) / (2 * sizeof(int));
+		McpMemorySearchState target = new([1], [2], new int[targetWords], 3, 4);
+		McpMemorySearchState undo = new([5], [6], [7], 1, 2);
+		string id = AddSearch(fixture, target, undo);
+		McpMemorySearchResource before = SnapshotResource(fixture, id);
+		long retainedBytes = fixture.Store.RetainedBytes;
+
+		AssertError(fixture.Service.RefineMemorySearch(id, "changed", null, null), "resource_limit");
+
+		Assert.Equal(0, fixture.Api.GetMemoryValuesCalls);
+		AssertResourceStateEqual(before, SnapshotResource(fixture, id));
+		Assert.Equal(retainedBytes, fixture.Store.RetainedBytes);
+	}
+
 	[Fact]
 	public void RefineMemorySearch_IsAtomicAndProvidesExactlyOneUndoState()
 	{
@@ -304,6 +447,64 @@ public sealed class McpMemorySearchServiceTests
 		fixture.Service.StartMemorySearch(
 			nameof(MemoryType.NesWorkRam), 0, count, 1, false, "little", 1, null)).Id;
 
+	private static string AddSearch(
+		SearchFixture fixture, McpMemorySearchState state, McpMemorySearchState? undo = null) => AssertSuccess(
+		fixture.Store.Create(new(
+			"Nes", nameof(MemoryType.NesWorkRam), 0, 1, 1, false, "little", 1,
+			fixture.Identity.Current, state, undo, 1)));
+
+	private static McpMemorySearchResource SnapshotResource(SearchFixture fixture, string id)
+	{
+		using McpPinnedResource<McpMemorySearchResource> pin = AssertSuccess(fixture.Store.Pin(id));
+		McpMemorySearchResource value = pin.Value;
+		return value with {
+			State = CopyState(value.State),
+			UndoState = value.UndoState is null ? null : CopyState(value.UndoState)
+		};
+	}
+
+	private static McpMemorySearchState CopyState(McpMemorySearchState state) => new(
+		[.. state.PreviousSnapshot],
+		[.. state.CurrentSnapshot],
+		[.. state.CandidateOffsets],
+		state.PreviousMutableStateGeneration,
+		state.MutableStateGeneration);
+
+	private static void AssertResourceStateEqual(McpMemorySearchResource expected, McpMemorySearchResource actual)
+	{
+		Assert.Equal(expected.Identity, actual.Identity);
+		Assert.Equal(expected.State.PreviousSnapshot, actual.State.PreviousSnapshot);
+		Assert.Equal(expected.State.CurrentSnapshot, actual.State.CurrentSnapshot);
+		Assert.Equal(expected.State.CandidateOffsets, actual.State.CandidateOffsets);
+		Assert.Equal(expected.State.PreviousMutableStateGeneration, actual.State.PreviousMutableStateGeneration);
+		Assert.Equal(expected.State.MutableStateGeneration, actual.State.MutableStateGeneration);
+		Assert.Equal(expected.UndoState?.PreviousSnapshot, actual.UndoState?.PreviousSnapshot);
+		Assert.Equal(expected.UndoState?.CurrentSnapshot, actual.UndoState?.CurrentSnapshot);
+		Assert.Equal(expected.UndoState?.CandidateOffsets, actual.UndoState?.CandidateOffsets);
+		Assert.Equal(expected.UndoState?.PreviousMutableStateGeneration, actual.UndoState?.PreviousMutableStateGeneration);
+		Assert.Equal(expected.UndoState?.MutableStateGeneration, actual.UndoState?.MutableStateGeneration);
+	}
+
+	private static void ConfigurePostflightFailure(SearchFixture fixture, string failure)
+	{
+		if(failure == "interop") {
+			fixture.Api.ThrowOnDebuggerRequestBlockStateCall = fixture.Api.DebuggerRequestBlockStateCalls + 2;
+			return;
+		}
+
+		int calls = 0;
+		fixture.Api.GetDebuggerRequestBlockStateHandler = () => {
+			if(++calls == 2) {
+				switch(failure) {
+					case "generation": fixture.Gate.NotifyEmulatorStateChanged(); break;
+					case "rom": fixture.Identity.NotifyRomChanged(); break;
+					case "execution": fixture.ExecutionStopped = false; break;
+				}
+			}
+			return failure == "debugger" && calls >= 2 ? 2UL : 0UL;
+		};
+	}
+
 	private static T AssertSuccess<T>(McpServiceResult<T> result)
 	{
 		Assert.True(result.IsSuccess, result.Error?.Code);
@@ -318,23 +519,28 @@ public sealed class McpMemorySearchServiceTests
 
 	private sealed class SearchFixture : IDisposable
 	{
+		private bool _executionStopped = true;
+
 		internal SearchFixture(int memorySize, byte[] readData, Func<bool>? isStopped = null)
 		{
 			Api = FakeMcpEmulatorApi.RunningNes();
 			Api.MemorySizes[MemoryType.NesWorkRam] = memorySize;
 			Api.ReadData = readData;
-			Api.IsExecutionStoppedHandler = isStopped;
+			Api.IsExecutionStoppedHandler = () => isStopped?.Invoke() ?? _executionStopped;
 			Identity = new();
-			Emulator = new(Api, emulatorIdentity: Identity);
+			Gate = new(Api);
+			Emulator = new(Api, gate: Gate, emulatorIdentity: Identity);
 			Store = new();
 			Service = new(Emulator, Store);
 		}
 
 		internal FakeMcpEmulatorApi Api { get; }
 		internal McpEmulatorIdentity Identity { get; }
+		internal McpEmulatorGate Gate { get; }
 		internal McpEmulatorService Emulator { get; }
 		internal McpMemorySearchStore Store { get; }
 		internal McpMemorySearchService Service { get; }
+		internal bool ExecutionStopped { set => _executionStopped = value; }
 
 		public void Dispose()
 		{

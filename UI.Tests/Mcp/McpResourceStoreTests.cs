@@ -367,6 +367,52 @@ public sealed class McpResourceStoreTests
 	}
 
 	[Fact]
+	public void TransactionalSearchCreateRollbackRemovesTheExactEntryAndAllocation()
+	{
+		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
+		McpServiceResult<McpTransactionalResourceCreation<McpMemorySearchResource>> result =
+			store.CreateTransactional(SearchResource(new([1], [2], [3], 1, 2)));
+		McpTransactionalResourceCreation<McpMemorySearchResource> created = AssertSuccess(result);
+
+		created.Transaction.Complete(commit: false);
+
+		AssertError(store.Pin(created.Id), "resource_not_found");
+		Assert.Equal(0, store.ResourceEntryCount);
+		Assert.Equal(0, store.RetainedBytes);
+	}
+
+	[Fact]
+	public void TransactionalSearchReplaceRollbackIsVersionGuardedAndDoesNotResurrectStaleState()
+	{
+		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
+		string id = AssertSuccess(store.Create(SearchResource(new([1], [2], [3], 1, 2))));
+		McpResourceTransaction transaction = AssertSuccess(store.ReplaceTransactional(
+			id, SearchResource(new([4], [5], [6], 2, 3))));
+
+		store.InvalidateTopology(resource => resource.State.MutableStateGeneration == 3);
+		transaction.Complete(commit: false);
+
+		AssertError(store.Pin(id), "stale_resource");
+		Assert.Equal(0, store.RetainedBytes);
+	}
+
+	[Fact]
+	public void TransactionalSearchReplaceRollbackDoesNotOverwriteANewerVersion()
+	{
+		using McpMemorySearchStore store = new(new FakeMcpMonotonicClock());
+		string id = AssertSuccess(store.Create(SearchResource(new([1], [2], [3], 1, 2))));
+		McpResourceTransaction transaction = AssertSuccess(store.ReplaceTransactional(
+			id, SearchResource(new([4], [5], [6], 2, 3))));
+		AssertSuccess(store.Replace(id, SearchResource(new([7], [8], [9], 3, 4))));
+
+		transaction.Complete(commit: false);
+
+		using McpPinnedResource<McpMemorySearchResource> pin = AssertSuccess(store.Pin(id));
+		Assert.Equal([8], pin.Value.State.CurrentSnapshot);
+		Assert.Equal(4, pin.Value.State.MutableStateGeneration);
+	}
+
+	[Fact]
 	public void SearchReplacementAccountsForPinnedOldArraysUntilRelease()
 	{
 		FakeMcpMonotonicClock clock = new();
