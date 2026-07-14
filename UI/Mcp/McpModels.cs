@@ -2,7 +2,10 @@ using System.Collections.Generic;
 
 namespace Mesen.Mcp;
 
-public sealed record EmulatorStatus(bool GameLoaded, string? System, string? RomName, string State, string MesenVersion, string McpVersion);
+public sealed record EmulatorStatus(bool GameLoaded, string? System, string? RomName, string State, string MesenVersion, string McpVersion)
+{
+	public const string Unknown = "unknown";
+}
 public sealed record MemorySpace(string Id, string DisplayName, int Size, bool CanRead, bool CanWrite);
 public sealed record MemoryRead(string Space, uint Address, int Count, byte[] Data, string Hex);
 public sealed record MemoryWrite(string Space, uint Address, int Count);
