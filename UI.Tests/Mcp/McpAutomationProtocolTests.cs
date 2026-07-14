@@ -117,6 +117,17 @@ public sealed class McpAutomationProtocolTests
 	[Fact]
 	public void PublicResultContracts_HaveGeneratedMetadataAndStableDiscriminators()
 	{
+		Assert.NotNull(McpToolJsonContext.Default.LoadSaveStateRequest);
+		Assert.NotNull(McpToolJsonContext.Default.DeleteSaveStateRequest);
+		Assert.NotNull(McpToolJsonContext.Default.RunExperimentRequest);
+		Assert.NotNull(McpToolJsonContext.Default.CreateMemorySnapshotRequest);
+		Assert.NotNull(McpToolJsonContext.Default.CompareMemorySnapshotsRequest);
+		Assert.NotNull(McpToolJsonContext.Default.DeleteMemorySnapshotRequest);
+		Assert.NotNull(McpToolJsonContext.Default.StartMemorySearchRequest);
+		Assert.NotNull(McpToolJsonContext.Default.RefineMemorySearchRequest);
+		Assert.NotNull(McpToolJsonContext.Default.GetMemorySearchResultsRequest);
+		Assert.NotNull(McpToolJsonContext.Default.UndoMemorySearchRequest);
+		Assert.NotNull(McpToolJsonContext.Default.DeleteMemorySearchRequest);
 		Assert.NotNull(McpToolJsonContext.Default.McpSaveStateMetadata);
 		Assert.NotNull(McpToolJsonContext.Default.McpSaveStateLoadResult);
 		Assert.NotNull(McpToolJsonContext.Default.McpDeleteResourceResult);

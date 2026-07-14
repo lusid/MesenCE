@@ -21,6 +21,8 @@ internal sealed class McpServer : IDisposable
 	private readonly McpEmulatorService _service;
 	private readonly McpAutomationService _automationService;
 	private readonly McpExperimentService _experimentService;
+	private readonly McpMemorySnapshotService _memorySnapshotService;
+	private readonly McpMemorySearchService _memorySearchService;
 	private readonly McpSaveStateStore _saveStates;
 	private readonly McpMemorySnapshotStore _memorySnapshots;
 	private readonly McpMemorySearchStore _memorySearches;
@@ -52,6 +54,8 @@ internal sealed class McpServer : IDisposable
 		_memorySearches = new();
 		_automationService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
 		_experimentService = new(service, new McpAutomationAdapterRegistry(service.Api), _saveStates);
+		_memorySnapshotService = new(service, _memorySnapshots);
+		_memorySearchService = new(service, _memorySearches);
 		_toolLog = toolLog ?? Log;
 		_applicationCleanup = applicationCleanup ?? StopAndDisposeApplicationAsync;
 	}
@@ -220,7 +224,13 @@ internal sealed class McpServer : IDisposable
 			builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = MaximumRequestBodySize);
 			builder.Services.AddMcpServer()
 				.WithHttpTransport()
-				.WithTools(McpTools.Create(_service, _toolLog));
+				.WithTools(McpTools.Create(
+					_service,
+					_automationService,
+					_experimentService,
+					_memorySnapshotService,
+					_memorySearchService,
+					_toolLog));
 
 			application = builder.Build();
 			application.Use(async (context, next) => {

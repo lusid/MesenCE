@@ -28,13 +28,15 @@ public sealed class McpExperimentServiceTests
 			 new("final-value", "final", nameof(MemoryType.NesMemory), 0, 1, null)],
 			[], true, false);
 
-		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(request, CancellationToken.None));
+		McpExperimentCapture capture = AssertCapture(await fixture.Experiments.RunAsync(request, CancellationToken.None));
+		RunExperimentResult result = capture.Result;
 
 		Assert.Equal(McpExperimentStatus.Completed, result.Status);
 		Assert.Equal([0, 1], result.CompletedSegments);
 		Assert.Equal(5, result.CompletedFrames);
 		Assert.Equal(["initial", "first", "final"], result.Checkpoints.Select(checkpoint => checkpoint.Name));
 		Assert.NotNull(result.Screenshot);
+		Assert.Equal([0x89], capture.Png);
 		Assert.True(result.Cleanup.StopConfirmed);
 		Assert.True(result.Cleanup.InputReleased);
 		Assert.True(result.Cleanup.LeaseReleased);
@@ -55,7 +57,7 @@ public sealed class McpExperimentServiceTests
 		using ExperimentFixture fixture = new();
 		RunExperimentRequest request = BasicRequest() with { CaptureFinalScreenshot = true, Cpu = "nes" };
 
-		McpServiceResult<RunExperimentResult> result = await fixture.Experiments.RunAsync(request, CancellationToken.None);
+		McpServiceResult<McpExperimentCapture> result = await fixture.Experiments.RunAsync(request, CancellationToken.None);
 
 		Assert.Equal("invalid_request", result.Error?.Code);
 		Assert.Empty(fixture.Api.NativeCallLog);
@@ -437,12 +439,14 @@ public sealed class McpExperimentServiceTests
 			return McpServiceResult<McpScreenshotCapture>.Success(new(new(1, 1, 1, 1, 0, 0), [1]));
 		};
 
-		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+		McpExperimentCapture capture = AssertCapture(await fixture.Experiments.RunAsync(
 			BasicRequest() with { CaptureFinalScreenshot = true }, cancellation.Token));
+		RunExperimentResult result = capture.Result;
 
 		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
 		Assert.Equal(McpExperimentReason.Cancelled, result.Reason);
 		Assert.Null(result.Screenshot);
+		Assert.Null(capture.Png);
 		Assert.Equal(1, fixture.Api.CaptureScreenshotCalls);
 	}
 
@@ -455,12 +459,14 @@ public sealed class McpExperimentServiceTests
 		fixture.Api.CaptureScreenshotHandler = () => McpServiceResult<McpScreenshotCapture>.Success(
 			new(new(1, 1, 1, 1, 0, 0), [1]));
 
-		RunExperimentResult result = AssertSuccess(await fixture.Experiments.RunAsync(
+		McpExperimentCapture capture = AssertCapture(await fixture.Experiments.RunAsync(
 			BasicRequest() with { CaptureFinalScreenshot = true }, cancellation.Token));
+		RunExperimentResult result = capture.Result;
 
 		Assert.Equal(McpExperimentStatus.Interrupted, result.Status);
 		Assert.Equal(McpExperimentReason.Cancelled, result.Reason);
 		Assert.Null(result.Screenshot);
+		Assert.Null(capture.Png);
 		Assert.Equal(1, fixture.Api.CaptureScreenshotCalls);
 	}
 
@@ -661,6 +667,15 @@ public sealed class McpExperimentServiceTests
 		"Nes", null, [new(1, [], null)], 1000, [], [], false, false);
 
 	private static T AssertSuccess<T>(McpServiceResult<T> result)
+	{
+		Assert.True(result.IsSuccess, result.Error?.Code);
+		return result.Value!;
+	}
+
+	private static RunExperimentResult AssertSuccess(McpServiceResult<McpExperimentCapture> result) =>
+		AssertCapture(result).Result;
+
+	private static McpExperimentCapture AssertCapture(McpServiceResult<McpExperimentCapture> result)
 	{
 		Assert.True(result.IsSuccess, result.Error?.Code);
 		return result.Value!;

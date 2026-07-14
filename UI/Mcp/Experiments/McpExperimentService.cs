@@ -30,14 +30,14 @@ internal sealed class McpExperimentService
 		_afterScreenshotAssigned = afterScreenshotAssigned ?? (() => { });
 	}
 
-	internal async Task<McpServiceResult<RunExperimentResult>> RunAsync(
+	internal async Task<McpServiceResult<McpExperimentCapture>> RunAsync(
 		RunExperimentRequest request,
 		CancellationToken cancellationToken)
 	{
 		long started = _clock.GetTimestamp();
 		McpServiceResult<PreparedExperiment> preparation = Prepare(request);
 		if(!preparation.IsSuccess) {
-			return FailureFrom<RunExperimentResult, PreparedExperiment>(preparation);
+			return FailureFrom<McpExperimentCapture, PreparedExperiment>(preparation);
 		}
 		PreparedExperiment prepared = preparation.Value!;
 
@@ -45,7 +45,7 @@ internal sealed class McpExperimentService
 			.TryAcquireAsync(cancellationToken)
 			.ConfigureAwait(false);
 		if(!acquisition.IsSuccess) {
-			return FailureFrom<RunExperimentResult, McpExecutionLease>(acquisition);
+			return FailureFrom<McpExperimentCapture, McpExecutionLease>(acquisition);
 		}
 
 		McpExecutionLease lease = acquisition.Value!;
@@ -60,6 +60,7 @@ internal sealed class McpExperimentService
 		string? reason = null;
 		McpExperimentInterruption? interruption = null;
 		McpScreenshotMetadata? screenshot = null;
+		byte[]? screenshotPng = null;
 		bool stopConfirmed = false;
 		bool inputReleased = prepared.ControlledPorts.Count == 0;
 		bool leaseReleased = false;
@@ -73,7 +74,7 @@ internal sealed class McpExperimentService
 					_saveStates.Pin(prepared.Experiment.SaveStateId);
 				if(!pinResult.IsSuccess) {
 					await lease.DisposeAsync().ConfigureAwait(false);
-					return FailureFrom<RunExperimentResult, McpPinnedResource<McpSaveStateResource>>(pinResult);
+					return FailureFrom<McpExperimentCapture, McpPinnedResource<McpSaveStateResource>>(pinResult);
 				}
 				statePin = pinResult.Value!;
 				if(CheckCancellation() || CheckDeadline()) {
@@ -232,7 +233,7 @@ internal sealed class McpExperimentService
 					if(CheckCancellation() || CheckDeadline()) {
 						goto Cleanup;
 					}
-					McpServiceResult<McpScreenshotMetadata> capture = CaptureScreenshot(lease.LeaseId, expectedIdentity);
+					McpServiceResult<McpScreenshotCapture> capture = CaptureScreenshot(lease.LeaseId, expectedIdentity);
 					if(!capture.IsSuccess) {
 						SetFailure(capture.Error!.Code);
 						goto Cleanup;
@@ -240,7 +241,8 @@ internal sealed class McpExperimentService
 					if(CheckCancellation() || CheckDeadline()) {
 						goto Cleanup;
 					}
-					screenshot = capture.Value;
+					screenshot = capture.Value!.Metadata;
+					screenshotPng = capture.Value.Png;
 					_afterScreenshotAssigned();
 				}
 				if(CheckFinalInterruption()) {
@@ -325,7 +327,7 @@ internal sealed class McpExperimentService
 			prepared.Experiment.Assertions.Count - assertionResults.Count);
 		int[] skipped = prepared.Experiment.Segments.Select(item => item.Index)
 			.Except(completedSegments).ToArray();
-		return McpServiceResult<RunExperimentResult>.Success(new(
+		RunExperimentResult result = new(
 			status,
 			reason,
 			summary,
@@ -336,7 +338,8 @@ internal sealed class McpExperimentService
 			stopConfirmed ? "paused" : "unknown",
 			screenshot,
 			interruption,
-			new(stopConfirmed, inputReleased, leaseReleased, quarantined)));
+			new(stopConfirmed, inputReleased, leaseReleased, quarantined));
+		return McpServiceResult<McpExperimentCapture>.Success(new(result, screenshot is null ? null : screenshotPng));
 
 		void AddCheckpoint(McpCheckpointResult checkpoint)
 		{
@@ -610,38 +613,40 @@ internal sealed class McpExperimentService
 		});
 	}
 
-	private McpServiceResult<McpScreenshotMetadata> CaptureScreenshot(
+	private McpServiceResult<McpScreenshotCapture> CaptureScreenshot(
 		long leaseId,
 		McpStateIdentity expectedIdentity)
 	{
 		return _emulator.ExecuteOwned(leaseId, (api, identity) => {
 			if(identity != expectedIdentity || !api.IsExecutionStopped()) {
-				return McpServiceResult<McpScreenshotMetadata>.Failure("state_changed", "Screenshot capture requires stopped execution.");
+				return McpServiceResult<McpScreenshotCapture>.Failure("state_changed", "Screenshot capture requires stopped execution.");
 			}
 			if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
-				return StateChanged<McpScreenshotMetadata>();
+				return StateChanged<McpScreenshotCapture>();
 			}
 			McpServiceResult<McpScreenshotCapture> capture = api.CaptureScreenshot();
 			if(!capture.IsSuccess) {
-				return FailureFrom<McpScreenshotMetadata, McpScreenshotCapture>(capture);
+				return capture;
 			}
 			McpScreenshotCapture value = capture.Value!;
 			if(_emulator.EmulatorIdentity.Current != expectedIdentity) {
-				return StateChanged<McpScreenshotMetadata>();
+				return StateChanged<McpScreenshotCapture>();
 			}
 			McpScreenshotMetadata metadata = value.Metadata;
 			if(metadata.Width <= 0 || metadata.Height <= 0 || value.Png.Length == 0 || metadata.PngBytes != value.Png.Length) {
-				return McpServiceResult<McpScreenshotMetadata>.Failure("native_failure", "Native screenshot data is invalid.");
+				return McpServiceResult<McpScreenshotCapture>.Failure("native_failure", "Native screenshot data is invalid.");
 			}
 			if(metadata.Width > McpAutomationLimits.MaxScreenshotDimension
 				|| metadata.Height > McpAutomationLimits.MaxScreenshotDimension
 				|| (long)metadata.Width * metadata.Height > McpAutomationLimits.MaxScreenshotPixels
 				|| value.Png.Length > McpAutomationLimits.MaxPngBytes) {
-				return McpServiceResult<McpScreenshotMetadata>.Failure("native_failure", "Native screenshot data exceeds managed limits.");
+				return McpServiceResult<McpScreenshotCapture>.Failure("native_failure", "Native screenshot data exceeds managed limits.");
 			}
-			return McpServiceResult<McpScreenshotMetadata>.Success(metadata with {
-				RomIdentity = identity.RomIdentity,
-				MutableStateGeneration = identity.MutableStateGeneration
+			return McpServiceResult<McpScreenshotCapture>.Success(value with {
+				Metadata = metadata with {
+					RomIdentity = identity.RomIdentity,
+					MutableStateGeneration = identity.MutableStateGeneration
+				}
 			});
 		});
 	}

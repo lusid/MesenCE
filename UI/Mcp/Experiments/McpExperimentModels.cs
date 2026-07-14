@@ -35,3 +35,4 @@ public sealed record McpAssertionSummary(int Total, int Passed, int Failed, int 
 public sealed record McpExperimentInterruption(string Reason, BreakContext? BreakContext);
 public sealed record McpExperimentCleanup(bool StopConfirmed, bool InputReleased, bool LeaseReleased, bool Quarantined);
 public sealed record RunExperimentResult(string Status, string? Reason, McpAssertionSummary AssertionSummary, IReadOnlyList<McpCheckpointResult> Checkpoints, IReadOnlyList<int> CompletedSegments, IReadOnlyList<int> SkippedSegments, int CompletedFrames, string FinalRunState, McpScreenshotMetadata? Screenshot, McpExperimentInterruption? Interruption, McpExperimentCleanup Cleanup);
+internal sealed record McpExperimentCapture(RunExperimentResult Result, byte[]? Png);
