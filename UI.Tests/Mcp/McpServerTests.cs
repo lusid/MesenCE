@@ -1,5 +1,7 @@
 using System.Net;
 using System.Text.Json;
+using Mesen.Debugger;
+using Mesen.Debugger.Utilities;
 using Mesen.Interop;
 using Mesen.Mcp;
 using Mesen.Windows;
@@ -10,6 +12,33 @@ namespace UI.Tests.Mcp;
 
 public sealed class McpServerTests
 {
+	[Fact]
+	public async Task MainWindowNotification_ForwardsCodeBreakSynchronously()
+	{
+		McpEmulatorService service = new(
+			FakeMcpEmulatorApi.RunningNes(),
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { })
+		);
+		using McpServer server = new(service);
+		MainWindowMcpLifecycle lifecycle = new(() => server, (_, _) => Task.CompletedTask, _ => { }, _ => { });
+		await lifecycle.StartAsync(true, 7342);
+		Task<McpServiceResult<ContinueResult>> wait = service.ContinueUntilBreakAsync(nameof(CpuType.Nes), 5000, CancellationToken.None);
+		BreakEvent breakEvent = new() { Source = BreakSource.Pause, SourceCpu = CpuType.Nes, BreakpointId = -1 };
+		IntPtr pointer = System.Runtime.InteropServices.Marshal.AllocHGlobal(System.Runtime.InteropServices.Marshal.SizeOf<BreakEvent>());
+		try {
+			System.Runtime.InteropServices.Marshal.StructureToPtr(breakEvent, pointer, false);
+			lifecycle.ProcessNotification(new NotificationEventArgs {
+				NotificationType = ConsoleNotificationType.CodeBreak,
+				Parameter = pointer
+			});
+			System.Runtime.InteropServices.Marshal.StructureToPtr(new BreakEvent { Source = BreakSource.Nmi }, pointer, false);
+		} finally {
+			System.Runtime.InteropServices.Marshal.FreeHGlobal(pointer);
+		}
+
+		Assert.Equal("pause", (await wait.WaitAsync(TimeSpan.FromSeconds(2))).Value!.Reason);
+	}
+
 	[Fact]
 	public async Task MainWindowLifecycle_AppliesConfigBeforeStartingAndStopsBeforeCoreRelease()
 	{
@@ -126,7 +155,7 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
-	public async Task Discovery_ExposesExactlyFiveToolsOnLoopbackMcpRoute()
+	public async Task Discovery_ExposesExactlyNineteenToolsWithBoundedSchemasOnLoopbackMcpRoute()
 	{
 		using McpServer server = new(new McpEmulatorService(new FakeMcpEmulatorApi()));
 		await server.StartAsync(0);
@@ -139,13 +168,15 @@ public sealed class McpServerTests
 		IList<McpClientTool> tools = await client.ListToolsAsync();
 
 		Assert.Equal(
-			["get_cpu_registers", "get_emulator_status", "list_memory_spaces", "read_memory", "write_memory"],
+			[
+				"configure_execution_trace", "continue_until_break", "disassemble", "get_break_context",
+				"get_call_stack", "get_cpu_registers", "get_emulator_status", "get_execution_trace",
+				"list_breakpoints", "list_memory_spaces", "map_address", "pause", "read_memory",
+				"remove_all_breakpoints", "remove_breakpoint", "resume", "set_breakpoint", "step",
+				"write_memory"
+			],
 			[.. tools.Select(tool => tool.Name).Order()]
 		);
-		Assert.All(tools, tool => {
-			Assert.Contains("live", tool.Description);
-			Assert.Contains("without pausing", tool.Description);
-		});
 		Assert.Contains("modifies emulator state immediately", tools.Single(tool => tool.Name == "write_memory").Description);
 		JsonElement writeSchema = tools.Single(tool => tool.Name == "write_memory").JsonSchema;
 		JsonElement readSchema = tools.Single(tool => tool.Name == "read_memory").JsonSchema;
@@ -158,8 +189,48 @@ public sealed class McpServerTests
 		Assert.Equal("integer", dataSchema.GetProperty("items").GetProperty("type").GetString());
 		Assert.Equal(0, dataSchema.GetProperty("items").GetProperty("minimum").GetInt32());
 		Assert.Equal(byte.MaxValue, dataSchema.GetProperty("items").GetProperty("maximum").GetInt32());
-		Assert.False(tools.Single(tool => tool.Name == "write_memory").ProtocolTool.Annotations!.IdempotentHint);
-		Assert.All(tools.Where(tool => tool.Name != "write_memory"), tool => Assert.True(tool.ProtocolTool.Annotations!.IdempotentHint));
+
+		JsonElement breakpointProperties = RequestProperties(tools, "set_breakpoint");
+		Assert.Equal("integer", breakpointProperties.GetProperty("startAddress").GetProperty("type").GetString());
+		Assert.Contains("integer", breakpointProperties.GetProperty("endAddress").GetProperty("type").EnumerateArray().Select(value => value.GetString()));
+		Assert.Equal(
+			["execute", "read", "write"],
+			breakpointProperties.GetProperty("access").GetProperty("enum").EnumerateArray().Select(value => value.GetString())
+		);
+		Assert.Equal(McpDebuggerLimits.MaxConditionUtf8Bytes, breakpointProperties.GetProperty("condition").GetProperty("maxLength").GetInt32());
+
+		JsonElement continueProperties = RequestProperties(tools, "continue_until_break");
+		JsonElement timeoutSchema = continueProperties.GetProperty("timeoutMs");
+		Assert.Equal(McpDebuggerLimits.MinContinueTimeoutMs, timeoutSchema.GetProperty("minimum").GetInt32());
+		Assert.Equal(McpDebuggerLimits.MaxContinueTimeoutMs, timeoutSchema.GetProperty("maximum").GetInt32());
+
+		foreach(string toolName in new[] { "get_break_context", "disassemble" }) {
+			JsonElement properties = RequestProperties(tools, toolName);
+			Assert.Equal(McpDebuggerLimits.MaxDisassemblyRows - 1, properties.GetProperty("before").GetProperty("maximum").GetInt32());
+			Assert.Equal(McpDebuggerLimits.MaxDisassemblyRows - 1, properties.GetProperty("after").GetProperty("maximum").GetInt32());
+		}
+		Assert.Equal(
+			McpDebuggerLimits.MaxCallStackDepth,
+			RequestProperties(tools, "get_break_context").GetProperty("maxStackDepth").GetProperty("maximum").GetInt32()
+		);
+		Assert.Equal(
+			McpDebuggerLimits.MaxCallStackDepth,
+			RequestProperties(tools, "get_call_stack").GetProperty("maxDepth").GetProperty("maximum").GetInt32()
+		);
+
+		JsonElement traceProperties = RequestProperties(tools, "configure_execution_trace");
+		Assert.Equal(McpDebuggerLimits.MaxConditionUtf8Bytes, traceProperties.GetProperty("condition").GetProperty("maxLength").GetInt32());
+		Assert.Equal(McpDebuggerLimits.MaxTraceFormatUtf8Bytes, traceProperties.GetProperty("format").GetProperty("maxLength").GetInt32());
+		Assert.Equal(
+			McpDebuggerLimits.MaxTraceRows,
+			RequestProperties(tools, "get_execution_trace").GetProperty("maxRows").GetProperty("maximum").GetInt32()
+		);
+
+		HashSet<string> readOnlyTools = [
+			"disassemble", "get_break_context", "get_call_stack", "get_cpu_registers", "get_emulator_status",
+			"get_execution_trace", "list_breakpoints", "list_memory_spaces", "map_address", "read_memory"
+		];
+		Assert.All(tools, tool => Assert.Equal(readOnlyTools.Contains(tool.Name), tool.ProtocolTool.Annotations!.ReadOnlyHint));
 	}
 
 	[Fact]
@@ -228,6 +299,117 @@ public sealed class McpServerTests
 		Assert.False(error.TryGetProperty("bytesWritten", out _));
 		Assert.Equal(1, api.GetMemoryValuesCalls);
 		Assert.Equal(1, api.SetMemoryValuesCalls);
+	}
+
+	[Fact]
+	public async Task BreakpointProtocol_SetListAndRemoveReturnsStructuredResults()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.MemorySizes[MemoryType.NesMemory] = 0x10000;
+		using McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { }),
+			breakpointCollection: new ProtocolBreakpointCollection()
+		);
+		using McpServer server = new(service);
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult set = await client.CallToolAsync("set_breakpoint", Request(new {
+			cpu = nameof(CpuType.Nes),
+			space = nameof(MemoryType.NesMemory),
+			access = "execute",
+			startAddress = 0x8000U,
+			endAddress = (uint?)null,
+			condition = (string?)null
+		}));
+		long id = set.StructuredContent!.Value.GetProperty("id").GetInt64();
+		CallToolResult list = await client.CallToolAsync("list_breakpoints");
+		CallToolResult remove = await client.CallToolAsync("remove_breakpoint", Request(new { id }));
+
+		Assert.False(set.IsError);
+		Assert.Equal(1, id);
+		Assert.False(list.IsError);
+		Assert.Equal(id, Assert.Single(list.StructuredContent!.Value.EnumerateArray()).GetProperty("id").GetInt64());
+		Assert.False(remove.IsError);
+		Assert.True(remove.StructuredContent!.Value.GetProperty("removed").GetBoolean());
+		Assert.Empty((await client.CallToolAsync("list_breakpoints")).StructuredContent!.Value.EnumerateArray());
+	}
+
+	[Fact]
+	public async Task DebuggerProtocol_InvalidCallsReturnExactStructuredErrorCodes()
+	{
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		using McpServer server = new(new McpEmulatorService(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { })
+		));
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+
+		CallToolResult invalidTimeout = await client.CallToolAsync("continue_until_break", Request(new {
+			cpu = nameof(CpuType.Nes),
+			timeoutMs = 0
+		}));
+		CallToolResult staleContext = await client.CallToolAsync("get_break_context", Request(new {
+			before = 0,
+			after = 0,
+			maxStackDepth = 1
+		}));
+		CallToolResult oversizedDisassembly = await client.CallToolAsync("disassemble", Request(new {
+			cpu = nameof(CpuType.Nes),
+			space = (string?)null,
+			address = (uint?)0x8000,
+			before = McpDebuggerLimits.MaxDisassemblyRows - 1,
+			after = 1
+		}));
+		CallToolResult unsupportedStep = await client.CallToolAsync("step", Request(new {
+			cpu = nameof(CpuType.Nes),
+			stepType = "over"
+		}));
+
+		AssertErrorCode(invalidTimeout, "invalid_timeout");
+		AssertErrorCode(staleContext, "stale_context");
+		AssertErrorCode(oversizedDisassembly, "invalid_range");
+		AssertErrorCode(unsupportedStep, "invalid_step_type");
+	}
+
+	[Fact]
+	public async Task ContinueUntilBreak_ProtocolCancellationReturnsCancelledAndReleasesWaiter()
+	{
+		TaskCompletionSource resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		TaskCompletionSource cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		api.ResumeDebuggerHandler = () => resumed.TrySetResult();
+		using McpServer server = new(
+			new McpEmulatorService(
+				api,
+				debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => { })
+			),
+			message => {
+				if(message.Contains("failed with cancelled", StringComparison.Ordinal)) {
+					cancelled.TrySetResult();
+				}
+			}
+		);
+		await server.StartAsync(0);
+		await using McpClient client = await CreateClientAsync(server.Endpoint);
+		using CancellationTokenSource cancellation = new();
+
+		Task<CallToolResult> pending = client.CallToolAsync("continue_until_break", Request(new {
+			cpu = nameof(CpuType.Nes),
+			timeoutMs = McpDebuggerLimits.MaxContinueTimeoutMs
+		}), cancellationToken: cancellation.Token).AsTask();
+		await resumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+		cancellation.Cancel();
+
+		await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+		await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+		CallToolResult subsequent = await client.CallToolAsync("continue_until_break", Request(new {
+			cpu = nameof(CpuType.Nes),
+			timeoutMs = McpDebuggerLimits.MinContinueTimeoutMs
+		}));
+		AssertErrorCode(subsequent, "timeout");
 	}
 
 	[Fact]
@@ -320,7 +502,9 @@ public sealed class McpServerTests
 	{
 		FakeMcpEmulatorApi api = CreateRunningApi();
 		using McpServer server = new(new McpEmulatorService(api));
-		api.OnRead = server.NotifyEmulatorStateChanged;
+		api.OnRead = () => server.ProcessNotification(new NotificationEventArgs {
+			NotificationType = ConsoleNotificationType.StateLoaded
+		});
 		await server.StartAsync(0);
 		await using McpClient client = await CreateClientAsync(server.Endpoint);
 
@@ -369,7 +553,7 @@ public sealed class McpServerTests
 		using McpServer server = new(new McpEmulatorService(CreateRunningApi()));
 		await server.StartAsync(0);
 		await using(McpClient firstClient = await CreateClientAsync(server.Endpoint)) {
-			Assert.Equal(5, (await firstClient.ListToolsAsync()).Count);
+			Assert.Equal(19, (await firstClient.ListToolsAsync()).Count);
 		}
 
 		await using McpClient secondClient = await CreateClientAsync(server.Endpoint);
@@ -398,7 +582,70 @@ public sealed class McpServerTests
 	}
 
 	[Fact]
-	public async Task Stop_WithBlockedToolCall_IsBoundedAndDoesNotResurrectHost()
+	public async Task Stop_WhenHostCleanupExceedsTimeout_DetachesHostAndCleansServiceExactlyOnce()
+	{
+		TaskCompletionSource releaseHostCleanup = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		TaskCompletionSource hostCleanupCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+		using ManualResetEventSlim hostCleanupEntered = new();
+		int hostCleanupCalls = 0;
+		int debuggerReleaseCalls = 0;
+		FakeMcpEmulatorApi api = CreateRunningApi();
+		TrackingBreakpointCollection breakpoints = new();
+		McpEmulatorService service = new(
+			api,
+			debuggerLifetime: new DebuggerLifetimeCoordinator(() => { }, () => debuggerReleaseCalls++),
+			breakpointCollection: breakpoints
+		);
+		using McpServer server = new(
+			service,
+			applicationCleanup: async (application, _) => {
+				Interlocked.Increment(ref hostCleanupCalls);
+				hostCleanupEntered.Set();
+				await releaseHostCleanup.Task;
+				await application.DisposeAsync();
+				hostCleanupCompleted.SetResult();
+			}
+		);
+		await server.StartAsync(0);
+		Assert.True(service.SetBreakpoint(
+			nameof(CpuType.Nes),
+			nameof(MemoryType.NesWorkRam),
+			"write",
+			0,
+			null,
+			null
+		).IsSuccess);
+
+		long started = Environment.TickCount64;
+		server.Stop(TimeSpan.FromMilliseconds(100));
+		long elapsed = Environment.TickCount64 - started;
+
+		Assert.True(hostCleanupEntered.IsSet);
+		Assert.InRange(elapsed, 0, 1000);
+		Assert.Equal(1, hostCleanupCalls);
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(1, debuggerReleaseCalls);
+		Assert.Equal("server_stopping", service.GetStatus().Error!.Code);
+		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
+		Action restart = () => { _ = server.StartAsync(0); };
+		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
+		int nativeCallsAfterStop = NativeCallCount(api);
+
+		releaseHostCleanup.SetResult();
+		await hostCleanupCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+		Assert.Equal(nativeCallsAfterStop, NativeCallCount(api));
+		server.Stop(TimeSpan.Zero);
+		server.Dispose();
+		Assert.Equal(1, hostCleanupCalls);
+		Assert.Equal(1, breakpoints.DisposeCalls);
+		Assert.Equal(1, breakpoints.EmptyReplaceCalls);
+		Assert.Equal(1, debuggerReleaseCalls);
+	}
+
+	[Fact]
+	public async Task Stop_WithBlockedToolCall_WaitsForNativeDrainAndDoesNotResurrectHost()
 	{
 		using ManualResetEventSlim readEntered = new();
 		using ManualResetEventSlim releaseRead = new();
@@ -418,14 +665,15 @@ public sealed class McpServerTests
 		})).AsTask();
 		Assert.True(readEntered.Wait(TimeSpan.FromSeconds(5)));
 
-		long started = Environment.TickCount64;
-		server.Stop(TimeSpan.FromSeconds(30));
+		Task stop = Task.Run(() => server.Stop(TimeSpan.FromSeconds(30)));
+		await Task.Delay(TimeSpan.FromMilliseconds(2200));
+		Assert.False(stop.IsCompleted);
+		releaseRead.Set();
+		await stop.WaitAsync(TimeSpan.FromSeconds(5));
 
-		Assert.InRange(Environment.TickCount64 - started, 0, 2500);
 		Assert.Throws<InvalidOperationException>(() => server.Endpoint);
 		Action restart = () => { _ = server.StartAsync(0); };
 		Assert.IsType<InvalidOperationException>(Record.Exception(restart));
-		releaseRead.Set();
 		Exception requestFailure = await Assert.ThrowsAnyAsync<Exception>(async () => await read.WaitAsync(TimeSpan.FromSeconds(5)));
 		Assert.IsNotType<TimeoutException>(requestFailure);
 		server.Stop(TimeSpan.FromSeconds(2));
@@ -445,6 +693,41 @@ public sealed class McpServerTests
 
 	private static Dictionary<string, object?> Request(object request) => new() { ["request"] = request };
 
+	private static int NativeCallCount(FakeMcpEmulatorApi api) =>
+		api.DebuggerRequestBlockStateCalls
+		+ api.IsRunningCalls
+		+ api.IsPausedCalls
+		+ api.GetRomInfoCalls
+		+ api.GetMemorySizeCalls
+		+ api.GetMemoryValuesCalls
+		+ api.SetMemoryValuesCalls
+		+ api.GetNesCpuStateCalls
+		+ api.PauseCalls
+		+ api.ResumeCalls
+		+ api.ResumeDebuggerCalls
+		+ api.IsExecutionStoppedCalls
+		+ api.StepCalls
+		+ api.GetDebuggerFeaturesCalls
+		+ api.EvaluateExpressionCalls
+		+ api.GetProgramCounterCalls
+		+ api.GetDisassemblyOutputCalls
+		+ api.GetDisassemblyRowAddressCalls
+		+ api.GetAbsoluteAddressCalls
+		+ api.GetRelativeAddressCalls
+		+ api.GetCallstackCalls
+		+ api.SetTraceOptionsCalls
+		+ api.ClearExecutionTraceCalls
+		+ api.GetExecutionTraceSizeCalls
+		+ api.GetExecutionTraceCalls;
+
+	private static JsonElement RequestProperties(IEnumerable<McpClientTool> tools, string toolName)
+	{
+		return tools.Single(tool => tool.Name == toolName).JsonSchema
+			.GetProperty("properties")
+			.GetProperty("request")
+			.GetProperty("properties");
+	}
+
 	private static void AssertInvalidByteValue(CallToolResult result)
 	{
 		Assert.True(result.IsError);
@@ -452,6 +735,12 @@ public sealed class McpServerTests
 		Assert.Equal("invalid_byte_value", error.GetProperty("code").GetString());
 		Assert.Equal("Write data must contain only integer values from 0 through 255.", error.GetProperty("message").GetString());
 		Assert.False(error.TryGetProperty("bytesWritten", out _));
+	}
+
+	private static void AssertErrorCode(CallToolResult result, string code)
+	{
+		Assert.True(result.IsError);
+		Assert.Equal(code, result.StructuredContent!.Value.GetProperty("code").GetString());
 	}
 
 	private static FakeMcpEmulatorApi CreateRunningApi()
@@ -470,47 +759,46 @@ public sealed class McpServerTests
 		return api;
 	}
 
-	private sealed class FakeMcpEmulatorApi : IMcpEmulatorApi
+	private sealed class ProtocolBreakpointCollection : IMcpBreakpointCollection
 	{
-		public bool Running { get; init; }
-		public RomInfo RomInfo { get; init; } = new();
-		public Dictionary<MemoryType, int> MemorySizes { get; } = [];
-		public byte[] ReadData { get; init; } = [];
-		public NesCpuState NesCpuState { get; init; }
-		public Action? OnRead { get; set; }
-		public int IsRunningCalls { get; private set; }
-		public int GetMemoryValuesCalls { get; private set; }
-		public int SetMemoryValuesCalls { get; private set; }
-		public int DebuggerRequestBlockStateCalls { get; private set; }
+		private readonly Dictionary<int, long> _stableIdsByNativeId = [];
 
-		public ulong GetDebuggerRequestBlockState()
+		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints)
 		{
-			DebuggerRequestBlockStateCalls++;
-			return 0;
+			_stableIdsByNativeId.Clear();
+			for(int i = 0; i < breakpoints.Count; i++) {
+				_stableIdsByNativeId.Add(i + 1, breakpoints[i].StableId);
+			}
 		}
 
-		public bool IsRunning()
-		{
-			IsRunningCalls++;
-			return Running;
-		}
+		public bool TryGetStableId(int nativeBreakpointId, out long stableId) =>
+			_stableIdsByNativeId.TryGetValue(nativeBreakpointId, out stableId);
 
-		public bool IsPaused() => false;
-		public RomInfo GetRomInfo() => RomInfo;
-		public int GetMemorySize(MemoryType type) => MemorySizes.GetValueOrDefault(type);
-
-		public byte[] GetMemoryValues(MemoryType type, uint start, uint endInclusive)
-		{
-			GetMemoryValuesCalls++;
-			OnRead?.Invoke();
-			return ReadData;
-		}
-
-		public void SetMemoryValues(MemoryType type, uint start, byte[] data)
-		{
-			SetMemoryValuesCalls++;
-		}
-
-		public NesCpuState GetNesCpuState() => NesCpuState;
+		public void Dispose() { }
 	}
+
+	private sealed class TrackingBreakpointCollection : IMcpBreakpointCollection
+	{
+		public int EmptyReplaceCalls { get; private set; }
+		public int DisposeCalls { get; private set; }
+
+		public void Replace(IReadOnlyList<BreakpointManager.ExternalBreakpoint> breakpoints)
+		{
+			if(breakpoints.Count == 0) {
+				EmptyReplaceCalls++;
+			}
+		}
+
+		public bool TryGetStableId(int nativeBreakpointId, out long stableId)
+		{
+			stableId = 0;
+			return false;
+		}
+
+		public void Dispose()
+		{
+			DisposeCalls++;
+		}
+	}
+
 }

@@ -323,19 +323,7 @@ namespace Mesen.Windows
 		private void OnNotification(NotificationEventArgs e)
 		{
 			DebugWindowManager.ProcessNotification(e);
-			if(e.NotificationType is ConsoleNotificationType.BeforeEmulationStop
-				or ConsoleNotificationType.BeforeGameLoad
-				or ConsoleNotificationType.BeforeGameUnload) {
-				_mcpLifecycle.BeginEmulatorTransition();
-			} else if(e.NotificationType is ConsoleNotificationType.GameLoaded
-				or ConsoleNotificationType.GameLoadFailed
-				or ConsoleNotificationType.EmulationStopped) {
-				_mcpLifecycle.EndEmulatorTransition();
-			} else if(e.NotificationType is ConsoleNotificationType.StateLoaded
-				or ConsoleNotificationType.GameReset
-				or ConsoleNotificationType.AfterInitConsole) {
-				_mcpLifecycle.NotifyEmulatorStateChanged();
-			}
+			_mcpLifecycle.ProcessNotification(e);
 
 			switch(e.NotificationType) {
 				case ConsoleNotificationType.GameLoaded:
@@ -939,24 +927,10 @@ namespace Mesen.Windows
 			releaseCore();
 		}
 
-		internal void NotifyEmulatorStateChanged()
+		internal void ProcessNotification(NotificationEventArgs e)
 		{
 			lock(_lock) {
-				(_server ?? _stoppingServer)?.NotifyEmulatorStateChanged();
-			}
-		}
-
-		internal void BeginEmulatorTransition()
-		{
-			lock(_lock) {
-				(_server ?? _stoppingServer)?.BeginEmulatorTransition();
-			}
-		}
-
-		internal void EndEmulatorTransition()
-		{
-			lock(_lock) {
-				(_server ?? _stoppingServer)?.EndEmulatorTransition();
+				(_server ?? _stoppingServer)?.ProcessNotification(e);
 			}
 		}
 	}

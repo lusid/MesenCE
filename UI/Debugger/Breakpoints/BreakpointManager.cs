@@ -11,37 +11,93 @@ namespace Mesen.Debugger
 	{
 		public static event EventHandler? BreakpointsChanged;
 
+		private static readonly object _sync = new();
 		private static List<Breakpoint> _breakpoints = new List<Breakpoint>();
+		private static List<Breakpoint> _asserts = new List<Breakpoint>();
 		private static List<Breakpoint> _temporaryBreakpoints = new List<Breakpoint>();
 		private static HashSet<CpuType> _activeCpuTypes = new HashSet<CpuType>();
+		private static readonly Dictionary<long, List<ExternalBreakpoint>> _externalBreakpoints = [];
+		private static readonly Dictionary<int, Breakpoint> _uiByNativeId = [];
+		private static readonly Dictionary<int, (long CollectionId, long StableId)> _externalByNativeId = [];
+		private static long _nextExternalCollectionId;
+		private static Action<InteropBreakpoint[]> _nativeBreakpointSetter = SetNativeBreakpoints;
 
 		public static ReadOnlyCollection<Breakpoint> Breakpoints
 		{
-			get { return _breakpoints.ToList().AsReadOnly(); }
+			get
+			{
+				lock(_sync) {
+					return _breakpoints.ToList().AsReadOnly();
+				}
+			}
 		}
 
-		public static List<Breakpoint> Asserts { internal get; set; } = new List<Breakpoint>();
+		public static List<Breakpoint> Asserts
+		{
+			internal get
+			{
+				lock(_sync) {
+					return _asserts.ToList();
+				}
+			}
+			set
+			{
+				lock(_sync) {
+					_asserts = value.ToList();
+				}
+			}
+		}
+
+		public readonly record struct ExternalBreakpoint(long StableId, Breakpoint Breakpoint);
+
+		public sealed class ExternalBreakpointCollection : IDisposable
+		{
+			private readonly long _collectionId;
+			private bool _disposed;
+
+			internal ExternalBreakpointCollection(long collectionId) => _collectionId = collectionId;
+			public void Replace(IReadOnlyList<ExternalBreakpoint> breakpoints) =>
+				BreakpointManager.ReplaceExternal(_collectionId, breakpoints, ref _disposed);
+			public bool TryGetStableId(int nativeBreakpointId, out long stableId) =>
+				BreakpointManager.TryGetExternalStableId(_collectionId, nativeBreakpointId, out stableId);
+			public void Dispose() => BreakpointManager.RemoveExternal(_collectionId, ref _disposed);
+		}
+
+		public static ExternalBreakpointCollection CreateExternalBreakpointCollection()
+		{
+			lock(_sync) {
+				long id = ++_nextExternalCollectionId;
+				_externalBreakpoints.Add(id, []);
+				return new ExternalBreakpointCollection(id);
+			}
+		}
 
 		public static List<Breakpoint> GetBreakpoints(CpuType cpuType)
 		{
-			List<Breakpoint> breakpoints = new List<Breakpoint>();
-			foreach(Breakpoint bp in _breakpoints) {
-				if(bp.CpuType == cpuType) {
-					breakpoints.Add(bp);
+			lock(_sync) {
+				List<Breakpoint> breakpoints = new List<Breakpoint>();
+				foreach(Breakpoint bp in _breakpoints) {
+					if(bp.CpuType == cpuType) {
+						breakpoints.Add(bp);
+					}
 				}
+				return breakpoints;
 			}
-			return breakpoints;
 		}
 
 		public static void AddCpuType(CpuType cpuType)
 		{
-			_activeCpuTypes.Add(cpuType);
+			lock(_sync) {
+				_activeCpuTypes.Add(cpuType);
+			}
 			SetBreakpoints();
 		}
 
 		public static void RemoveCpuType(CpuType cpuType)
 		{
-			_activeCpuTypes.Remove(cpuType);
+			lock(_sync) {
+				_activeCpuTypes.Remove(cpuType);
+			}
 			SetBreakpoints();
 		}
 
@@ -53,19 +109,27 @@ namespace Mesen.Debugger
 
 		public static void ClearBreakpoints()
 		{
-			_breakpoints = new();
+			lock(_sync) {
+				_breakpoints = new();
+			}
 			RefreshBreakpoints();
 		}
 
 		public static void AddBreakpoints(List<Breakpoint> breakpoints)
 		{
-			_breakpoints.AddRange(breakpoints);
+			lock(_sync) {
+				_breakpoints.AddRange(breakpoints);
+			}
 			RefreshBreakpoints();
 		}
 
 		public static void RemoveBreakpoint(Breakpoint bp)
 		{
-			if(_breakpoints.Remove(bp)) {
+			bool removed;
+			lock(_sync) {
+				removed = _breakpoints.Remove(bp);
+			}
+			if(removed) {
 				DebugWorkspaceManager.AutoSave();
 			}
 			RefreshBreakpoints(bp);
@@ -73,16 +137,24 @@ namespace Mesen.Debugger
 
 		public static void RemoveBreakpoints(IEnumerable<Breakpoint> breakpoints)
 		{
-			foreach(Breakpoint bp in breakpoints) {
-				_breakpoints.Remove(bp);
+			lock(_sync) {
+				foreach(Breakpoint bp in breakpoints) {
+					_breakpoints.Remove(bp);
+				}
 			}
 			RefreshBreakpoints(null);
 		}
 
 		public static void AddBreakpoint(Breakpoint bp)
 		{
-			if(!_breakpoints.Contains(bp)) {
-				_breakpoints.Add(bp);
+			bool added = false;
+			lock(_sync) {
+				if(!_breakpoints.Contains(bp)) {
+					_breakpoints.Add(bp);
+					added = true;
+				}
+			}
+			if(added) {
 				DebugWorkspaceManager.AutoSave();
 			}
 			RefreshBreakpoints(bp);
@@ -107,14 +179,22 @@ namespace Mesen.Debugger
 
 		public static void AddTemporaryBreakpoint(Breakpoint bp)
 		{
-			_temporaryBreakpoints.Add(bp);
+			lock(_sync) {
+				_temporaryBreakpoints.Add(bp);
+			}
 			SetBreakpoints();
 		}
 
 		public static void ClearTemporaryBreakpoints()
 		{
-			if(_temporaryBreakpoints.Count > 0) {
-				_temporaryBreakpoints.Clear();
+			bool cleared = false;
+			lock(_sync) {
+				if(_temporaryBreakpoints.Count > 0) {
+					_temporaryBreakpoints.Clear();
+					cleared = true;
+				}
+			}
+			if(cleared) {
 				SetBreakpoints();
 			}
 		}
@@ -230,38 +310,124 @@ namespace Mesen.Debugger
 
 		public static void SetBreakpoints()
 		{
-			List<InteropBreakpoint> breakpoints = new List<InteropBreakpoint>();
+			lock(_sync) {
+				SetBreakpointsLocked();
+			}
+		}
 
-			int id = 0;
-			void toInteropBreakpoints(IEnumerable<Breakpoint> bpList)
+		private static void SetBreakpointsLocked()
+		{
+			List<InteropBreakpoint> breakpoints = new List<InteropBreakpoint>();
+			_uiByNativeId.Clear();
+			_externalByNativeId.Clear();
+
+			int nativeId = 0;
+			void addUiBreakpoints(IEnumerable<Breakpoint> bpList)
 			{
 				foreach(Breakpoint bp in bpList) {
 					if(_activeCpuTypes.Contains(bp.CpuType)) {
-						breakpoints.Add(bp.ToInteropBreakpoint(id));
+						breakpoints.Add(bp.ToInteropBreakpoint(nativeId));
+						_uiByNativeId.Add(nativeId, bp);
+						nativeId++;
 					}
-					id++;
 				}
 			}
 
-			toInteropBreakpoints(BreakpointManager.Breakpoints);
-			toInteropBreakpoints(BreakpointManager.Asserts);
-			toInteropBreakpoints(BreakpointManager._temporaryBreakpoints);
+			addUiBreakpoints(_breakpoints);
+			addUiBreakpoints(_asserts);
+			addUiBreakpoints(_temporaryBreakpoints);
 
-			DebugApi.SetBreakpoints(breakpoints.ToArray(), (UInt32)breakpoints.Count);
+			foreach(KeyValuePair<long, List<ExternalBreakpoint>> collection in _externalBreakpoints) {
+				foreach(ExternalBreakpoint external in collection.Value) {
+					breakpoints.Add(external.Breakpoint.ToInteropBreakpoint(nativeId));
+					_externalByNativeId.Add(nativeId, (collection.Key, external.StableId));
+					nativeId++;
+				}
+			}
+
+			_nativeBreakpointSetter(breakpoints.ToArray());
 		}
 
 		public static Breakpoint? GetBreakpointById(int breakpointId)
 		{
-			if(breakpointId < 0) {
-				return null;
-			} else if(breakpointId < _breakpoints.Count) {
-				return _breakpoints[breakpointId];
-			} else if(breakpointId < _breakpoints.Count + Asserts.Count) {
-				return Asserts[breakpointId - _breakpoints.Count];
-			} else if(breakpointId < _breakpoints.Count + Asserts.Count + _temporaryBreakpoints.Count) {
-				return _temporaryBreakpoints[breakpointId - _breakpoints.Count - Asserts.Count];
+			lock(_sync) {
+				return _uiByNativeId.GetValueOrDefault(breakpointId);
 			}
-			return null;
+		}
+
+		private static void ReplaceExternal(long collectionId, IReadOnlyList<ExternalBreakpoint> breakpoints, ref bool disposed)
+		{
+			lock(_sync) {
+				ObjectDisposedException.ThrowIf(disposed, typeof(ExternalBreakpointCollection));
+				_externalBreakpoints[collectionId] = breakpoints.ToList();
+				SetBreakpointsLocked();
+			}
+		}
+
+		private static bool TryGetExternalStableId(long collectionId, int nativeBreakpointId, out long stableId)
+		{
+			lock(_sync) {
+				if(_externalByNativeId.TryGetValue(nativeBreakpointId, out (long CollectionId, long StableId) external) && external.CollectionId == collectionId) {
+					stableId = external.StableId;
+					return true;
+				}
+				stableId = 0;
+				return false;
+			}
+		}
+
+		private static void RemoveExternal(long collectionId, ref bool disposed)
+		{
+			lock(_sync) {
+				if(disposed) {
+					return;
+				}
+				disposed = true;
+				if(_externalBreakpoints.Remove(collectionId)) {
+					SetBreakpointsLocked();
+				}
+			}
+		}
+
+		internal static IDisposable OverrideNativeBreakpointSetterForTests(Action<InteropBreakpoint[]> setter)
+		{
+			lock(_sync) {
+				_nativeBreakpointSetter = setter;
+			}
+			return new NativeBreakpointSetterOverride();
+		}
+
+		internal static void ResetForTests()
+		{
+			lock(_sync) {
+				_breakpoints = [];
+				_asserts = [];
+				_temporaryBreakpoints = [];
+				_activeCpuTypes = [];
+				_externalBreakpoints.Clear();
+				_uiByNativeId.Clear();
+				_externalByNativeId.Clear();
+			}
+		}
+
+		private static void SetNativeBreakpoints(InteropBreakpoint[] breakpoints)
+		{
+			DebugApi.SetBreakpoints(breakpoints, (UInt32)breakpoints.Length);
+		}
+
+		private sealed class NativeBreakpointSetterOverride : IDisposable
+		{
+			private bool _disposed;
+
+			public void Dispose()
+			{
+				lock(_sync) {
+					if(!_disposed) {
+						_nativeBreakpointSetter = SetNativeBreakpoints;
+						_disposed = true;
+					}
+				}
+			}
 		}
 	}
 }

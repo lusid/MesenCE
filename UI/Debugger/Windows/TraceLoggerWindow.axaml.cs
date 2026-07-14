@@ -58,10 +58,7 @@ namespace Mesen.Debugger.Windows
 			_model.Config.SaveWindowSettings(this);
 			DebugApi.StopLogTraceToFile();
 
-			//Disable trace logging for all cpus
-			foreach(CpuType cpuType in Enum.GetValues<CpuType>()) {
-				DebugApi.SetTraceOptions(cpuType, new());
-			}
+			_model.ReleaseTraceOwnership();
 		}
 
 		private LocationInfo ActionLocation => _selectionHandler?.ActionLocation ?? new LocationInfo();
@@ -219,8 +216,9 @@ namespace Mesen.Debugger.Windows
 
 		private void OnClearClick(object sender, RoutedEventArgs e)
 		{
-			DebugApi.ClearExecutionTrace();
-			_model.UpdateLog();
+			if(_model.ClearTrace()) {
+				_model.UpdateLog();
+			}
 		}
 
 		private void InitializeComponent()
